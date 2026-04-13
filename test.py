@@ -12,18 +12,29 @@ import utils  # my tool box
 import dataset
 from net_stdf import MFVQE
 
+USE_REFINE = False
+
+
+def refine_postprocess(y, alpha=0.3):
+    return torch.clamp(
+        alpha * torch.nn.functional.avg_pool2d(y, kernel_size=3, stride=1, padding=1)
+        + (1 - alpha) * y,
+        0.0,
+        1.0,
+    )
+
 
 def receive_arg():
     """Process all hyper-parameters and experiment settings.
-    
+
     Record in opts_dict."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        '--opt_path', type=str, default='option.yml', 
+        '--opt_path', type=str, default='option.yml',
         help='Path to option YAML file.'
-        )
+    )
     args = parser.parse_args()
-    
+
     with open(args.opt_path, 'r') as fp:
         opts_dict = yaml.load(fp, Loader=yaml.FullLoader)
 
@@ -34,18 +45,18 @@ def receive_arg():
 
     opts_dict['train']['log_path'] = op.join(
         "exp", opts_dict['train']['exp_name'], "log_test.log"
-        )
+    )
     opts_dict['train']['checkpoint_save_path_pre'] = op.join(
         "exp", opts_dict['train']['exp_name'], "ckp_"
-        )
+    )
     opts_dict['test']['restore_iter'] = int(
         opts_dict['test']['restore_iter']
-        )
+    )
     opts_dict['test']['checkpoint_save_path'] = (
         f"{opts_dict['train']['checkpoint_save_path_pre']}"
         f"{opts_dict['test']['restore_iter']}"
         '.pt'
-        )
+    )
 
     return opts_dict
 
@@ -68,23 +79,23 @@ def main():
         f"Timestamp: [{utils.get_timestr()}]\n"
         f"\n{'<' * 10} Options {'>' * 10}\n"
         f"{utils.dict2str(opts_dict['test'])}"
-        )
+    )
     print(msg)
     log_fp.write(msg + '\n')
     log_fp.flush()
 
-    # ========== 
+    # ==========
     # Ensure reproducibility or Speed up
     # ==========
 
-    #torch.backends.cudnn.benchmark = False  # if reproduce
-    #torch.backends.cudnn.deterministic = True  # if reproduce
+    # torch.backends.cudnn.benchmark = False  # if reproduce
+    # torch.backends.cudnn.deterministic = True  # if reproduce
     torch.backends.cudnn.benchmark = True  # speed up
 
     # ==========
     # create test data prefetchers
     # ==========
-    
+
     # create datasets
     test_ds_type = opts_dict['dataset']['test']['type']
     radius = opts_dict['network']['radius']
@@ -92,9 +103,9 @@ def main():
         "Not implemented!"
     test_ds_cls = getattr(dataset, test_ds_type)
     test_ds = test_ds_cls(
-        opts_dict=opts_dict['dataset']['test'], 
+        opts_dict=opts_dict['dataset']['test'],
         radius=radius
-        )
+    )
 
     test_num = len(test_ds)
     test_vid_num = test_ds.get_vid_num()
@@ -104,11 +115,11 @@ def main():
 
     # create dataloaders
     test_loader = utils.create_dataloader(
-        dataset=test_ds, 
-        opts_dict=opts_dict, 
-        sampler=test_sampler, 
+        dataset=test_ds,
+        opts_dict=opts_dict,
+        sampler=test_sampler,
         phase='val'
-        )
+    )
     assert test_loader is not None
 
     # create dataloader prefetchers
@@ -134,7 +145,7 @@ def main():
         model.load_state_dict(new_state_dict)
     else:  # single-gpu training
         model.load_state_dict(checkpoint['state_dict'])
-    
+
     msg = f'> model {checkpoint_save_path} loaded.'
     print(msg)
     log_fp.write(msg + '\n')
@@ -148,29 +159,32 @@ def main():
 
     # define criterion
     assert opts_dict['test']['criterion'].pop('type') == \
-        'PSNR', "Not implemented."
+           'PSNR', "Not implemented."
     criterion = utils.PSNR()
 
     # ==========
     # validation
     # ==========
-                
+
     # create timer
     total_timer = utils.Timer()
 
     # create counters
     per_aver_dict = dict()
     ori_aver_dict = dict()
+    per_aver_ref_dict = dict() if USE_REFINE else None
     name_vid_dict = dict()
     for index_vid in range(test_vid_num):
         per_aver_dict[index_vid] = utils.Counter()
         ori_aver_dict[index_vid] = utils.Counter()
+        if USE_REFINE:
+            per_aver_ref_dict[index_vid] = utils.Counter()
         name_vid_dict[index_vid] = ""
 
     pbar = tqdm(
-        total=test_num, 
+        total=test_num,
         ncols=opts_dict['test']['pbar_len']
-        )
+    )
 
     # fetch the first batch
     test_prefetcher.reset()
@@ -183,29 +197,42 @@ def main():
             lq_data = val_data['lq'].cuda()  # (B T [RGB] H W)
             index_vid = val_data['index_vid'].item()
             name_vid = val_data['name_vid'][0]  # bs must be 1!
-            
-            b, _, c, _, _  = lq_data.shape
+
+            b, _, c, _, _ = lq_data.shape
             assert b == 1, "Not supported!"
-            
+
             input_data = torch.cat(
-                [lq_data[:,:,i,...] for i in range(c)], 
+                [lq_data[:, :, i, ...] for i in range(c)],
                 dim=1
-                )  # B [R1 ... R7 G1 ... G7 B1 ... B7] H W
+            )  # B [R1 ... R7 G1 ... G7 B1 ... B7] H W
             enhanced_data = model(input_data)  # (B [RGB] H W)
+            if USE_REFINE:
+                enhanced_data_ref = refine_postprocess(enhanced_data)
 
             # eval
             batch_ori = criterion(lq_data[0, radius, ...], gt_data[0])
             batch_perf = criterion(enhanced_data[0], gt_data[0])
+            if USE_REFINE:
+                batch_perf_ref = criterion(enhanced_data_ref[0], gt_data[0])
 
             # display
-            pbar.set_description(
-                "{:s}: [{:.3f}] {:s} -> [{:.3f}] {:s}"
-                .format(name_vid, batch_ori, unit, batch_perf, unit)
+            if USE_REFINE:
+                pbar.set_description(
+                    "{:s}: [{:.3f}] {:s} -> base [{:.3f}] {:s} | refine [{:.3f}] {:s}".format(
+                        name_vid, batch_ori, unit, batch_perf, unit, batch_perf_ref, unit
+                    )
+                )
+            else:
+                pbar.set_description(
+                    "{:s}: [{:.3f}] {:s} -> [{:.3f}] {:s}"
+                    .format(name_vid, batch_ori, unit, batch_perf, unit)
                 )
             pbar.update()
 
             # log
             per_aver_dict[index_vid].accum(volume=batch_perf)
+            if USE_REFINE:
+                per_aver_ref_dict[index_vid].accum(volume=batch_perf_ref)
             ori_aver_dict[index_vid].accum(volume=batch_ori)
             if name_vid_dict[index_vid] == "":
                 name_vid_dict[index_vid] = name_vid
@@ -214,7 +241,7 @@ def main():
 
             # fetch next batch
             val_data = test_prefetcher.next()
-        
+
     # end of val
     pbar.close()
 
@@ -224,23 +251,43 @@ def main():
     log_fp.write(msg + '\n')
     for index_vid in range(test_vid_num):
         per = per_aver_dict[index_vid].get_ave()
+        per_ref = per_aver_ref_dict[index_vid].get_ave() if USE_REFINE else None
         ori = ori_aver_dict[index_vid].get_ave()
         name_vid = name_vid_dict[index_vid]
-        msg = "{:s}: [{:.3f}] {:s} -> [{:.3f}] {:s}".format(
-            name_vid, ori, unit, per, unit
+        if USE_REFINE:
+            msg = "{:s}: [{:.3f}] {:s} -> base [{:.3f}] {:s} | refine [{:.3f}] {:s}".format(
+                name_vid, ori, unit, per, unit, per_ref, unit
+            )
+        else:
+            msg = "{:s}: [{:.3f}] {:s} -> [{:.3f}] {:s}".format(
+                name_vid, ori, unit, per, unit
             )
         print(msg)
         log_fp.write(msg + '\n')
     ave_per = np.mean([
         per_aver_dict[index_vid].get_ave() for index_vid in range(test_vid_num)
+    ])
+    if USE_REFINE:
+        ave_per_ref = np.mean([
+            per_aver_ref_dict[index_vid].get_ave() for index_vid in range(test_vid_num)
         ])
     ave_ori = np.mean([
         ori_aver_dict[index_vid].get_ave() for index_vid in range(test_vid_num)
-        ])
-    msg = (
-        f"{'> ori: [{:.3f}] {:s}'.format(ave_ori, unit)}\n"
-        f"{'> ave: [{:.3f}] {:s}'.format(ave_per, unit)}\n"
-        f"{'> delta: [{:.3f}] {:s}'.format(ave_per - ave_ori, unit)}"
+    ])
+    if USE_REFINE:
+        msg = (
+            f"{'> ori:   [{:.3f}] {:s}'.format(ave_ori, unit)}\n"
+            f"{'> base:  [{:.3f}] {:s}'.format(ave_per, unit)}\n"
+            f"{'> refine:[{:.3f}] {:s}'.format(ave_per_ref, unit)}\n"
+            f"{'> delta(base-ori):   [{:.3f}] {:s}'.format(ave_per - ave_ori, unit)}\n"
+            f"{'> delta(refine-ori): [{:.3f}] {:s}'.format(ave_per_ref - ave_ori, unit)}\n"
+            f"{'> gain(refine-base): [{:.3f}] {:s}'.format(ave_per_ref - ave_per, unit)}"
+        )
+    else:
+        msg = (
+            f"{'> ori: [{:.3f}] {:s}'.format(ave_ori, unit)}\n"
+            f"{'> ave: [{:.3f}] {:s}'.format(ave_per, unit)}\n"
+            f"{'> delta: [{:.3f}] {:s}'.format(ave_per - ave_ori, unit)}"
         )
     print(msg)
     log_fp.write(msg + '\n')
@@ -254,17 +301,16 @@ def main():
     msg = "TOTAL TIME: [{:.1f}] h".format(total_time)
     print(msg)
     log_fp.write(msg + '\n')
-    
+
     msg = (
         f"\n{'<' * 10} Goodbye {'>' * 10}\n"
         f"Timestamp: [{utils.get_timestr()}]"
-        )
+    )
     print(msg)
     log_fp.write(msg + '\n')
-    
+
     log_fp.close()
 
 
 if __name__ == '__main__':
     main()
-    
