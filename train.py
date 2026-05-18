@@ -4,6 +4,7 @@ import time
 import yaml
 import argparse
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 import os.path as op
 import numpy as np
@@ -57,6 +58,58 @@ def receive_arg():
         )
 
     return opts_dict
+
+
+def _norm_map(x, eps=1e-6):
+    b = x.size(0)
+    x_flat = x.reshape(b, -1)
+    x_min = x_flat.min(dim=1)[0].view(b, 1, 1, 1)
+    x_max = x_flat.max(dim=1)[0].view(b, 1, 1, 1)
+    return (x - x_min) / (x_max - x_min + eps)
+
+
+def _high_freq(x):
+    return x - F.avg_pool2d(x, kernel_size=5, stride=1, padding=2)
+
+
+def build_routing_targets(enhanced, gt):
+    """Build pseudo labels for the stage-2 generative routing estimator."""
+    with torch.no_grad():
+        err = torch.mean(torch.abs(enhanced - gt), dim=1, keepdim=True)
+        artifact = _norm_map(F.avg_pool2d(err, kernel_size=7, stride=1, padding=3))
+
+        hf_err = torch.mean(
+            torch.abs(_high_freq(enhanced) - _high_freq(gt)),
+            dim=1,
+            keepdim=True
+        )
+        texture = _norm_map(F.avg_pool2d(hf_err, kernel_size=5, stride=1, padding=2))
+
+        gate = torch.clamp(0.6 * artifact + 0.4 * texture, 0, 1)
+
+    return {
+        'artifact': artifact,
+        'texture': texture,
+        'gate': gate
+    }
+
+
+def cal_routing_loss(route_maps, targets, loss_func, opts_dict):
+    loss = opts_dict.get('artifact_weight', 1.0) * loss_func(
+        route_maps['artifact'], targets['artifact']
+    )
+    loss += opts_dict.get('texture_weight', 1.0) * loss_func(
+        route_maps['texture'], targets['texture']
+    )
+    loss += opts_dict.get('gate_weight', 1.0) * loss_func(
+        route_maps['gate'], targets['gate']
+    )
+    loss += opts_dict.get('sparse_weight', 0.0) * route_maps['gate'].mean()
+    loss += opts_dict.get('risk_weight', 0.0) * route_maps['risk'].mean()
+    loss += opts_dict.get('uncertainty_weight', 0.0) * route_maps[
+        'uncertainty'
+    ].mean()
+    return loss
 
 
 def main():
@@ -372,13 +425,28 @@ def main():
                 [lq_data[:,:,i,...] for i in range(c)], 
                 dim=1
                 )  # B [R1 ... R7 G1 ... G7 B1 ... B7] H W
-            enhanced_data = model(input_data)
+            routing_loss_opts = opts_dict['train'].get('routing_loss', {})
+            use_routing_loss = (
+                routing_loss_opts.get('enabled', False) and
+                opts_dict['network'].get('routing', {}).get('enabled', False)
+            )
+            if use_routing_loss:
+                model_outputs = model(input_data, return_route=True)
+                enhanced_data = model_outputs['enhanced']
+                route_maps = model_outputs['route']
+            else:
+                enhanced_data = model(input_data)
 
             # get loss
             optimizer.zero_grad()  # zero grad
             loss = torch.mean(torch.stack(
                 [loss_func(enhanced_data[i], gt_data[i]) for i in range(b)]
                 ))  # cal loss
+            if use_routing_loss:
+                route_targets = build_routing_targets(enhanced_data, gt_data)
+                loss += routing_loss_opts.get('weight', 0.1) * cal_routing_loss(
+                    route_maps, route_targets, loss_func, routing_loss_opts
+                )
             loss.backward()  # cal grad
             optimizer.step()  # update parameters
 

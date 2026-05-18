@@ -57,6 +57,11 @@ network:
     nb: 8
     base_ks: 3
 
+  routing:
+    enabled: False  # scheme-2 CAGRNet. Set True to estimate diffusion gate maps.
+    nf: 32
+    codec_nc: 0  # optional QP/MV/residual/partition prior channels
+
 train:
   exp_name: MFQEv2_R3_enlarge300x  # default: timestr. None: ~
   random_seed: 7
@@ -82,6 +87,16 @@ train:
   loss:
     type: CharbonnierLoss
     eps: !!float 1e-6
+
+  routing_loss:
+    enabled: False  # requires network.routing.enabled=True
+    weight: 0.1
+    artifact_weight: 1.0
+    texture_weight: 1.0
+    gate_weight: 1.0
+    sparse_weight: 0.01
+    risk_weight: 0.001
+    uncertainty_weight: 0.001
 
   criterion:
     type: PSNR
