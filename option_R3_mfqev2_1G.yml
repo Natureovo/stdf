@@ -49,7 +49,7 @@ network:
     nb: 3  # num of conv layers
     base_ks: 3
     deform_ks: 3  # size of the deformable kernel
-  
+    load_path: exp/MFQEv2_R3_enlarge300x_20260518_151942/ckp_2000.pt # set a trained STDF checkpoint path for stage-2 routing training
   qenet:
     in_nc: 64  # = out_nc of stdf
     out_nc: 1  # 1 for Y
@@ -58,7 +58,7 @@ network:
     base_ks: 3
 
   routing:
-    enabled: False  # scheme-2 CAGRNet. Set True to estimate diffusion gate maps.
+    enabled: True # scheme-2 CAGRNet. Set True to estimate diffusion gate maps.
     nf: 32
     codec_nc: 0  # optional QP/MV/residual/partition prior channels
 
@@ -66,9 +66,9 @@ train:
   exp_name: MFQEv2_R3_enlarge300x  # default: timestr. None: ~
   random_seed: 7
   pre-val: False  # evaluate criterion before training, e.g., ori PSNR
-  num_iter: !!float 3e+5
-  interval_print: !!float 100
-  interval_val: !!float 5e+3  # also save model
+  num_iter: 2000 # !!float 5e+3
+  interval_print: 2000 # !!float 100
+  interval_val: !!float 1e+3  # also save model
   pbar_len: 100
 
   optim:
@@ -89,7 +89,8 @@ train:
     eps: !!float 1e-6
 
   routing_loss:
-    enabled: False  # requires network.routing.enabled=True
+    enabled: True  # requires network.routing.enabled=True
+    freeze_enhancer: True # stage-2: freeze STDF/QE and train only CAGRNet
     weight: 0.1
     artifact_weight: 1.0
     texture_weight: 1.0
