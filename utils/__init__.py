@@ -27,6 +27,7 @@ from .deep_learning import (set_random_seed, init_dist, get_dist_info,
 DistSampler, create_dataloader, CharbonnierLoss, PSNR, CosineAnnealingRestartLR)
 from .system import (mkdir, get_timestr, Timer, Counter)
 from .lmdb import make_lmdb_from_imgs, make_y_lmdb_from_yuv
+from .detail_loss import (analyze_luma_pair, analyze_image_files)
 
 
 __all__ = [
@@ -39,4 +40,5 @@ __all__ = [
     'create_dataloader', 'CharbonnierLoss', 'PSNR', 'CosineAnnealingRestartLR', 
     'mkdir', 'get_timestr', 'Timer', 'Counter', 
     'make_lmdb_from_imgs', 'make_y_lmdb_from_yuv', 
+    'analyze_luma_pair', 'analyze_image_files', 
     ]
