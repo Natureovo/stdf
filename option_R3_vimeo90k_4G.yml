@@ -58,6 +58,24 @@ network:
     nb: 8
     base_ks: 3
 
+  diffusion:
+    enabled: False  # guided residual diffusion refinement, disabled by default
+    type: GRDR
+    freeze_stdf: True
+    in_nc: 1
+    nf: 48
+    cond_dim: 128
+    rate_dim: 0  # reserved for QP/bitrate/CRF condition; 0 means unused now
+    num_steps: 1000
+    sample_steps: 20
+    loss_type: l1
+
+  detail_guidance:
+    gradient_weight: 0.35
+    highfreq_weight: 0.40
+    direction_weight: 0.15
+    variance_weight: 0.10
+
 train:
   exp_name: Vimeo90K_R3_enlarge300x  # default: timestr. None: ~
   random_seed: 7
