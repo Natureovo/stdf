@@ -8,9 +8,9 @@ from tqdm import tqdm
 
 ckp_path = 'exp/MFQEv2_R3_enlarge300x/ckp_290000.pt'  # trained at QP37, LDP, HM16.5
 
-raw_yuv_path = '/media/cp/SWH-4T机械红/MFQEv2_dataset/test_18/raw/test_1080x1920_60.yuv'
-lq_yuv_path = '/media/cp/SWH-4T机械红/MFQEv2_dataset/test_18/raw/test_1080x1920_60.yuv'
-h, w, nfs = 1920, 1080, 60
+raw_yuv_path = '/media/cp/SWH-4T机械红/MFQEv2_dataset/test_18/raw/BasketballDrill_832x480_500.yuv'
+lq_yuv_path = '/media/cp/SWH-4T机械红/MFQEv2_dataset/test_18/HM16.5_LDP/QP37/BasketballDrill_832x480_500.yuv'
+h, w, nfs = 480, 832, 500
 save_yuv_path = '/media/cp/SWH-4T机械红/MFQEv2_dataset/enhanced.yuv'  # 设置保存路径
 
 

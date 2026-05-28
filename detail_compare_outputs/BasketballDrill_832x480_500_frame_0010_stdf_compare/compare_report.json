@@ -1,0 +1,41 @@
+{
+  "video": "BasketballDrill_832x480_500.yuv",
+  "frame": 10,
+  "size": {
+    "width": 832,
+    "height": 480
+  },
+  "inputs": {
+    "raw_yuv": "data/MFQEv2/test_18/raw/BasketballDrill_832x480_500.yuv",
+    "lq_yuv": "data/MFQEv2/test_18/HM16.5_LDP/QP37/BasketballDrill_832x480_500.yuv",
+    "enh_yuv": "/media/cp/SWH-4T机械红/MFQEv2_dataset/enhanced.yuv",
+    "enh_img": null
+  },
+  "compression": {
+    "detail_loss_mean": 0.35431620478630066,
+    "gradient_loss_mean": 0.14725466072559357,
+    "highfreq_loss_mean": 0.14403969049453735,
+    "block_artifact_mean": 0.04157371073961258,
+    "candidate_area_ratio": 0.1515049078525641
+  },
+  "stdf_remaining": {
+    "detail_loss_mean": 0.3699576258659363,
+    "gradient_loss_mean": 0.16113954782485962,
+    "highfreq_loss_mean": 0.14224205911159515,
+    "block_artifact_mean": 0.036920756101608276,
+    "candidate_area_ratio": 0.16698217147435898
+  },
+  "changes_after_stdf": {
+    "detail_loss_delta": -0.01564142107963562,
+    "highfreq_loss_delta": 0.0017976313829421997,
+    "gradient_loss_delta": -0.013884887099266052,
+    "candidate_area_delta": -0.015477263621794884,
+    "improvement_mean": 0.02708933874964714,
+    "worse_mean": 0.04273069277405739
+  },
+  "interpretation": {
+    "compression_detail_loss": "Detail loss caused by compression: raw vs QP37.",
+    "stdf_remaining_detail_loss": "Detail loss still remaining after STDF: raw vs STDF.",
+    "diffusion_guidance": "Regions still not recovered by STDF; use as candidate guidance for diffusion refinement."
+  }
+}
