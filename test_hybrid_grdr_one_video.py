@@ -106,7 +106,7 @@ def parse_args():
     parser.add_argument('--lq-yuv', default=None)
     parser.add_argument('--stdf_ckpt', required=True)
     parser.add_argument('--grdr_ckpt', required=True)
-    parser.add_argument('--out', default='hybrid_grdr_outputs')
+    parser.add_argument('--out', default='outputs/hybrid_grdr')
     parser.add_argument('--save-name', default=None)
     parser.add_argument('--max_frames', type=int, default=None)
     parser.add_argument('--sample_steps', type=int, default=20)

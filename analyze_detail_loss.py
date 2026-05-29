@@ -17,7 +17,7 @@ def parse_args():
     )
     parser.add_argument('--ref', required=True, help='Reference/original image path.')
     parser.add_argument('--cmp', required=True, help='Compressed image path.')
-    parser.add_argument('--out', default='detail_loss_outputs', help='Output root directory.')
+    parser.add_argument('--out', default='outputs/detail_loss', help='Output root directory.')
     parser.add_argument('--case-name', default=None, help='Optional output subfolder name.')
     parser.add_argument('--block', type=int, default=32, help='Block size for DCT statistics.')
     parser.add_argument('--threshold', type=float, default=0.55, help='Candidate mask threshold.')

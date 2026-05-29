@@ -1,11 +1,22 @@
 __pycache__
+__pycache__/
 
 .vscode/
 .idea/
 
 *.so
+*.pyc
+*.pyo
+*.log
+*.pt
+*.pth
+*.yuv
 
 /data/
 /exp/
 /model/
 hybrid_grdr_outputs/
+/outputs/
+/detail_loss_outputs/
+/detail_compare_outputs/
+/hybrid_grdr_outputs/

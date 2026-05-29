@@ -102,7 +102,7 @@ def parse_args():
     parser.add_argument('--enh-yuv', default=None, help='Enhanced/STDF YUV path.')
     parser.add_argument('--enh-img', default=None, help='Enhanced/STDF image path.')
 
-    parser.add_argument('--out', default='detail_compare_outputs')
+    parser.add_argument('--out', default='outputs/detail_compare')
     parser.add_argument('--case-name', default=None)
     parser.add_argument('--block', type=int, default=32)
     parser.add_argument('--threshold', type=float, default=0.55)

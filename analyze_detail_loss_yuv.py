@@ -84,7 +84,7 @@ def parse_args():
     parser.add_argument('--video', default=None, help='Optional YUV filename to analyze. If omitted, the first matched pair is used.')
     parser.add_argument('--frame', type=int, default=0, help='Frame index to extract.')
     parser.add_argument('--yuv-type', default='420p', choices=['420p', '444p'], help='YUV pixel format.')
-    parser.add_argument('--out', default='detail_loss_outputs', help='Output root directory.')
+    parser.add_argument('--out', default='outputs/detail_loss', help='Output root directory.')
     parser.add_argument('--case-name', default=None, help='Optional output subfolder name.')
     parser.add_argument('--block', type=int, default=32, help='Block size for DCT statistics.')
     parser.add_argument('--threshold', type=float, default=0.55, help='Candidate mask threshold.')
