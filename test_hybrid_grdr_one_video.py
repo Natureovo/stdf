@@ -169,6 +169,8 @@ def main():
     hybrid_counter = utils.Counter()
     guidance_counter = utils.Counter()
     mask_counter = utils.Counter()
+    diff_counter = utils.Counter()
+    max_diff_counter = utils.Counter()
     hybrid_y = []
 
     pbar = tqdm(total=nfs, ncols=100)
@@ -201,7 +203,8 @@ def main():
 
         base_np = base[0, 0].detach().cpu().numpy().clip(0, 1)
         refined_np = refined[0, 0].detach().cpu().numpy().clip(0, 1)
-        hybrid_y.append(utils.ndarray2img(refined_np))
+        diff_np = np.abs(refined_np - base_np)
+        hybrid_y.append(utils.ndarray2img(refined_np.copy()))
 
         ori_psnr = psnr_np(lq_y[idx], gt_np)
         stdf_psnr = psnr_np(base_np, gt_np)
@@ -211,6 +214,8 @@ def main():
         hybrid_counter.accum(hybrid_psnr)
         guidance_counter.accum(float(guidance.mean().detach().cpu()))
         mask_counter.accum(float(write_mask.mean().detach().cpu()))
+        diff_counter.accum(float(diff_np.mean()))
+        max_diff_counter.accum(float(diff_np.max()))
 
         pbar.set_description(
             'ori {:.3f} | stdf {:.3f} | hybrid {:.3f}'.format(
@@ -244,6 +249,8 @@ def main():
         },
         'guidance_mean': guidance_counter.get_ave(),
         'write_area_ratio': mask_counter.get_ave(),
+        'mean_abs_hybrid_minus_stdf': diff_counter.get_ave(),
+        'max_abs_hybrid_minus_stdf': max_diff_counter.get_ave(),
         'output_yuv': save_yuv_path,
     }
     with open(report_path, 'w', encoding='utf-8') as f:
@@ -256,6 +263,8 @@ def main():
     ))
     print('hybrid delta vs stdf [{:.3f}] dB'.format(report['psnr']['hybrid_delta_vs_stdf']))
     print('write area ratio [{:.4f}]'.format(report['write_area_ratio']))
+    print('mean |hybrid-stdf| [{:.6f}]'.format(report['mean_abs_hybrid_minus_stdf']))
+    print('max |hybrid-stdf| [{:.6f}]'.format(report['max_abs_hybrid_minus_stdf']))
     print(f'report saved to {report_path}')
     print('> done.')
 

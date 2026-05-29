@@ -238,7 +238,11 @@ class GuidedResidualDiffusion(nn.Module):
             residual_clip=0.1,
             use_hard_mask=True):
         guidance = guidance.clamp(0, 1)
+        if residual_scale is None or residual_scale <= 0:
+            return base.clamp(0, 1)
+
         residual = self.sample_residual(lq, base, guidance, rate_cond=rate_cond, steps=steps)
+        residual = torch.nan_to_num(residual, nan=0.0, posinf=0.0, neginf=0.0)
         if residual_clip is not None and residual_clip > 0:
             residual = residual.clamp(-residual_clip, residual_clip)
 
