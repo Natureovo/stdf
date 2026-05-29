@@ -158,11 +158,13 @@ class GuidedResidualDiffusion(nn.Module):
             num_steps=1000,
             beta_start=1e-4,
             beta_end=2e-2,
-            loss_type='l1'):
+            loss_type='l1',
+            loss_bg_weight=0.05):
         super(GuidedResidualDiffusion, self).__init__()
         self.denoiser = denoiser
         self.num_steps = num_steps
         self.loss_type = loss_type
+        self.loss_bg_weight = loss_bg_weight
 
         betas = torch.linspace(beta_start, beta_end, num_steps, dtype=torch.float32)
         alphas = 1.0 - betas
@@ -193,8 +195,13 @@ class GuidedResidualDiffusion(nn.Module):
         noisy_residual = self.q_sample(residual, t, noise=noise)
         pred_noise = self.denoiser(noisy_residual, lq, base, guidance, t, rate_cond=rate_cond)
         if self.loss_type == 'l2':
-            return F.mse_loss(pred_noise, noise)
-        return F.l1_loss(pred_noise, noise)
+            loss_map = (pred_noise - noise).pow(2)
+        else:
+            loss_map = (pred_noise - noise).abs()
+
+        guidance_weight = guidance.detach().clamp(0, 1)
+        weight = self.loss_bg_weight + (1.0 - self.loss_bg_weight) * guidance_weight
+        return (loss_map * weight).sum() / (weight.sum() + 1e-6)
 
     @torch.no_grad()
     def sample_residual(self, lq, base, guidance, rate_cond=None, steps=None):
@@ -219,10 +226,28 @@ class GuidedResidualDiffusion(nn.Module):
         return residual
 
     @torch.no_grad()
-    def refine(self, lq, base, guidance, rate_cond=None, steps=None):
+    def refine(
+            self,
+            lq,
+            base,
+            guidance,
+            rate_cond=None,
+            steps=None,
+            guidance_threshold=0.6,
+            residual_scale=0.05,
+            residual_clip=0.1,
+            use_hard_mask=True):
         guidance = guidance.clamp(0, 1)
         residual = self.sample_residual(lq, base, guidance, rate_cond=rate_cond, steps=steps)
-        return (base + guidance * residual).clamp(0, 1)
+        if residual_clip is not None and residual_clip > 0:
+            residual = residual.clamp(-residual_clip, residual_clip)
+
+        if use_hard_mask and guidance_threshold is not None:
+            mask = (guidance >= guidance_threshold).float()
+        else:
+            mask = guidance
+
+        return (base + residual_scale * mask * residual).clamp(0, 1)
 
 
 def build_grdr(opts=None):
@@ -239,4 +264,5 @@ def build_grdr(opts=None):
         beta_start=opts.get('beta_start', 1e-4),
         beta_end=opts.get('beta_end', 2e-2),
         loss_type=opts.get('loss_type', 'l1'),
+        loss_bg_weight=opts.get('loss_bg_weight', 0.05),
     )

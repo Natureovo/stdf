@@ -68,6 +68,7 @@ network:
     num_steps: 1000
     sample_steps: 20
     loss_type: l1
+    loss_bg_weight: 0.05  # keep a weak full-frame constraint, but focus GRDR loss on guided detail regions
 
   detail_guidance:
     gradient_weight: 0.35

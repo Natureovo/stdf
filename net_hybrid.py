@@ -80,7 +80,16 @@ class HybridSTDFGRDR(nn.Module):
         }
 
     @torch.no_grad()
-    def refine(self, x, guidance=None, rate_cond=None, steps=None):
+    def refine(
+            self,
+            x,
+            guidance=None,
+            rate_cond=None,
+            steps=None,
+            guidance_threshold=0.6,
+            residual_scale=0.05,
+            residual_clip=0.1,
+            use_hard_mask=True):
         base = self.forward_base(x)
         lq = self.center_frame(x)
         if guidance is None:
@@ -96,6 +105,10 @@ class HybridSTDFGRDR(nn.Module):
             guidance.clamp(0, 1),
             rate_cond=rate_cond,
             steps=steps,
+            guidance_threshold=guidance_threshold,
+            residual_scale=residual_scale,
+            residual_clip=residual_clip,
+            use_hard_mask=use_hard_mask,
         )
         return {
             'base': base,
