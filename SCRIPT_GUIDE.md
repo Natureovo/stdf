@@ -23,10 +23,22 @@ outputs/detail_compare/
 
 ## Hybrid STDF + GRDR Diffusion
 
+- `train_guidance.py`: freeze a trained STDF checkpoint and train the no-GT guidance predictor from oracle detail-loss maps.
 - `train_hybrid_grdr.py`: freeze a trained STDF checkpoint and train only the GRDR residual diffusion branch.
 - `test_hybrid_grdr_one_video.py`: test STDF + guidance + GRDR on one YUV video.
 - `check_grdr.py`: quick sanity check for the GRDR module.
 - `check_hybrid_parts.py`: quick sanity check for the hybrid guidance and diffusion parts.
+
+`test_hybrid_grdr_one_video.py` writes a JSON report with:
+
+- fidelity metrics: PSNR, SSIM, MSE
+- detail metrics: Sobel gradient MAE and local high-frequency MAE
+- temporal diagnostics: no-flow temporal difference error and temporal activity
+- guidance diagnostics: mean guidance, write-area ratio, and hybrid-vs-STDF difference
+
+Use `--guidance_mode oracle` only as an upper bound because it uses GT during
+testing. Use `--guidance_mode predicted --guidance_ckpt PATH` for the main
+no-GT method, and `--guidance_mode coarse` for a weak no-reference baseline.
 
 Default hybrid outputs are written under:
 

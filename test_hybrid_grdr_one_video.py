@@ -51,11 +51,58 @@ def load_state_dict(path):
     return clean_state, checkpoint
 
 
+def load_guidance_weights(guidance_net, path):
+    state_dict, checkpoint = load_state_dict(path)
+    if 'guidance_state_dict' in checkpoint:
+        guidance_net.load_state_dict(checkpoint['guidance_state_dict'], strict=True)
+    else:
+        guidance_state = OrderedDict()
+        for key, value in state_dict.items():
+            if key.startswith('guidance_net.'):
+                guidance_state[key[len('guidance_net.'):]] = value
+        if not guidance_state:
+            guidance_state = state_dict
+        guidance_net.load_state_dict(guidance_state, strict=True)
+
+
 def psnr_np(x, y):
-    mse = float(np.mean((x.astype(np.float32) - y.astype(np.float32)) ** 2))
-    if mse <= 1e-12:
-        return 99.0
-    return 10.0 * np.log10(1.0 / mse)
+    return utils.calculate_psnr_np(x, y, data_range=1.0)
+
+
+def make_metric_counters(metric_names):
+    return {name: utils.Counter() for name in metric_names}
+
+
+def accum_metrics(counters, values):
+    for name, value in values.items():
+        counters[name].accum(float(value))
+
+
+def average_metrics(counters):
+    return {
+        name: (counter.get_ave() if counter.time > 0 else None)
+        for name, counter in counters.items()
+    }
+
+
+def counter_delta(left, right):
+    if left.time == 0 or right.time == 0:
+        return None
+    return left.get_ave() - right.get_ave()
+
+
+def fmt_optional(value, fmt='{:.6f}'):
+    if value is None:
+        return 'n/a'
+    return fmt.format(value)
+
+
+def make_rate_cond(batch_size, device, rate_dim, qp):
+    if rate_dim <= 0:
+        return None
+    qp_value = 37.0 if qp is None else float(qp)
+    rate_value = (qp_value - 22.0) / 20.0
+    return torch.full((batch_size, rate_dim), rate_value, device=device)
 
 
 def build_opts(args):
@@ -86,6 +133,12 @@ def build_opts(args):
             'sample_steps': args.sample_steps,
             'loss_type': 'l1',
         },
+        'guidance_net': {
+            'in_nc': 1,
+            'nf': args.guidance_nf,
+            'rate_dim': args.guidance_rate_dim,
+            'target_threshold': args.guidance_target_threshold,
+        },
         'detail_guidance': {
             'gradient_weight': 0.35,
             'highfreq_weight': 0.40,
@@ -106,6 +159,7 @@ def parse_args():
     parser.add_argument('--lq-yuv', default=None)
     parser.add_argument('--stdf_ckpt', required=True)
     parser.add_argument('--grdr_ckpt', required=True)
+    parser.add_argument('--guidance_ckpt', default=None)
     parser.add_argument('--out', default='outputs/hybrid_grdr')
     parser.add_argument('--save-name', default=None)
     parser.add_argument('--max_frames', type=int, default=None)
@@ -122,6 +176,16 @@ def parse_args():
     parser.add_argument('--diff_nf', type=int, default=48)
     parser.add_argument('--cond_dim', type=int, default=128)
     parser.add_argument('--rate_dim', type=int, default=0)
+    parser.add_argument('--guidance_nf', type=int, default=32)
+    parser.add_argument('--guidance_rate_dim', type=int, default=0)
+    parser.add_argument('--guidance_target_threshold', type=float, default=0.3)
+    parser.add_argument(
+        '--guidance_mode',
+        default='oracle',
+        choices=['oracle', 'coarse', 'predicted'],
+        help='oracle uses GT and is only an upper bound; predicted is the main no-GT path.'
+    )
+    parser.add_argument('--qp', type=float, default=None)
     parser.add_argument('--yuv-type', default='420p', choices=['420p'])
     return parser.parse_args()
 
@@ -159,7 +223,12 @@ def main():
     if 'diffusion_state_dict' in grdr_checkpoint:
         model.diffusion.load_state_dict(grdr_checkpoint['diffusion_state_dict'], strict=True)
     else:
-        model.load_state_dict(grdr_checkpoint['state_dict'], strict=True)
+        model.load_state_dict(grdr_checkpoint['state_dict'], strict=False)
+
+    if args.guidance_mode == 'predicted':
+        if args.guidance_ckpt is None:
+            raise ValueError('--guidance_ckpt is required for --guidance_mode predicted.')
+        load_guidance_weights(model.guidance_net, args.guidance_ckpt)
 
     model = model.to(device)
     model.eval()
@@ -167,11 +236,27 @@ def main():
     ori_counter = utils.Counter()
     stdf_counter = utils.Counter()
     hybrid_counter = utils.Counter()
+    metric_names = ['psnr', 'ssim', 'mse', 'gradient_mae', 'highfreq_mae']
+    temporal_metric_names = ['temporal_diff_error', 'temporal_activity']
+    metric_counters = {
+        'ori': make_metric_counters(metric_names),
+        'stdf': make_metric_counters(metric_names),
+        'hybrid': make_metric_counters(metric_names),
+    }
+    temporal_counters = {
+        'ori': make_metric_counters(temporal_metric_names),
+        'stdf': make_metric_counters(temporal_metric_names),
+        'hybrid': make_metric_counters(temporal_metric_names),
+    }
     guidance_counter = utils.Counter()
     mask_counter = utils.Counter()
     diff_counter = utils.Counter()
     max_diff_counter = utils.Counter()
     hybrid_y = []
+    prev_gt_np = None
+    prev_lq_np = None
+    prev_base_np = None
+    prev_refined_np = None
 
     pbar = tqdm(total=nfs, ncols=100)
     for idx in range(nfs):
@@ -183,13 +268,36 @@ def main():
         with torch.no_grad():
             gt = torch.from_numpy(gt_np).to(device).view(1, 1, h, w)
             base = model.forward_base(input_data)
-            guidance = model.make_guidance(gt, base)['guidance']
             lq_center = torch.from_numpy(lq_y[idx]).to(device).view(1, 1, h, w)
+            rate_cond = make_rate_cond(
+                batch_size=1,
+                device=device,
+                rate_dim=max(args.rate_dim, args.guidance_rate_dim),
+                qp=args.qp,
+            )
+            diffusion_rate_cond = None
+            guidance_rate_cond = None
+            if rate_cond is not None:
+                if args.rate_dim > 0:
+                    diffusion_rate_cond = rate_cond[:, :args.rate_dim]
+                if args.guidance_rate_dim > 0:
+                    guidance_rate_cond = rate_cond[:, :args.guidance_rate_dim]
+
+            if args.guidance_mode == 'oracle':
+                guidance = model.make_guidance(gt, base)['guidance']
+            elif args.guidance_mode == 'coarse':
+                guidance = model.make_coarse_guidance(lq_center, base)
+            else:
+                guidance = model.predict_guidance(
+                    lq_center,
+                    base,
+                    rate_cond=guidance_rate_cond,
+                )
             refined = model.diffusion.refine(
                 lq_center,
                 base,
                 guidance,
-                rate_cond=None,
+                rate_cond=diffusion_rate_cond,
                 steps=args.sample_steps,
                 guidance_threshold=args.guidance_threshold,
                 residual_scale=args.residual_scale,
@@ -209,17 +317,58 @@ def main():
         ori_psnr = psnr_np(lq_y[idx], gt_np)
         stdf_psnr = psnr_np(base_np, gt_np)
         hybrid_psnr = psnr_np(refined_np, gt_np)
+        ori_metrics = utils.calculate_frame_metrics(gt_np, lq_y[idx], data_range=1.0)
+        stdf_metrics = utils.calculate_frame_metrics(gt_np, base_np, data_range=1.0)
+        hybrid_metrics = utils.calculate_frame_metrics(gt_np, refined_np, data_range=1.0)
         ori_counter.accum(ori_psnr)
         stdf_counter.accum(stdf_psnr)
         hybrid_counter.accum(hybrid_psnr)
+        accum_metrics(metric_counters['ori'], ori_metrics)
+        accum_metrics(metric_counters['stdf'], stdf_metrics)
+        accum_metrics(metric_counters['hybrid'], hybrid_metrics)
+        if prev_gt_np is not None:
+            temporal_values = {
+                'ori': {
+                    'temporal_diff_error': utils.calculate_temporal_difference_error(
+                        prev_lq_np, lq_y[idx], prev_gt_np, gt_np
+                    ),
+                    'temporal_activity': utils.calculate_temporal_activity(
+                        prev_lq_np, lq_y[idx]
+                    ),
+                },
+                'stdf': {
+                    'temporal_diff_error': utils.calculate_temporal_difference_error(
+                        prev_base_np, base_np, prev_gt_np, gt_np
+                    ),
+                    'temporal_activity': utils.calculate_temporal_activity(
+                        prev_base_np, base_np
+                    ),
+                },
+                'hybrid': {
+                    'temporal_diff_error': utils.calculate_temporal_difference_error(
+                        prev_refined_np, refined_np, prev_gt_np, gt_np
+                    ),
+                    'temporal_activity': utils.calculate_temporal_activity(
+                        prev_refined_np, refined_np
+                    ),
+                },
+            }
+            for stage, values in temporal_values.items():
+                accum_metrics(temporal_counters[stage], values)
         guidance_counter.accum(float(guidance.mean().detach().cpu()))
         mask_counter.accum(float(write_mask.mean().detach().cpu()))
         diff_counter.accum(float(diff_np.mean()))
         max_diff_counter.accum(float(diff_np.max()))
+        prev_gt_np = gt_np
+        prev_lq_np = lq_y[idx]
+        prev_base_np = base_np
+        prev_refined_np = refined_np
 
         pbar.set_description(
-            'ori {:.3f} | stdf {:.3f} | hybrid {:.3f}'.format(
-                ori_psnr, stdf_psnr, hybrid_psnr
+            'ori {:.3f}/{:.4f} | stdf {:.3f}/{:.4f} | hybrid {:.3f}/{:.4f}'.format(
+                ori_psnr, ori_metrics['ssim'],
+                stdf_psnr, stdf_metrics['ssim'],
+                hybrid_psnr, hybrid_metrics['ssim'],
             )
         )
         pbar.update()
@@ -234,11 +383,14 @@ def main():
         'size': {'width': w, 'height': h},
         'stdf_ckpt': args.stdf_ckpt,
         'grdr_ckpt': args.grdr_ckpt,
+        'guidance_ckpt': args.guidance_ckpt,
         'sample_steps': args.sample_steps,
         'guidance_threshold': args.guidance_threshold,
         'residual_scale': args.residual_scale,
         'residual_clip': args.residual_clip,
         'soft_guidance': args.soft_guidance,
+        'guidance_source': args.guidance_mode,
+        'qp': args.qp,
         'psnr': {
             'ori': ori_counter.get_ave(),
             'stdf': stdf_counter.get_ave(),
@@ -246,6 +398,41 @@ def main():
             'stdf_delta': stdf_counter.get_ave() - ori_counter.get_ave(),
             'hybrid_delta_vs_ori': hybrid_counter.get_ave() - ori_counter.get_ave(),
             'hybrid_delta_vs_stdf': hybrid_counter.get_ave() - stdf_counter.get_ave(),
+        },
+        'metrics': {
+            'ori': average_metrics(metric_counters['ori']),
+            'stdf': average_metrics(metric_counters['stdf']),
+            'hybrid': average_metrics(metric_counters['hybrid']),
+            'delta_hybrid_vs_stdf': {
+                name: counter_delta(
+                    metric_counters['hybrid'][name],
+                    metric_counters['stdf'][name],
+                )
+                for name in metric_names
+            },
+            'delta_hybrid_vs_ori': {
+                name: counter_delta(
+                    metric_counters['hybrid'][name],
+                    metric_counters['ori'][name],
+                )
+                for name in metric_names
+            },
+        },
+        'temporal_metrics': {
+            'description': (
+                'temporal_diff_error compares frame-to-frame changes with GT; '
+                'temporal_activity is the mean absolute frame-to-frame change.'
+            ),
+            'ori': average_metrics(temporal_counters['ori']),
+            'stdf': average_metrics(temporal_counters['stdf']),
+            'hybrid': average_metrics(temporal_counters['hybrid']),
+            'delta_hybrid_vs_stdf': {
+                name: counter_delta(
+                    temporal_counters['hybrid'][name],
+                    temporal_counters['stdf'][name],
+                )
+                for name in temporal_metric_names
+            },
         },
         'guidance_mean': guidance_counter.get_ave(),
         'write_area_ratio': mask_counter.get_ave(),
@@ -262,6 +449,20 @@ def main():
         report['psnr']['hybrid'],
     ))
     print('hybrid delta vs stdf [{:.3f}] dB'.format(report['psnr']['hybrid_delta_vs_stdf']))
+    print('ave SSIM ori [{:.4f}], stdf [{:.4f}], hybrid [{:.4f}]'.format(
+        report['metrics']['ori']['ssim'],
+        report['metrics']['stdf']['ssim'],
+        report['metrics']['hybrid']['ssim'],
+    ))
+    print('hybrid gradient_mae delta vs stdf [{:.6f}]'.format(
+        report['metrics']['delta_hybrid_vs_stdf']['gradient_mae']
+    ))
+    print('hybrid highfreq_mae delta vs stdf [{:.6f}]'.format(
+        report['metrics']['delta_hybrid_vs_stdf']['highfreq_mae']
+    ))
+    print('hybrid temporal_diff_error delta vs stdf [{}]'.format(
+        fmt_optional(report['temporal_metrics']['delta_hybrid_vs_stdf']['temporal_diff_error'])
+    ))
     print('write area ratio [{:.4f}]'.format(report['write_area_ratio']))
     print('mean |hybrid-stdf| [{:.6f}]'.format(report['mean_abs_hybrid_minus_stdf']))
     print('max |hybrid-stdf| [{:.6f}]'.format(report['max_abs_hybrid_minus_stdf']))

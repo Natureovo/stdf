@@ -16,7 +16,7 @@ from net_hybrid import build_hybrid_stdf_grdr
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Train GRDR diffusion residual branch with frozen STDF.'
+        description='Train no-GT guidance predictor with frozen STDF.'
     )
     parser.add_argument('--opt_path', default='option_R3_mfqev2_1G.yml')
     parser.add_argument(
@@ -29,6 +29,12 @@ def parse_args():
     parser.add_argument('--interval_print', type=int, default=None)
     parser.add_argument('--interval_save', type=int, default=None)
     parser.add_argument('--exp_name', default=None)
+    parser.add_argument(
+        '--qp',
+        type=float,
+        default=None,
+        help='Optional QP value. Used only when guidance_net.rate_dim > 0.',
+    )
     return parser.parse_args()
 
 
@@ -51,15 +57,13 @@ def load_opts(args):
     if opts_dict['train']['exp_name'] is None:
         opts_dict['train']['exp_name'] = utils.get_timestr()
     else:
-        opts_dict['train']['exp_name'] = '{}_grdr_{}'.format(
+        opts_dict['train']['exp_name'] = '{}_guidance_{}'.format(
             opts_dict['train']['exp_name'], utils.get_timestr()
         )
 
     exp_dir = op.join('exp', opts_dict['train']['exp_name'])
-    opts_dict['train']['log_path'] = op.join(exp_dir, 'log_grdr.log')
-    opts_dict['train']['checkpoint_save_path_pre'] = op.join(exp_dir, 'grdr_')
-    opts_dict['network']['diffusion']['enabled'] = True
-    opts_dict['network']['diffusion']['freeze_stdf'] = True
+    opts_dict['train']['log_path'] = op.join(exp_dir, 'log_guidance.log')
+    opts_dict['train']['checkpoint_save_path_pre'] = op.join(exp_dir, 'guidance_')
     return opts_dict
 
 
@@ -78,6 +82,28 @@ def count_trainable_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def make_rate_cond(batch_size, device, rate_dim, qp):
+    if rate_dim <= 0:
+        return None
+    qp_value = 37.0 if qp is None else float(qp)
+    rate_value = (qp_value - 22.0) / 20.0
+    return torch.full((batch_size, rate_dim), rate_value, device=device)
+
+
+def mask_iou_and_f1(pred, target, threshold):
+    pred_mask = pred.detach() >= threshold
+    target_mask = target.detach() >= threshold
+    inter = (pred_mask & target_mask).float().sum()
+    union = (pred_mask | target_mask).float().sum()
+    pred_sum = pred_mask.float().sum()
+    target_sum = target_mask.float().sum()
+    iou = inter / (union + 1e-6)
+    precision = inter / (pred_sum + 1e-6)
+    recall = inter / (target_sum + 1e-6)
+    f1 = 2.0 * precision * recall / (precision + recall + 1e-6)
+    return float(iou.detach().cpu()), float(f1.detach().cpu())
+
+
 def main():
     args = parse_args()
     opts_dict = load_opts(args)
@@ -86,13 +112,16 @@ def main():
     num_iter = int(opts_dict['train']['num_iter'])
     interval_print = int(opts_dict['train']['interval_print'])
     interval_save = int(opts_dict['train']['interval_val'])
+    guidance_opts = opts_dict['network'].get('guidance_net', {})
+    guidance_threshold = guidance_opts.get('target_threshold', 0.3)
+    rate_dim = guidance_opts.get('rate_dim', 0)
 
     if rank == 0:
         exp_dir = op.dirname(opts_dict['train']['log_path'])
         os.makedirs(exp_dir, exist_ok=False)
         log_fp = open(opts_dict['train']['log_path'], 'w')
         msg = (
-            f"{'<' * 10} Hybrid GRDR Training {'>' * 10}\n"
+            f"{'<' * 10} Guidance Training {'>' * 10}\n"
             f"Timestamp: [{utils.get_timestr()}]\n"
             f"STDF checkpoint: [{args.stdf_ckpt}]\n"
             f"\n{'<' * 10} Options {'>' * 10}\n"
@@ -134,15 +163,19 @@ def main():
 
     model = build_hybrid_stdf_grdr(opts_dict['network'])
     load_stdf_weights(model.enhancer, args.stdf_ckpt)
-    model.freeze_enhancer()
+    for param in model.parameters():
+        param.requires_grad = False
+    model.unfreeze_guidance_net()
     model = model.to(device)
     model.enhancer.eval()
-    model.diffusion.train()
+    model.diffusion.eval()
+    model.guidance_net.train()
 
-    assert opts_dict['train']['optim'].pop('type') == 'Adam', 'Not implemented.'
+    optim_opts = dict(opts_dict['train']['optim'])
+    assert optim_opts.pop('type') == 'Adam', 'Not implemented.'
     optimizer = optim.Adam(
-        [p for p in model.diffusion.parameters() if p.requires_grad],
-        **opts_dict['train']['optim'],
+        [p for p in model.guidance_net.parameters() if p.requires_grad],
+        **optim_opts,
     )
 
     if rank == 0:
@@ -176,12 +209,18 @@ def main():
                 [lq_data[:, :, i, ...] for i in range(c)],
                 dim=1,
             )
+            rate_cond = make_rate_cond(
+                gt_data.size(0),
+                device,
+                rate_dim=rate_dim,
+                qp=args.qp,
+            )
 
             optimizer.zero_grad()
-            outputs = model.training_loss(
+            outputs = model.guidance_training_loss(
                 input_data,
                 gt_data,
-                rate_cond=None,
+                rate_cond=rate_cond,
                 freeze_base=True,
             )
             loss = outputs['loss']
@@ -189,22 +228,22 @@ def main():
             optimizer.step()
 
             if rank == 0 and num_iter_accum % interval_print == 0:
-                lr = optimizer.param_groups[0]['lr']
-                guidance_mean = float(outputs['guidance'].mean().detach().cpu())
-                write_area = float(outputs['write_mask'].mean().detach().cpu())
-                base_mean = float(outputs['base'].mean().detach().cpu())
-                diff_loss = outputs['diffusion_loss']
-                rec_loss = outputs['reconstruction_loss']
+                iou, f1 = mask_iou_and_f1(
+                    outputs['pred_guidance'],
+                    outputs['oracle_guidance'],
+                    threshold=guidance_threshold,
+                )
                 msg = (
                     f"iter: [{num_iter_accum}]/{num_iter}, "
                     f"epoch: [{current_epoch}]/{num_epoch - 1}, "
-                    f"lr: [{lr * 1e4:.3f}]x1e-4, "
                     f"loss: [{loss.item():.4f}], "
-                    f"diff_loss: [{diff_loss.item():.4f}], "
-                    f"rec_loss: [{rec_loss.item():.4f}], "
-                    f"guidance_mean: [{guidance_mean:.4f}], "
-                    f"write_area: [{write_area:.4f}], "
-                    f"base_mean: [{base_mean:.4f}]"
+                    f"l1: [{outputs['guidance_l1_loss'].item():.4f}], "
+                    f"bce: [{outputs['guidance_bce_loss'].item():.4f}], "
+                    f"tv: [{outputs['guidance_tv_loss'].item():.4f}], "
+                    f"pred_mean: [{outputs['pred_guidance'].mean().item():.4f}], "
+                    f"oracle_mean: [{outputs['oracle_guidance'].mean().item():.4f}], "
+                    f"mask_iou: [{iou:.4f}], "
+                    f"mask_f1: [{f1:.4f}]"
                 )
                 print(msg)
                 log_fp.write(msg + '\n')
@@ -221,11 +260,11 @@ def main():
                     'num_iter_accum': num_iter_accum,
                     'stdf_ckpt': args.stdf_ckpt,
                     'state_dict': model.state_dict(),
-                    'diffusion_state_dict': model.diffusion.state_dict(),
+                    'guidance_state_dict': model.guidance_net.state_dict(),
                     'optimizer': optimizer.state_dict(),
                 }
                 torch.save(state, checkpoint_save_path)
-                msg = f"> GRDR model saved at {checkpoint_save_path}"
+                msg = f"> Guidance model saved at {checkpoint_save_path}"
                 print(msg)
                 log_fp.write(msg + '\n')
                 log_fp.flush()

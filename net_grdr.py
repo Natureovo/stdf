@@ -159,12 +159,22 @@ class GuidedResidualDiffusion(nn.Module):
             beta_start=1e-4,
             beta_end=2e-2,
             loss_type='l1',
-            loss_bg_weight=0.05):
+            loss_bg_weight=0.05,
+            rec_weight=0.0,
+            train_guidance_threshold=0.3,
+            train_residual_scale=0.05,
+            train_residual_clip=0.1,
+            train_use_hard_mask=True):
         super(GuidedResidualDiffusion, self).__init__()
         self.denoiser = denoiser
         self.num_steps = num_steps
         self.loss_type = loss_type
         self.loss_bg_weight = loss_bg_weight
+        self.rec_weight = rec_weight
+        self.train_guidance_threshold = train_guidance_threshold
+        self.train_residual_scale = train_residual_scale
+        self.train_residual_clip = train_residual_clip
+        self.train_use_hard_mask = train_use_hard_mask
 
         betas = torch.linspace(beta_start, beta_end, num_steps, dtype=torch.float32)
         alphas = 1.0 - betas
@@ -188,7 +198,20 @@ class GuidedResidualDiffusion(nn.Module):
             _extract(self.sqrt_one_minus_alphas_cumprod, t, residual.shape) * noise
         )
 
-    def training_loss(self, lq, base, gt, guidance, rate_cond=None):
+    def predict_residual_from_noise(self, noisy_residual, t, pred_noise):
+        pred_residual = (
+            noisy_residual -
+            _extract(self.sqrt_one_minus_alphas_cumprod, t, noisy_residual.shape) * pred_noise
+        ) / (_extract(self.sqrt_alphas_cumprod, t, noisy_residual.shape) + 1e-6)
+        return torch.nan_to_num(pred_residual, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def make_write_mask(self, guidance, use_hard_mask=True, guidance_threshold=0.3):
+        guidance = guidance.clamp(0, 1)
+        if use_hard_mask and guidance_threshold is not None:
+            return (guidance >= guidance_threshold).float()
+        return guidance
+
+    def training_losses(self, lq, base, gt, guidance, rate_cond=None):
         residual = gt - base
         t = torch.randint(0, self.num_steps, (gt.size(0),), device=gt.device).long()
         noise = torch.randn_like(residual)
@@ -201,7 +224,36 @@ class GuidedResidualDiffusion(nn.Module):
 
         guidance_weight = guidance.detach().clamp(0, 1)
         weight = self.loss_bg_weight + (1.0 - self.loss_bg_weight) * guidance_weight
-        return (loss_map * weight).sum() / (weight.sum() + 1e-6)
+        diff_loss = (loss_map * weight).sum() / (weight.sum() + 1e-6)
+
+        pred_residual = self.predict_residual_from_noise(noisy_residual, t, pred_noise)
+        if self.train_residual_clip is not None and self.train_residual_clip > 0:
+            pred_residual = pred_residual.clamp(-self.train_residual_clip, self.train_residual_clip)
+        write_mask = self.make_write_mask(
+            guidance,
+            use_hard_mask=self.train_use_hard_mask,
+            guidance_threshold=self.train_guidance_threshold,
+        )
+        pred_hybrid = (base + self.train_residual_scale * write_mask * pred_residual).clamp(0, 1)
+        rec_loss = torch.sqrt((pred_hybrid - gt).pow(2) + 1e-6).mean()
+        total_loss = diff_loss + self.rec_weight * rec_loss
+
+        return {
+            'loss': total_loss,
+            'diffusion_loss': diff_loss,
+            'reconstruction_loss': rec_loss,
+            'pred_hybrid': pred_hybrid,
+            'write_mask': write_mask,
+        }
+
+    def training_loss(self, lq, base, gt, guidance, rate_cond=None):
+        return self.training_losses(
+            lq,
+            base,
+            gt,
+            guidance,
+            rate_cond=rate_cond,
+        )['loss']
 
     @torch.no_grad()
     def sample_residual(self, lq, base, guidance, rate_cond=None, steps=None):
@@ -269,4 +321,9 @@ def build_grdr(opts=None):
         beta_end=opts.get('beta_end', 2e-2),
         loss_type=opts.get('loss_type', 'l1'),
         loss_bg_weight=opts.get('loss_bg_weight', 0.05),
+        rec_weight=opts.get('rec_weight', 0.0),
+        train_guidance_threshold=opts.get('train_guidance_threshold', 0.3),
+        train_residual_scale=opts.get('train_residual_scale', 0.05),
+        train_residual_clip=opts.get('train_residual_clip', 0.1),
+        train_use_hard_mask=opts.get('train_use_hard_mask', True),
     )

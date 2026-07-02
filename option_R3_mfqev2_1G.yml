@@ -69,6 +69,21 @@ network:
     sample_steps: 20
     loss_type: l1
     loss_bg_weight: 0.05  # keep a weak full-frame constraint, but focus GRDR loss on guided detail regions
+    rec_weight: 1.0  # direct final-output reconstruction loss: Y_hybrid should move toward GT
+    train_guidance_threshold: 0.3
+    train_residual_scale: 0.05
+    train_residual_clip: 0.1
+    train_use_hard_mask: True
+
+  guidance_net:
+    enabled: True  # no-GT local detail-loss guidance predictor
+    in_nc: 1
+    nf: 32
+    rate_dim: 0  # set to 1 when QP/bitrate condition is enabled
+    target_threshold: 0.3
+    l1_weight: 1.0
+    bce_weight: 0.5
+    tv_weight: 0.05
 
   detail_guidance:
     gradient_weight: 0.35
