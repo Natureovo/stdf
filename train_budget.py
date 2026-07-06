@@ -21,6 +21,12 @@ def parse_args():
     parser.add_argument('--stdf_ckpt', required=True)
     parser.add_argument('--guidance_ckpt', default=None)
     parser.add_argument(
+        '--budget_target_mode',
+        default=None,
+        choices=['mean_guidance', 'threshold_coverage'],
+        help='Override budget_net.target_mode in config.',
+    )
+    parser.add_argument(
         '--guidance_source',
         default='oracle',
         choices=['oracle', 'predicted', 'coarse'],
@@ -51,6 +57,9 @@ def load_opts(args):
         opts_dict['train']['interval_val'] = args.interval_save
     if args.exp_name is not None:
         opts_dict['train']['exp_name'] = args.exp_name
+    if args.budget_target_mode is not None:
+        opts_dict['network'].setdefault('budget_net', {})
+        opts_dict['network']['budget_net']['target_mode'] = args.budget_target_mode
     if opts_dict['train']['exp_name'] is None:
         opts_dict['train']['exp_name'] = utils.get_timestr()
     else:
@@ -139,6 +148,7 @@ def main():
             f"STDF checkpoint: [{args.stdf_ckpt}]\n"
             f"Guidance checkpoint: [{args.guidance_ckpt}]\n"
             f"Guidance source: [{args.guidance_source}]\n"
+            f"Budget target mode: [{budget_opts.get('target_mode', 'mean_guidance')}]\n"
             f"\n{'<' * 10} Options {'>' * 10}\n"
             f"{utils.dict2str(opts_dict)}"
         )
@@ -305,4 +315,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

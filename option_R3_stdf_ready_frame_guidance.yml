@@ -66,7 +66,7 @@ network:
     train_content_ratio_max_scale: 1.35
     train_residual_scale: 0.05
     train_residual_clip: 0.1
-    train_use_hard_mask: True
+    train_use_hard_mask: False
 
   guidance_net:
     enabled: True
@@ -75,10 +75,10 @@ network:
     rate_dim: 1
     target_threshold: 0.20
     log_thresholds: [0.15, 0.20, 0.25, 0.30]
-    l1_weight: 1.2
-    bce_weight: 0.5
-    dice_weight: 0.3
-    soft_iou_weight: 0.3
+    l1_weight: 1.5
+    bce_weight: 0.3
+    dice_weight: 0.1
+    soft_iou_weight: 0.1
     tv_weight: 0.01
 
   budget_net:
@@ -88,6 +88,7 @@ network:
     min_budget: 0.02
     max_budget: 0.45
     target_threshold: 0.20
+    target_mode: mean_guidance
     l1_weight: 1.0
     mse_weight: 0.25
 

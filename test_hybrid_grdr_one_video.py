@@ -288,7 +288,14 @@ def parse_args():
     parser.add_argument(
         '--soft_guidance',
         action='store_true',
+        default=True,
         help='Use soft guidance map instead of thresholded sparse mask.'
+    )
+    parser.add_argument(
+        '--hard_guidance',
+        dest='soft_guidance',
+        action='store_false',
+        help='Use hard threshold/top-ratio mask. Intended for ablations.'
     )
     parser.add_argument('--num_steps', type=int, default=1000)
     parser.add_argument('--diff_nf', type=int, default=48)
@@ -417,7 +424,9 @@ def main():
         'guidance_soft_iou',
         'guidance_soft_dice',
         'oracle_budget',
+        'oracle_soft_budget',
         'write_oracle_budget_abs_gap',
+        'write_oracle_soft_budget_abs_gap',
     ]
     metric_counters = {
         'ori': make_metric_counters(metric_names),
@@ -548,11 +557,16 @@ def main():
             cur_mask_metrics = mask_metrics(compare_mask, oracle_mask)
             cur_mask_metrics.update(soft_guidance_metrics(guidance, oracle_guidance))
             oracle_budget = float(oracle_mask.float().mean().cpu())
+            oracle_soft_budget = float(oracle_guidance.mean().cpu())
             write_area = float(write_mask.mean().detach().cpu())
             cur_mask_metrics['oracle_budget'] = oracle_budget
+            cur_mask_metrics['oracle_soft_budget'] = oracle_soft_budget
             cur_mask_metrics['write_oracle_budget_abs_gap'] = abs(write_area - oracle_budget)
+            cur_mask_metrics['write_oracle_soft_budget_abs_gap'] = abs(
+                write_area - oracle_soft_budget
+            )
             if pred_budget is not None:
-                budget_mae_counter.accum(abs(float(pred_budget.mean().cpu()) - oracle_budget))
+                budget_mae_counter.accum(abs(float(pred_budget.mean().cpu()) - oracle_soft_budget))
             if perceptual_metric_names:
                 perceptual_values = {
                     'ori': calculate_optional_perceptual(
@@ -737,7 +751,7 @@ def main():
         'guidance_mean': guidance_counter.get_ave(),
         'write_area_ratio': mask_counter.get_ave(),
         'predicted_budget': budget_counter.get_ave() if budget_counter.time > 0 else None,
-        'budget_mae_vs_oracle': (
+        'budget_mae_vs_oracle_soft': (
             budget_mae_counter.get_ave() if budget_mae_counter.time > 0 else None
         ),
         'mean_abs_hybrid_minus_stdf': diff_counter.get_ave(),
@@ -767,10 +781,11 @@ def main():
     print('hybrid temporal_diff_error delta vs stdf [{}]'.format(
         fmt_optional(report['temporal_metrics']['delta_hybrid_vs_stdf']['temporal_diff_error'])
     ))
-    print('mask F1 [{:.4f}], mask IoU [{:.4f}], oracle budget [{:.4f}]'.format(
+    print('mask F1 [{:.4f}], mask IoU [{:.4f}], oracle hard/soft budget [{:.4f}/{:.4f}]'.format(
         report['local_generation_diagnostics']['mask_f1'],
         report['local_generation_diagnostics']['mask_iou'],
         report['local_generation_diagnostics']['oracle_budget'],
+        report['local_generation_diagnostics']['oracle_soft_budget'],
     ))
     print('write area ratio [{:.4f}]'.format(report['write_area_ratio']))
     print('avg total runtime [{:.4f}] s/frame, fps [{}]'.format(

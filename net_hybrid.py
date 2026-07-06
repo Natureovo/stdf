@@ -178,6 +178,7 @@ class HybridSTDFGRDR(nn.Module):
                 'target_threshold',
                 self.guidance_net_opts.get('target_threshold', 0.20),
             ),
+            target_mode=self.budget_net_opts.get('target_mode', 'mean_guidance'),
             l1_weight=self.budget_net_opts.get('l1_weight', 1.0),
             mse_weight=self.budget_net_opts.get('mse_weight', 0.25),
         )

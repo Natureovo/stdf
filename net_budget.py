@@ -37,20 +37,30 @@ class BudgetNet(nn.Module):
         return budget.clamp(self.min_budget, self.max_budget)
 
 
-def oracle_budget_from_guidance(oracle_guidance, threshold=0.20):
-    oracle_mask = oracle_guidance.detach().clamp(0, 1) >= threshold
-    return oracle_mask.float().mean(dim=(1, 2, 3), keepdim=False).view(-1, 1)
+def oracle_budget_from_guidance(
+        oracle_guidance,
+        threshold=0.20,
+        target_mode='mean_guidance'):
+    guidance = oracle_guidance.detach().clamp(0, 1)
+    if target_mode in ('mean_guidance', 'soft_mean', 'continuous_mean'):
+        return guidance.mean(dim=(1, 2, 3), keepdim=False).view(-1, 1)
+    if target_mode in ('threshold_coverage', 'hard_coverage'):
+        oracle_mask = guidance >= threshold
+        return oracle_mask.float().mean(dim=(1, 2, 3), keepdim=False).view(-1, 1)
+    raise ValueError(f'Unsupported budget target_mode: {target_mode}')
 
 
 def budget_prediction_losses(
         pred_budget,
         oracle_guidance,
         threshold=0.20,
+        target_mode='mean_guidance',
         l1_weight=1.0,
         mse_weight=0.25):
     target_budget = oracle_budget_from_guidance(
         oracle_guidance,
         threshold=threshold,
+        target_mode=target_mode,
     ).to(pred_budget.device)
     l1_loss = F.l1_loss(pred_budget, target_budget)
     mse_loss = F.mse_loss(pred_budget, target_budget)
