@@ -162,6 +162,15 @@ class GuidedResidualDiffusion(nn.Module):
             loss_bg_weight=0.05,
             rec_weight=0.0,
             train_guidance_threshold=0.3,
+            train_mask_mode='threshold',
+            train_top_ratio=None,
+            train_top_ratio_min=0.10,
+            train_top_ratio_max=0.22,
+            train_top_ratio_qp_min=27.0,
+            train_top_ratio_qp_max=42.0,
+            train_content_ratio_weight=0.50,
+            train_content_ratio_min_scale=0.70,
+            train_content_ratio_max_scale=1.35,
             train_residual_scale=0.05,
             train_residual_clip=0.1,
             train_use_hard_mask=True):
@@ -172,6 +181,15 @@ class GuidedResidualDiffusion(nn.Module):
         self.loss_bg_weight = loss_bg_weight
         self.rec_weight = rec_weight
         self.train_guidance_threshold = train_guidance_threshold
+        self.train_mask_mode = train_mask_mode
+        self.train_top_ratio = train_top_ratio
+        self.train_top_ratio_min = train_top_ratio_min
+        self.train_top_ratio_max = train_top_ratio_max
+        self.train_top_ratio_qp_min = train_top_ratio_qp_min
+        self.train_top_ratio_qp_max = train_top_ratio_qp_max
+        self.train_content_ratio_weight = train_content_ratio_weight
+        self.train_content_ratio_min_scale = train_content_ratio_min_scale
+        self.train_content_ratio_max_scale = train_content_ratio_max_scale
         self.train_residual_scale = train_residual_scale
         self.train_residual_clip = train_residual_clip
         self.train_use_hard_mask = train_use_hard_mask
@@ -205,10 +223,158 @@ class GuidedResidualDiffusion(nn.Module):
         ) / (_extract(self.sqrt_alphas_cumprod, t, noisy_residual.shape) + 1e-6)
         return torch.nan_to_num(pred_residual, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def make_write_mask(self, guidance, use_hard_mask=True, guidance_threshold=0.3):
+    def _top_ratio_mask(self, guidance, top_ratio):
+        if top_ratio is None:
+            raise ValueError('top_ratio should be set when mask_mode is top_ratio.')
+        b = guidance.size(0)
+        flat = guidance.reshape(b, -1)
+        if torch.is_tensor(top_ratio):
+            ratios = top_ratio.to(guidance.device).float().view(-1)
+            if ratios.numel() == 1:
+                ratios = ratios.expand(b)
+        else:
+            ratios = guidance.new_full((b,), float(top_ratio))
+        ratios = ratios.clamp(1.0 / flat.size(1), 1.0)
+
+        masks = []
+        total = flat.size(1)
+        for idx in range(b):
+            k = int(torch.ceil(ratios[idx] * total).item())
+            k = max(1, min(total, k))
+            threshold = flat[idx].topk(k, largest=True).values[-1]
+            masks.append((flat[idx] >= threshold).float())
+        return torch.stack(masks, dim=0).view_as(guidance)
+
+    def _qp_adaptive_top_ratio(
+            self,
+            guidance,
+            rate_cond,
+            top_ratio_min,
+            top_ratio_max,
+            top_ratio_qp_min,
+            top_ratio_qp_max):
+        if rate_cond is None:
+            raise ValueError('rate_cond should be set when mask_mode is qp_top_ratio.')
+        if rate_cond.dim() == 1:
+            rate_cond = rate_cond[:, None]
+        if rate_cond.size(1) < 1:
+            raise ValueError('rate_cond should contain normalized QP in the first channel.')
+
+        qp = rate_cond[:, 0].to(guidance.device).float() * 20.0 + 22.0
+        qp_min = float(top_ratio_qp_min)
+        qp_max = float(top_ratio_qp_max)
+        if qp_max <= qp_min:
+            raise ValueError('top_ratio_qp_max should be larger than top_ratio_qp_min.')
+
+        qp_alpha = ((qp - qp_min) / (qp_max - qp_min)).clamp(0, 1)
+        ratio_min = float(top_ratio_min)
+        ratio_max = float(top_ratio_max)
+        ratios = ratio_min + qp_alpha * (ratio_max - ratio_min)
+        return ratios.clamp(min=1e-6, max=1.0)
+
+    def _content_complexity(self, content_source):
+        if content_source is None:
+            raise ValueError('content_source should be set when mask_mode uses content.')
+        if content_source.size(1) > 1:
+            content = content_source.mean(dim=1, keepdim=True)
+        else:
+            content = content_source
+
+        dx = F.pad((content[:, :, :, 1:] - content[:, :, :, :-1]).abs(), (0, 1, 0, 0))
+        dy = F.pad((content[:, :, 1:, :] - content[:, :, :-1, :]).abs(), (0, 0, 0, 1))
+        grad = 0.5 * (dx + dy)
+        padded = F.pad(content, (1, 1, 1, 1), mode='reflect')
+        highfreq = (content - F.avg_pool2d(padded, kernel_size=3, stride=1)).abs()
+        detail = 0.5 * grad + 0.5 * highfreq
+
+        b = detail.size(0)
+        flat = detail.reshape(b, -1)
+        norm = flat.amax(dim=1, keepdim=True).clamp(min=1e-6)
+        return (flat / norm).mean(dim=1).clamp(0, 1)
+
+    def _content_adjust_top_ratio(
+            self,
+            ratios,
+            content_source,
+            content_ratio_weight,
+            content_ratio_min_scale,
+            content_ratio_max_scale):
+        complexity = self._content_complexity(content_source).to(ratios.device)
+        scale = 1.0 + float(content_ratio_weight) * (complexity - 0.5) * 2.0
+        scale = scale.clamp(
+            min=float(content_ratio_min_scale),
+            max=float(content_ratio_max_scale),
+        )
+        return (ratios * scale).clamp(min=1e-6, max=1.0)
+
+    def make_write_mask(
+            self,
+            guidance,
+            use_hard_mask=True,
+            guidance_threshold=0.3,
+            mask_mode='threshold',
+            top_ratio=None,
+            rate_cond=None,
+            content_source=None,
+            top_ratio_min=None,
+            top_ratio_max=None,
+            top_ratio_qp_min=None,
+            top_ratio_qp_max=None,
+            content_ratio_weight=None,
+            content_ratio_min_scale=None,
+            content_ratio_max_scale=None):
         guidance = guidance.clamp(0, 1)
-        if use_hard_mask and guidance_threshold is not None:
+        if not use_hard_mask:
+            return guidance
+        if mask_mode == 'top_ratio':
+            return self._top_ratio_mask(guidance, top_ratio)
+        if mask_mode in ('qp_top_ratio', 'qp_adaptive_top_ratio'):
+            ratios = self._qp_adaptive_top_ratio(
+                guidance,
+                rate_cond,
+                self.train_top_ratio_min if top_ratio_min is None else top_ratio_min,
+                self.train_top_ratio_max if top_ratio_max is None else top_ratio_max,
+                self.train_top_ratio_qp_min if top_ratio_qp_min is None else top_ratio_qp_min,
+                self.train_top_ratio_qp_max if top_ratio_qp_max is None else top_ratio_qp_max,
+            )
+            return self._top_ratio_mask(guidance, ratios)
+        if mask_mode in ('content_top_ratio', 'content_adaptive_top_ratio'):
+            if top_ratio is None:
+                top_ratio = self.train_top_ratio
+            if top_ratio is None:
+                ratio_min = self.train_top_ratio_min if top_ratio_min is None else top_ratio_min
+                ratio_max = self.train_top_ratio_max if top_ratio_max is None else top_ratio_max
+                top_ratio = 0.5 * (float(ratio_min) + float(ratio_max))
+            ratios = guidance.new_full((guidance.size(0),), float(top_ratio))
+            ratios = self._content_adjust_top_ratio(
+                ratios,
+                content_source,
+                self.train_content_ratio_weight if content_ratio_weight is None else content_ratio_weight,
+                self.train_content_ratio_min_scale if content_ratio_min_scale is None else content_ratio_min_scale,
+                self.train_content_ratio_max_scale if content_ratio_max_scale is None else content_ratio_max_scale,
+            )
+            return self._top_ratio_mask(guidance, ratios)
+        if mask_mode in ('content_qp_top_ratio', 'qp_content_top_ratio'):
+            ratios = self._qp_adaptive_top_ratio(
+                guidance,
+                rate_cond,
+                self.train_top_ratio_min if top_ratio_min is None else top_ratio_min,
+                self.train_top_ratio_max if top_ratio_max is None else top_ratio_max,
+                self.train_top_ratio_qp_min if top_ratio_qp_min is None else top_ratio_qp_min,
+                self.train_top_ratio_qp_max if top_ratio_qp_max is None else top_ratio_qp_max,
+            )
+            ratios = self._content_adjust_top_ratio(
+                ratios,
+                content_source,
+                self.train_content_ratio_weight if content_ratio_weight is None else content_ratio_weight,
+                self.train_content_ratio_min_scale if content_ratio_min_scale is None else content_ratio_min_scale,
+                self.train_content_ratio_max_scale if content_ratio_max_scale is None else content_ratio_max_scale,
+            )
+            return self._top_ratio_mask(guidance, ratios)
+        if mask_mode == 'threshold' and guidance_threshold is not None:
             return (guidance >= guidance_threshold).float()
+        if mask_mode != 'threshold':
+            raise ValueError(f'Unsupported mask_mode: {mask_mode}')
         return guidance
 
     def training_losses(self, lq, base, gt, guidance, rate_cond=None):
@@ -233,6 +399,17 @@ class GuidedResidualDiffusion(nn.Module):
             guidance,
             use_hard_mask=self.train_use_hard_mask,
             guidance_threshold=self.train_guidance_threshold,
+            mask_mode=self.train_mask_mode,
+            top_ratio=self.train_top_ratio,
+            rate_cond=rate_cond,
+            content_source=lq,
+            top_ratio_min=self.train_top_ratio_min,
+            top_ratio_max=self.train_top_ratio_max,
+            top_ratio_qp_min=self.train_top_ratio_qp_min,
+            top_ratio_qp_max=self.train_top_ratio_qp_max,
+            content_ratio_weight=self.train_content_ratio_weight,
+            content_ratio_min_scale=self.train_content_ratio_min_scale,
+            content_ratio_max_scale=self.train_content_ratio_max_scale,
         )
         pred_hybrid = (base + self.train_residual_scale * write_mask * pred_residual).clamp(0, 1)
         rec_loss = torch.sqrt((pred_hybrid - gt).pow(2) + 1e-6).mean()
@@ -286,6 +463,15 @@ class GuidedResidualDiffusion(nn.Module):
             rate_cond=None,
             steps=None,
             guidance_threshold=0.6,
+            mask_mode='threshold',
+            top_ratio=None,
+            top_ratio_min=None,
+            top_ratio_max=None,
+            top_ratio_qp_min=None,
+            top_ratio_qp_max=None,
+            content_ratio_weight=None,
+            content_ratio_min_scale=None,
+            content_ratio_max_scale=None,
             residual_scale=0.05,
             residual_clip=0.1,
             use_hard_mask=True):
@@ -298,10 +484,22 @@ class GuidedResidualDiffusion(nn.Module):
         if residual_clip is not None and residual_clip > 0:
             residual = residual.clamp(-residual_clip, residual_clip)
 
-        if use_hard_mask and guidance_threshold is not None:
-            mask = (guidance >= guidance_threshold).float()
-        else:
-            mask = guidance
+        mask = self.make_write_mask(
+            guidance,
+            use_hard_mask=use_hard_mask,
+            guidance_threshold=guidance_threshold,
+            mask_mode=mask_mode,
+            top_ratio=top_ratio,
+            rate_cond=rate_cond,
+            content_source=lq,
+            top_ratio_min=top_ratio_min,
+            top_ratio_max=top_ratio_max,
+            top_ratio_qp_min=top_ratio_qp_min,
+            top_ratio_qp_max=top_ratio_qp_max,
+            content_ratio_weight=content_ratio_weight,
+            content_ratio_min_scale=content_ratio_min_scale,
+            content_ratio_max_scale=content_ratio_max_scale,
+        )
 
         return (base + residual_scale * mask * residual).clamp(0, 1)
 
@@ -323,6 +521,15 @@ def build_grdr(opts=None):
         loss_bg_weight=opts.get('loss_bg_weight', 0.05),
         rec_weight=opts.get('rec_weight', 0.0),
         train_guidance_threshold=opts.get('train_guidance_threshold', 0.3),
+        train_mask_mode=opts.get('train_mask_mode', 'threshold'),
+        train_top_ratio=opts.get('train_top_ratio', None),
+        train_top_ratio_min=opts.get('train_top_ratio_min', 0.10),
+        train_top_ratio_max=opts.get('train_top_ratio_max', 0.22),
+        train_top_ratio_qp_min=opts.get('train_top_ratio_qp_min', 27.0),
+        train_top_ratio_qp_max=opts.get('train_top_ratio_qp_max', 42.0),
+        train_content_ratio_weight=opts.get('train_content_ratio_weight', 0.50),
+        train_content_ratio_min_scale=opts.get('train_content_ratio_min_scale', 0.70),
+        train_content_ratio_max_scale=opts.get('train_content_ratio_max_scale', 1.35),
         train_residual_scale=opts.get('train_residual_scale', 0.05),
         train_residual_clip=opts.get('train_residual_clip', 0.1),
         train_use_hard_mask=opts.get('train_use_hard_mask', True),

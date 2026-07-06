@@ -29,6 +29,12 @@ def parse_args():
     parser.add_argument('--interval_print', type=int, default=None)
     parser.add_argument('--interval_save', type=int, default=None)
     parser.add_argument('--exp_name', default=None)
+    parser.add_argument(
+        '--qp',
+        type=float,
+        default=None,
+        help='Optional QP value. Used when dataset does not provide qp.',
+    )
     return parser.parse_args()
 
 
@@ -78,6 +84,25 @@ def count_trainable_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def make_rate_cond(batch_size, device, rate_dim, qp):
+    if rate_dim <= 0:
+        return None
+    if qp is None:
+        qp_tensor = torch.full((batch_size,), 37.0, device=device)
+    elif torch.is_tensor(qp):
+        qp_tensor = qp.float().view(-1).to(device)
+        if qp_tensor.numel() == 1:
+            qp_tensor = qp_tensor.expand(batch_size)
+        elif qp_tensor.numel() != batch_size:
+            raise ValueError(
+                f'QP batch size mismatch: {qp_tensor.numel()} vs {batch_size}'
+            )
+    else:
+        qp_tensor = torch.full((batch_size,), float(qp), device=device)
+    rate_value = ((qp_tensor - 22.0) / 20.0).view(batch_size, 1)
+    return rate_value.repeat(1, rate_dim)
+
+
 def main():
     args = parse_args()
     opts_dict = load_opts(args)
@@ -86,6 +111,10 @@ def main():
     num_iter = int(opts_dict['train']['num_iter'])
     interval_print = int(opts_dict['train']['interval_print'])
     interval_save = int(opts_dict['train']['interval_val'])
+    diffusion_opts = opts_dict['network'].get('diffusion', {})
+    mask_mode = diffusion_opts.get('train_mask_mode', 'threshold')
+    needs_qp = 'qp' in str(mask_mode)
+    rate_dim = max(diffusion_opts.get('rate_dim', 0), 1 if needs_qp else 0)
 
     if rank == 0:
         exp_dir = op.dirname(opts_dict['train']['log_path'])
@@ -176,12 +205,21 @@ def main():
                 [lq_data[:, :, i, ...] for i in range(c)],
                 dim=1,
             )
+            batch_qp = train_data.get('qp', None)
+            if batch_qp is None:
+                batch_qp = args.qp
+            rate_cond = make_rate_cond(
+                gt_data.size(0),
+                device,
+                rate_dim=rate_dim,
+                qp=batch_qp,
+            )
 
             optimizer.zero_grad()
             outputs = model.training_loss(
                 input_data,
                 gt_data,
-                rate_cond=None,
+                rate_cond=rate_cond,
                 freeze_base=True,
             )
             loss = outputs['loss']

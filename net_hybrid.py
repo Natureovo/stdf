@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from net_grdr import build_grdr
 from net_guidance import build_guidance_net, guidance_prediction_losses
+from net_budget import build_budget_net, budget_prediction_losses
 from net_stdf import MFVQE
 from utils.detail_guidance import compute_detail_guidance
 
@@ -27,8 +28,10 @@ class HybridSTDFGRDR(nn.Module):
         self.enhancer = MFVQE(opts_dict)
         self.diffusion = build_grdr(opts_dict.get('diffusion', {}))
         self.guidance_net = build_guidance_net(opts_dict.get('guidance_net', {}))
+        self.budget_net = build_budget_net(opts_dict.get('budget_net', {}))
         self.guidance_opts = opts_dict.get('detail_guidance', {})
         self.guidance_net_opts = opts_dict.get('guidance_net', {})
+        self.budget_net_opts = opts_dict.get('budget_net', {})
 
     def center_frame(self, x):
         frm_lst = [
@@ -61,6 +64,14 @@ class HybridSTDFGRDR(nn.Module):
         for param in self.guidance_net.parameters():
             param.requires_grad = True
 
+    def freeze_budget_net(self):
+        for param in self.budget_net.parameters():
+            param.requires_grad = False
+
+    def unfreeze_budget_net(self):
+        for param in self.budget_net.parameters():
+            param.requires_grad = True
+
     def make_guidance(self, gt, base):
         maps = compute_detail_guidance(
             gt,
@@ -78,6 +89,9 @@ class HybridSTDFGRDR(nn.Module):
 
     def predict_guidance(self, lq, base, rate_cond=None):
         return self.guidance_net(lq, base, rate_cond=rate_cond)
+
+    def predict_budget(self, lq, base, guidance=None, rate_cond=None):
+        return self.budget_net(lq, base, guidance=guidance, rate_cond=rate_cond)
 
     def forward_base(self, x):
         return self.enhancer(x)
@@ -116,6 +130,67 @@ class HybridSTDFGRDR(nn.Module):
             'lq': lq,
             'oracle_guidance': guidance_maps['guidance'],
             'pred_guidance': pred_guidance,
+            'guidance_maps': guidance_maps,
+        }
+
+    def budget_training_loss(
+            self,
+            x,
+            gt,
+            rate_cond=None,
+            freeze_base=True,
+            guidance_source='oracle',
+            detach_guidance=True):
+        if freeze_base:
+            with torch.no_grad():
+                base = self.forward_base(x)
+        else:
+            base = self.forward_base(x)
+        lq = self.center_frame(x)
+        guidance_maps = self.make_guidance(gt, base.detach())
+        oracle_guidance = guidance_maps['guidance']
+
+        if guidance_source == 'oracle':
+            budget_guidance = oracle_guidance
+        elif guidance_source == 'predicted':
+            budget_guidance = self.predict_guidance(
+                lq,
+                base.detach() if freeze_base else base,
+                rate_cond=rate_cond,
+            )
+        elif guidance_source == 'coarse':
+            budget_guidance = self.make_coarse_guidance(lq, base.detach())
+        else:
+            raise ValueError(f'Unsupported guidance_source: {guidance_source}')
+        if detach_guidance:
+            budget_guidance = budget_guidance.detach()
+
+        pred_budget = self.predict_budget(
+            lq,
+            base.detach() if freeze_base else base,
+            guidance=budget_guidance,
+            rate_cond=rate_cond,
+        )
+        loss_dict = budget_prediction_losses(
+            pred_budget,
+            oracle_guidance,
+            threshold=self.budget_net_opts.get(
+                'target_threshold',
+                self.guidance_net_opts.get('target_threshold', 0.20),
+            ),
+            l1_weight=self.budget_net_opts.get('l1_weight', 1.0),
+            mse_weight=self.budget_net_opts.get('mse_weight', 0.25),
+        )
+        return {
+            'loss': loss_dict['loss'],
+            'budget_l1_loss': loss_dict['l1_loss'],
+            'budget_mse_loss': loss_dict['mse_loss'],
+            'target_budget': loss_dict['target_budget'],
+            'pred_budget': pred_budget,
+            'base': base,
+            'lq': lq,
+            'oracle_guidance': oracle_guidance,
+            'budget_guidance': budget_guidance,
             'guidance_maps': guidance_maps,
         }
 
@@ -171,10 +246,14 @@ class HybridSTDFGRDR(nn.Module):
             rate_cond=None,
             steps=None,
             guidance_threshold=0.6,
+            mask_mode='threshold',
+            top_ratio=None,
             residual_scale=0.05,
             residual_clip=0.1,
             use_hard_mask=True,
-            guidance_mode='coarse'):
+            guidance_mode='coarse',
+            budget=None,
+            budget_mode='none'):
         base = self.forward_base(x)
         lq = self.center_frame(x)
         if guidance is None:
@@ -186,6 +265,20 @@ class HybridSTDFGRDR(nn.Module):
                 raise ValueError(
                     'refine only supports predicted/coarse guidance when guidance is None.'
                 )
+        pred_budget = None
+        if budget is not None:
+            top_ratio = budget
+        elif budget_mode == 'predicted':
+            pred_budget = self.predict_budget(
+                lq,
+                base,
+                guidance=guidance.clamp(0, 1),
+                rate_cond=rate_cond,
+            )
+            top_ratio = pred_budget
+            mask_mode = 'top_ratio'
+        elif budget_mode not in ('none', None):
+            raise ValueError(f'Unsupported budget_mode: {budget_mode}')
         refined = self.diffusion.refine(
             lq,
             base,
@@ -193,6 +286,8 @@ class HybridSTDFGRDR(nn.Module):
             rate_cond=rate_cond,
             steps=steps,
             guidance_threshold=guidance_threshold,
+            mask_mode=mask_mode,
+            top_ratio=top_ratio,
             residual_scale=residual_scale,
             residual_clip=residual_clip,
             use_hard_mask=use_hard_mask,
@@ -200,6 +295,7 @@ class HybridSTDFGRDR(nn.Module):
         return {
             'base': base,
             'guidance': guidance,
+            'budget': pred_budget if pred_budget is not None else budget,
             'refined': refined,
         }
 

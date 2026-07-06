@@ -3,6 +3,7 @@ import json
 import os
 import os.path as op
 import re
+import time
 from collections import OrderedDict
 
 import numpy as np
@@ -65,6 +66,20 @@ def load_guidance_weights(guidance_net, path):
         guidance_net.load_state_dict(guidance_state, strict=True)
 
 
+def load_budget_weights(budget_net, path):
+    state_dict, checkpoint = load_state_dict(path)
+    if 'budget_state_dict' in checkpoint:
+        budget_net.load_state_dict(checkpoint['budget_state_dict'], strict=True)
+    else:
+        budget_state = OrderedDict()
+        for key, value in state_dict.items():
+            if key.startswith('budget_net.'):
+                budget_state[key[len('budget_net.'):]] = value
+        if not budget_state:
+            budget_state = state_dict
+        budget_net.load_state_dict(budget_state, strict=True)
+
+
 def psnr_np(x, y):
     return utils.calculate_psnr_np(x, y, data_range=1.0)
 
@@ -97,12 +112,95 @@ def fmt_optional(value, fmt='{:.6f}'):
     return fmt.format(value)
 
 
+def sync_if_cuda(device):
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+
+
+def count_params(module):
+    return sum(param.numel() for param in module.parameters())
+
+
+def mask_metrics(pred_mask, target_mask):
+    pred = pred_mask.detach().bool()
+    target = target_mask.detach().bool()
+    inter = (pred & target).float().sum()
+    pred_sum = pred.float().sum()
+    target_sum = target.float().sum()
+    union = (pred | target).float().sum()
+    precision = inter / (pred_sum + 1e-6)
+    recall = inter / (target_sum + 1e-6)
+    f1 = 2.0 * precision * recall / (precision + recall + 1e-6)
+    iou = inter / (union + 1e-6)
+    return {
+        'mask_precision': float(precision.cpu()),
+        'mask_recall': float(recall.cpu()),
+        'mask_f1': float(f1.cpu()),
+        'mask_iou': float(iou.cpu()),
+    }
+
+
+def soft_guidance_metrics(pred, target):
+    pred = pred.detach().clamp(0, 1)
+    target = target.detach().clamp(0, 1)
+    soft_iou = torch.minimum(pred, target).sum() / (
+        torch.maximum(pred, target).sum() + 1e-6
+    )
+    soft_dice = 2.0 * (pred * target).sum() / (
+        pred.sum() + target.sum() + 1e-6
+    )
+    return {
+        'guidance_soft_iou': float(soft_iou.cpu()),
+        'guidance_soft_dice': float(soft_dice.cpu()),
+    }
+
+
 def make_rate_cond(batch_size, device, rate_dim, qp):
     if rate_dim <= 0:
         return None
     qp_value = 37.0 if qp is None else float(qp)
     rate_value = (qp_value - 22.0) / 20.0
     return torch.full((batch_size, rate_dim), rate_value, device=device)
+
+
+def load_optional_perceptual_models(device, enabled):
+    models = {'lpips': None, 'dists': None}
+    availability = {'lpips': False, 'dists': False}
+    if not enabled:
+        return models, availability
+    try:
+        import lpips
+        models['lpips'] = lpips.LPIPS(net='alex').to(device).eval()
+        availability['lpips'] = True
+    except Exception as exc:
+        availability['lpips_error'] = str(exc)
+    try:
+        from DISTS_pytorch import DISTS
+        models['dists'] = DISTS().to(device).eval()
+        availability['dists'] = True
+    except Exception as exc:
+        availability['dists_error'] = str(exc)
+    return models, availability
+
+
+def y_tensor_to_rgb(y):
+    y = y.clamp(0, 1)
+    if y.size(1) == 1:
+        y = y.repeat(1, 3, 1, 1)
+    return y
+
+
+def calculate_optional_perceptual(models, ref, img):
+    values = {}
+    ref_rgb = y_tensor_to_rgb(ref)
+    img_rgb = y_tensor_to_rgb(img)
+    if models.get('lpips') is not None:
+        lpips_ref = ref_rgb * 2.0 - 1.0
+        lpips_img = img_rgb * 2.0 - 1.0
+        values['lpips'] = float(models['lpips'](lpips_ref, lpips_img).mean().cpu())
+    if models.get('dists') is not None:
+        values['dists'] = float(models['dists'](ref_rgb, img_rgb).mean().cpu())
+    return values
 
 
 def build_opts(args):
@@ -139,6 +237,13 @@ def build_opts(args):
             'rate_dim': args.guidance_rate_dim,
             'target_threshold': args.guidance_target_threshold,
         },
+        'budget_net': {
+            'in_dim': 18,
+            'hidden_dim': args.budget_hidden_dim,
+            'min_budget': args.budget_min,
+            'max_budget': args.budget_max,
+            'target_threshold': args.guidance_target_threshold,
+        },
         'detail_guidance': {
             'gradient_weight': 0.35,
             'highfreq_weight': 0.40,
@@ -160,11 +265,24 @@ def parse_args():
     parser.add_argument('--stdf_ckpt', required=True)
     parser.add_argument('--grdr_ckpt', required=True)
     parser.add_argument('--guidance_ckpt', default=None)
+    parser.add_argument('--budget_ckpt', default=None)
     parser.add_argument('--out', default='outputs/hybrid_grdr')
     parser.add_argument('--save-name', default=None)
     parser.add_argument('--max_frames', type=int, default=None)
     parser.add_argument('--sample_steps', type=int, default=20)
     parser.add_argument('--guidance_threshold', type=float, default=0.6)
+    parser.add_argument(
+        '--mask_mode',
+        default='threshold',
+        choices=[
+            'threshold',
+            'top_ratio',
+            'qp_top_ratio',
+            'content_top_ratio',
+            'content_qp_top_ratio',
+        ],
+    )
+    parser.add_argument('--top_ratio', type=float, default=None)
     parser.add_argument('--residual_scale', type=float, default=0.05)
     parser.add_argument('--residual_clip', type=float, default=0.1)
     parser.add_argument(
@@ -179,6 +297,26 @@ def parse_args():
     parser.add_argument('--guidance_nf', type=int, default=32)
     parser.add_argument('--guidance_rate_dim', type=int, default=0)
     parser.add_argument('--guidance_target_threshold', type=float, default=0.3)
+    parser.add_argument('--budget_hidden_dim', type=int, default=64)
+    parser.add_argument('--budget_min', type=float, default=0.02)
+    parser.add_argument('--budget_max', type=float, default=0.45)
+    parser.add_argument(
+        '--enable_perceptual',
+        action='store_true',
+        help='Try optional LPIPS/DISTS metrics if the packages are installed.',
+    )
+    parser.add_argument(
+        '--oracle_budget_threshold',
+        type=float,
+        default=None,
+        help='Threshold used to derive oracle local-generation budget diagnostics.',
+    )
+    parser.add_argument(
+        '--budget_mode',
+        default='none',
+        choices=['none', 'predicted'],
+        help='predicted uses BudgetNet to choose top-ratio write area.',
+    )
     parser.add_argument(
         '--guidance_mode',
         default='oracle',
@@ -229,15 +367,58 @@ def main():
         if args.guidance_ckpt is None:
             raise ValueError('--guidance_ckpt is required for --guidance_mode predicted.')
         load_guidance_weights(model.guidance_net, args.guidance_ckpt)
+    if args.budget_mode == 'predicted':
+        if args.budget_ckpt is None:
+            raise ValueError('--budget_ckpt is required for --budget_mode predicted.')
+        load_budget_weights(model.budget_net, args.budget_ckpt)
 
     model = model.to(device)
     model.eval()
+    perceptual_models, perceptual_availability = load_optional_perceptual_models(
+        device,
+        args.enable_perceptual,
+    )
+    oracle_budget_threshold = (
+        args.guidance_target_threshold
+        if args.oracle_budget_threshold is None else
+        args.oracle_budget_threshold
+    )
+
+    params_report = {
+        'stdf': count_params(model.enhancer),
+        'diffusion': count_params(model.diffusion),
+        'guidance_net': count_params(model.guidance_net),
+        'budget_net': count_params(model.budget_net),
+        'total': count_params(model),
+    }
 
     ori_counter = utils.Counter()
     stdf_counter = utils.Counter()
     hybrid_counter = utils.Counter()
-    metric_names = ['psnr', 'ssim', 'mse', 'gradient_mae', 'highfreq_mae']
+    metric_names = [
+        'psnr',
+        'ssim',
+        'ms_ssim',
+        'mse',
+        'mae',
+        'gradient_mae',
+        'highfreq_mae',
+        'highfreq_corr',
+        'local_variance_mae',
+        'blockiness_error_8x8',
+        'blockiness_error_16x16',
+    ]
     temporal_metric_names = ['temporal_diff_error', 'temporal_activity']
+    mask_metric_names = [
+        'mask_precision',
+        'mask_recall',
+        'mask_f1',
+        'mask_iou',
+        'guidance_soft_iou',
+        'guidance_soft_dice',
+        'oracle_budget',
+        'write_oracle_budget_abs_gap',
+    ]
     metric_counters = {
         'ori': make_metric_counters(metric_names),
         'stdf': make_metric_counters(metric_names),
@@ -248,10 +429,25 @@ def main():
         'stdf': make_metric_counters(temporal_metric_names),
         'hybrid': make_metric_counters(temporal_metric_names),
     }
+    perceptual_metric_names = [
+        name for name, available in perceptual_availability.items()
+        if name in ('lpips', 'dists') and available
+    ]
+    perceptual_counters = {
+        'ori': make_metric_counters(perceptual_metric_names),
+        'stdf': make_metric_counters(perceptual_metric_names),
+        'hybrid': make_metric_counters(perceptual_metric_names),
+    }
+    mask_metric_counters = make_metric_counters(mask_metric_names)
     guidance_counter = utils.Counter()
     mask_counter = utils.Counter()
+    budget_counter = utils.Counter()
+    budget_mae_counter = utils.Counter()
     diff_counter = utils.Counter()
     max_diff_counter = utils.Counter()
+    stdf_time_counter = utils.Counter()
+    hybrid_time_counter = utils.Counter()
+    total_time_counter = utils.Counter()
     hybrid_y = []
     prev_gt_np = None
     prev_lq_np = None
@@ -267,12 +463,22 @@ def main():
         gt_np = raw_y[idx]
         with torch.no_grad():
             gt = torch.from_numpy(gt_np).to(device).view(1, 1, h, w)
+            total_start = time.perf_counter()
+            sync_if_cuda(device)
+            stdf_start = time.perf_counter()
             base = model.forward_base(input_data)
+            sync_if_cuda(device)
+            stdf_time_counter.accum(time.perf_counter() - stdf_start)
+            hybrid_start = time.perf_counter()
             lq_center = torch.from_numpy(lq_y[idx]).to(device).view(1, 1, h, w)
             rate_cond = make_rate_cond(
                 batch_size=1,
                 device=device,
-                rate_dim=max(args.rate_dim, args.guidance_rate_dim),
+                rate_dim=max(
+                    args.rate_dim,
+                    args.guidance_rate_dim,
+                    1 if ('qp' in args.mask_mode or args.budget_mode == 'predicted') else 0,
+                ),
                 qp=args.qp,
             )
             diffusion_rate_cond = None
@@ -280,11 +486,14 @@ def main():
             if rate_cond is not None:
                 if args.rate_dim > 0:
                     diffusion_rate_cond = rate_cond[:, :args.rate_dim]
+                elif 'qp' in args.mask_mode:
+                    diffusion_rate_cond = rate_cond[:, :1]
                 if args.guidance_rate_dim > 0:
                     guidance_rate_cond = rate_cond[:, :args.guidance_rate_dim]
 
+            oracle_guidance = model.make_guidance(gt, base)['guidance']
             if args.guidance_mode == 'oracle':
-                guidance = model.make_guidance(gt, base)['guidance']
+                guidance = oracle_guidance
             elif args.guidance_mode == 'coarse':
                 guidance = model.make_coarse_guidance(lq_center, base)
             else:
@@ -293,6 +502,18 @@ def main():
                     base,
                     rate_cond=guidance_rate_cond,
                 )
+            top_ratio = args.top_ratio
+            pred_budget = None
+            effective_mask_mode = args.mask_mode
+            if args.budget_mode == 'predicted':
+                pred_budget = model.predict_budget(
+                    lq_center,
+                    base,
+                    guidance=guidance.clamp(0, 1),
+                    rate_cond=rate_cond[:, :1] if rate_cond is not None else None,
+                )
+                top_ratio = pred_budget
+                effective_mask_mode = 'top_ratio'
             refined = model.diffusion.refine(
                 lq_center,
                 base,
@@ -300,6 +521,8 @@ def main():
                 rate_cond=diffusion_rate_cond,
                 steps=args.sample_steps,
                 guidance_threshold=args.guidance_threshold,
+                mask_mode=effective_mask_mode,
+                top_ratio=top_ratio,
                 residual_scale=args.residual_scale,
                 residual_clip=args.residual_clip,
                 use_hard_mask=not args.soft_guidance,
@@ -307,7 +530,49 @@ def main():
             if args.soft_guidance:
                 write_mask = guidance.clamp(0, 1)
             else:
-                write_mask = (guidance >= args.guidance_threshold).float()
+                write_mask = model.diffusion.make_write_mask(
+                    guidance,
+                    use_hard_mask=True,
+                    guidance_threshold=args.guidance_threshold,
+                    mask_mode=effective_mask_mode,
+                    top_ratio=top_ratio,
+                    rate_cond=diffusion_rate_cond,
+                    content_source=lq_center,
+                )
+            sync_if_cuda(device)
+            hybrid_time_counter.accum(time.perf_counter() - hybrid_start)
+            total_time_counter.accum(time.perf_counter() - total_start)
+
+            oracle_mask = oracle_guidance >= oracle_budget_threshold
+            compare_mask = write_mask >= 0.5
+            cur_mask_metrics = mask_metrics(compare_mask, oracle_mask)
+            cur_mask_metrics.update(soft_guidance_metrics(guidance, oracle_guidance))
+            oracle_budget = float(oracle_mask.float().mean().cpu())
+            write_area = float(write_mask.mean().detach().cpu())
+            cur_mask_metrics['oracle_budget'] = oracle_budget
+            cur_mask_metrics['write_oracle_budget_abs_gap'] = abs(write_area - oracle_budget)
+            if pred_budget is not None:
+                budget_mae_counter.accum(abs(float(pred_budget.mean().cpu()) - oracle_budget))
+            if perceptual_metric_names:
+                perceptual_values = {
+                    'ori': calculate_optional_perceptual(
+                        perceptual_models,
+                        gt,
+                        lq_center,
+                    ),
+                    'stdf': calculate_optional_perceptual(
+                        perceptual_models,
+                        gt,
+                        base,
+                    ),
+                    'hybrid': calculate_optional_perceptual(
+                        perceptual_models,
+                        gt,
+                        refined,
+                    ),
+                }
+                for stage, values in perceptual_values.items():
+                    accum_metrics(perceptual_counters[stage], values)
 
         base_np = base[0, 0].detach().cpu().numpy().clip(0, 1)
         refined_np = refined[0, 0].detach().cpu().numpy().clip(0, 1)
@@ -355,8 +620,11 @@ def main():
             }
             for stage, values in temporal_values.items():
                 accum_metrics(temporal_counters[stage], values)
+        accum_metrics(mask_metric_counters, cur_mask_metrics)
         guidance_counter.accum(float(guidance.mean().detach().cpu()))
         mask_counter.accum(float(write_mask.mean().detach().cpu()))
+        if pred_budget is not None:
+            budget_counter.accum(float(pred_budget.mean().detach().cpu()))
         diff_counter.accum(float(diff_np.mean()))
         max_diff_counter.accum(float(diff_np.max()))
         prev_gt_np = gt_np
@@ -384,13 +652,44 @@ def main():
         'stdf_ckpt': args.stdf_ckpt,
         'grdr_ckpt': args.grdr_ckpt,
         'guidance_ckpt': args.guidance_ckpt,
+        'budget_ckpt': args.budget_ckpt,
         'sample_steps': args.sample_steps,
         'guidance_threshold': args.guidance_threshold,
+        'mask_mode': args.mask_mode,
+        'top_ratio': args.top_ratio,
+        'budget_mode': args.budget_mode,
         'residual_scale': args.residual_scale,
         'residual_clip': args.residual_clip,
         'soft_guidance': args.soft_guidance,
         'guidance_source': args.guidance_mode,
         'qp': args.qp,
+        'oracle_budget_threshold': oracle_budget_threshold,
+        'params': params_report,
+        'runtime': {
+            'device': str(device),
+            'avg_stdf_seconds_per_frame': stdf_time_counter.get_ave(),
+            'avg_hybrid_extra_seconds_per_frame': hybrid_time_counter.get_ave(),
+            'avg_total_seconds_per_frame': total_time_counter.get_ave(),
+            'fps_total': (
+                1.0 / total_time_counter.get_ave()
+                if total_time_counter.time > 0 and total_time_counter.get_ave() > 0
+                else None
+            ),
+        },
+        'perceptual_metrics': {
+            'enabled': args.enable_perceptual,
+            'availability': perceptual_availability,
+            'ori': average_metrics(perceptual_counters['ori']),
+            'stdf': average_metrics(perceptual_counters['stdf']),
+            'hybrid': average_metrics(perceptual_counters['hybrid']),
+            'delta_hybrid_vs_stdf': {
+                name: counter_delta(
+                    perceptual_counters['hybrid'][name],
+                    perceptual_counters['stdf'][name],
+                )
+                for name in perceptual_metric_names
+            },
+        },
         'psnr': {
             'ori': ori_counter.get_ave(),
             'stdf': stdf_counter.get_ave(),
@@ -434,8 +733,13 @@ def main():
                 for name in temporal_metric_names
             },
         },
+        'local_generation_diagnostics': average_metrics(mask_metric_counters),
         'guidance_mean': guidance_counter.get_ave(),
         'write_area_ratio': mask_counter.get_ave(),
+        'predicted_budget': budget_counter.get_ave() if budget_counter.time > 0 else None,
+        'budget_mae_vs_oracle': (
+            budget_mae_counter.get_ave() if budget_mae_counter.time > 0 else None
+        ),
         'mean_abs_hybrid_minus_stdf': diff_counter.get_ave(),
         'max_abs_hybrid_minus_stdf': max_diff_counter.get_ave(),
         'output_yuv': save_yuv_path,
@@ -463,7 +767,16 @@ def main():
     print('hybrid temporal_diff_error delta vs stdf [{}]'.format(
         fmt_optional(report['temporal_metrics']['delta_hybrid_vs_stdf']['temporal_diff_error'])
     ))
+    print('mask F1 [{:.4f}], mask IoU [{:.4f}], oracle budget [{:.4f}]'.format(
+        report['local_generation_diagnostics']['mask_f1'],
+        report['local_generation_diagnostics']['mask_iou'],
+        report['local_generation_diagnostics']['oracle_budget'],
+    ))
     print('write area ratio [{:.4f}]'.format(report['write_area_ratio']))
+    print('avg total runtime [{:.4f}] s/frame, fps [{}]'.format(
+        report['runtime']['avg_total_seconds_per_frame'],
+        fmt_optional(report['runtime']['fps_total'], fmt='{:.3f}'),
+    ))
     print('mean |hybrid-stdf| [{:.6f}]'.format(report['mean_abs_hybrid_minus_stdf']))
     print('max |hybrid-stdf| [{:.6f}]'.format(report['max_abs_hybrid_minus_stdf']))
     print(f'report saved to {report_path}')

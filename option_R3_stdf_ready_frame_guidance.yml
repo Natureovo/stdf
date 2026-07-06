@@ -56,6 +56,14 @@ network:
     loss_bg_weight: 0.05
     rec_weight: 1.0
     train_guidance_threshold: 0.3
+    train_mask_mode: content_qp_top_ratio
+    train_top_ratio_min: 0.10
+    train_top_ratio_max: 0.22
+    train_top_ratio_qp_min: 27.0
+    train_top_ratio_qp_max: 42.0
+    train_content_ratio_weight: 0.50
+    train_content_ratio_min_scale: 0.70
+    train_content_ratio_max_scale: 1.35
     train_residual_scale: 0.05
     train_residual_clip: 0.1
     train_use_hard_mask: True
@@ -65,12 +73,23 @@ network:
     in_nc: 1
     nf: 32
     rate_dim: 1
-    target_threshold: 0.15
-    l1_weight: 1.0
-    bce_weight: 0.2
-    dice_weight: 0.5
-    soft_iou_weight: 0.5
+    target_threshold: 0.20
+    log_thresholds: [0.15, 0.20, 0.25, 0.30]
+    l1_weight: 1.2
+    bce_weight: 0.5
+    dice_weight: 0.3
+    soft_iou_weight: 0.3
     tv_weight: 0.01
+
+  budget_net:
+    enabled: True
+    in_dim: 18
+    hidden_dim: 64
+    min_budget: 0.02
+    max_budget: 0.45
+    target_threshold: 0.20
+    l1_weight: 1.0
+    mse_weight: 0.25
 
   detail_guidance:
     gradient_weight: 0.35

@@ -24,7 +24,10 @@ rgb2gray, gray2rgb, bgr2rgb, rgb2bgr, paired_random_crop, augment,
 totensor)
 from .metrics import (
     calculate_psnr, calculate_ssim, calculate_mse, calculate_psnr_np,
-    calculate_gradient_mae, calculate_highfreq_mae,
+    calculate_mae, calculate_ms_ssim,
+    calculate_gradient_mae, calculate_highfreq_mae, calculate_highfreq_corr,
+    calculate_local_variance_mae,
+    calculate_blockiness_score, calculate_blockiness_error,
     calculate_temporal_difference_error, calculate_temporal_activity,
     calculate_frame_metrics,
 )
@@ -41,7 +44,10 @@ __all__ = [
     'gray2rgb', 'bgr2rgb', 'rgb2bgr', 'paired_random_crop', 'augment', 
     'totensor', 
     'calculate_psnr', 'calculate_ssim', 'calculate_mse', 'calculate_psnr_np',
+    'calculate_mae', 'calculate_ms_ssim',
     'calculate_gradient_mae', 'calculate_highfreq_mae',
+    'calculate_highfreq_corr', 'calculate_local_variance_mae',
+    'calculate_blockiness_score', 'calculate_blockiness_error',
     'calculate_temporal_difference_error', 'calculate_temporal_activity',
     'calculate_frame_metrics',
     'set_random_seed', 'init_dist', 'get_dist_info', 'DistSampler', 
