@@ -65,10 +65,12 @@ network:
     in_nc: 1
     nf: 32
     rate_dim: 1
-    target_threshold: 0.3
+    target_threshold: 0.15
     l1_weight: 1.0
-    bce_weight: 0.5
-    tv_weight: 0.05
+    bce_weight: 0.2
+    dice_weight: 0.5
+    soft_iou_weight: 0.5
+    tv_weight: 0.01
 
   detail_guidance:
     gradient_weight: 0.35

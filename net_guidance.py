@@ -106,21 +106,39 @@ def guidance_prediction_losses(
         threshold=0.3,
         l1_weight=1.0,
         bce_weight=0.5,
+        dice_weight=0.0,
+        soft_iou_weight=0.0,
         tv_weight=0.05):
     target = target.detach().clamp(0, 1)
     pred = pred.clamp(1e-6, 1 - 1e-6)
     l1_loss = F.l1_loss(pred, target)
     target_mask = (target >= threshold).float()
     bce_loss = F.binary_cross_entropy(pred, target_mask)
+    dims = (1, 2, 3)
+    inter = (pred * target_mask).sum(dim=dims)
+    pred_sum = pred.sum(dim=dims)
+    target_sum = target_mask.sum(dim=dims)
+    dice_score = (2.0 * inter + 1e-6) / (pred_sum + target_sum + 1e-6)
+    dice_loss = 1.0 - dice_score.mean()
+    soft_iou_score = (inter + 1e-6) / (pred_sum + target_sum - inter + 1e-6)
+    soft_iou_loss = 1.0 - soft_iou_score.mean()
     tv_loss = (
         (pred[:, :, :, 1:] - pred[:, :, :, :-1]).abs().mean() +
         (pred[:, :, 1:, :] - pred[:, :, :-1, :]).abs().mean()
     )
-    loss = l1_weight * l1_loss + bce_weight * bce_loss + tv_weight * tv_loss
+    loss = (
+        l1_weight * l1_loss +
+        bce_weight * bce_loss +
+        dice_weight * dice_loss +
+        soft_iou_weight * soft_iou_loss +
+        tv_weight * tv_loss
+    )
     return {
         'loss': loss,
         'l1_loss': l1_loss,
         'bce_loss': bce_loss,
+        'dice_loss': dice_loss,
+        'soft_iou_loss': soft_iou_loss,
         'tv_loss': tv_loss,
     }
 

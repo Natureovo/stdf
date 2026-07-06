@@ -115,6 +115,25 @@ def mask_iou_and_f1(pred, target, threshold):
     return float(iou.detach().cpu()), float(f1.detach().cpu())
 
 
+def guidance_diagnostics(pred, target, threshold):
+    pred = pred.detach().clamp(0, 1)
+    target = target.detach().clamp(0, 1)
+    target_mask = target >= threshold
+    pred_mask = pred >= threshold
+    inter = torch.minimum(pred, target).sum()
+    union = torch.maximum(pred, target).sum()
+    soft_iou = inter / (union + 1e-6)
+    soft_dice = 2.0 * (pred * target).sum() / (pred.sum() + target.sum() + 1e-6)
+    return {
+        'pred_max': float(pred.max().cpu()),
+        'oracle_max': float(target.max().cpu()),
+        'pred_pos_ratio': float(pred_mask.float().mean().cpu()),
+        'oracle_pos_ratio': float(target_mask.float().mean().cpu()),
+        'soft_iou': float(soft_iou.cpu()),
+        'soft_dice': float(soft_dice.cpu()),
+    }
+
+
 def main():
     args = parse_args()
     opts_dict = load_opts(args)
@@ -247,17 +266,45 @@ def main():
                     outputs['oracle_guidance'],
                     threshold=guidance_threshold,
                 )
+                low_thr = min(0.15, guidance_threshold)
+                low_iou, low_f1 = mask_iou_and_f1(
+                    outputs['pred_guidance'],
+                    outputs['oracle_guidance'],
+                    threshold=low_thr,
+                )
+                diag = guidance_diagnostics(
+                    outputs['pred_guidance'],
+                    outputs['oracle_guidance'],
+                    threshold=guidance_threshold,
+                )
+                diag_low = guidance_diagnostics(
+                    outputs['pred_guidance'],
+                    outputs['oracle_guidance'],
+                    threshold=low_thr,
+                )
                 msg = (
                     f"iter: [{num_iter_accum}]/{num_iter}, "
                     f"epoch: [{current_epoch}]/{num_epoch - 1}, "
                     f"loss: [{loss.item():.4f}], "
                     f"l1: [{outputs['guidance_l1_loss'].item():.4f}], "
                     f"bce: [{outputs['guidance_bce_loss'].item():.4f}], "
+                    f"dice: [{outputs['guidance_dice_loss'].item():.4f}], "
+                    f"soft_iou_loss: [{outputs['guidance_soft_iou_loss'].item():.4f}], "
                     f"tv: [{outputs['guidance_tv_loss'].item():.4f}], "
                     f"pred_mean: [{outputs['pred_guidance'].mean().item():.4f}], "
                     f"oracle_mean: [{outputs['oracle_guidance'].mean().item():.4f}], "
-                    f"mask_iou: [{iou:.4f}], "
-                    f"mask_f1: [{f1:.4f}]"
+                    f"pred_max: [{diag['pred_max']:.4f}], "
+                    f"oracle_max: [{diag['oracle_max']:.4f}], "
+                    f"soft_iou: [{diag['soft_iou']:.4f}], "
+                    f"soft_dice: [{diag['soft_dice']:.4f}], "
+                    f"pos@{guidance_threshold:g}: "
+                    f"[{diag['pred_pos_ratio']:.4f}/{diag['oracle_pos_ratio']:.4f}], "
+                    f"iou@{guidance_threshold:g}: [{iou:.4f}], "
+                    f"f1@{guidance_threshold:g}: [{f1:.4f}], "
+                    f"pos@{low_thr:g}: "
+                    f"[{diag_low['pred_pos_ratio']:.4f}/{diag_low['oracle_pos_ratio']:.4f}], "
+                    f"iou@{low_thr:g}: [{low_iou:.4f}], "
+                    f"f1@{low_thr:g}: [{low_f1:.4f}]"
                 )
                 print(msg)
                 log_fp.write(msg + '\n')
