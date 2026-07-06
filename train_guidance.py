@@ -85,9 +85,20 @@ def count_trainable_params(model):
 def make_rate_cond(batch_size, device, rate_dim, qp):
     if rate_dim <= 0:
         return None
-    qp_value = 37.0 if qp is None else float(qp)
-    rate_value = (qp_value - 22.0) / 20.0
-    return torch.full((batch_size, rate_dim), rate_value, device=device)
+    if qp is None:
+        qp_tensor = torch.full((batch_size,), 37.0, device=device)
+    elif torch.is_tensor(qp):
+        qp_tensor = qp.float().view(-1).to(device)
+        if qp_tensor.numel() == 1:
+            qp_tensor = qp_tensor.expand(batch_size)
+        elif qp_tensor.numel() != batch_size:
+            raise ValueError(
+                f'QP batch size mismatch: {qp_tensor.numel()} vs {batch_size}'
+            )
+    else:
+        qp_tensor = torch.full((batch_size,), float(qp), device=device)
+    rate_value = ((qp_tensor - 22.0) / 20.0).view(batch_size, 1)
+    return rate_value.repeat(1, rate_dim)
 
 
 def mask_iou_and_f1(pred, target, threshold):
@@ -209,11 +220,14 @@ def main():
                 [lq_data[:, :, i, ...] for i in range(c)],
                 dim=1,
             )
+            batch_qp = train_data.get('qp', None)
+            if batch_qp is None:
+                batch_qp = args.qp
             rate_cond = make_rate_cond(
                 gt_data.size(0),
                 device,
                 rate_dim=rate_dim,
-                qp=args.qp,
+                qp=batch_qp,
             )
 
             optimizer.zero_grad()

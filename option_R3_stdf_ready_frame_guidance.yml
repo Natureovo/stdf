@@ -1,0 +1,114 @@
+dataset:
+  train:
+    type: STDFReadyFrameDataset
+    root: /home/cp/桌面/yx/modelone/dataset
+    manifest_path: stdf_ready/manifests/frame_train.csv
+    gt_size: 128
+    use_flip: True
+    use_rot: True
+    enlarge_ratio: 20
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 8
+
+  val:
+    type: STDFReadyFrameDataset
+    root: /home/cp/桌面/yx/modelone/dataset
+    manifest_path: stdf_ready/manifests/frame_val.csv
+    use_flip: False
+    use_rot: False
+
+  test:
+    type: STDFReadyFrameDataset
+    root: /home/cp/桌面/yx/modelone/dataset
+    manifest_path: stdf_ready/manifests/frame_test.csv
+    use_flip: False
+    use_rot: False
+
+network:
+  radius: 3
+
+  stdf:
+    in_nc: 1
+    out_nc: 64
+    nf: 32
+    nb: 3
+    base_ks: 3
+    deform_ks: 3
+
+  qenet:
+    in_nc: 64
+    out_nc: 1
+    nf: 48
+    nb: 8
+    base_ks: 3
+
+  diffusion:
+    enabled: False
+    type: GRDR
+    freeze_stdf: True
+    in_nc: 1
+    nf: 48
+    cond_dim: 128
+    rate_dim: 0
+    num_steps: 1000
+    sample_steps: 20
+    loss_type: l1
+    loss_bg_weight: 0.05
+    rec_weight: 1.0
+    train_guidance_threshold: 0.3
+    train_residual_scale: 0.05
+    train_residual_clip: 0.1
+    train_use_hard_mask: True
+
+  guidance_net:
+    enabled: True
+    in_nc: 1
+    nf: 32
+    rate_dim: 1
+    target_threshold: 0.3
+    l1_weight: 1.0
+    bce_weight: 0.5
+    tv_weight: 0.05
+
+  detail_guidance:
+    gradient_weight: 0.35
+    highfreq_weight: 0.40
+    direction_weight: 0.15
+    variance_weight: 0.10
+
+train:
+  exp_name: STDFReady_frame_guidance
+  random_seed: 7
+  pre-val: False
+  num_iter: 2000
+  interval_print: 20
+  interval_val: 500
+  pbar_len: 100
+
+  optim:
+    type: Adam
+    lr: !!float 1e-4
+    betas: [0.9, 0.999]
+    eps: !!float 1e-08
+
+  scheduler:
+    is_on: False
+    type: CosineAnnealingRestartLR
+    periods: [!!float 5e+4]
+    restart_weights: [1]
+    eta_min: !!float 1e-7
+
+  loss:
+    type: CharbonnierLoss
+    eps: !!float 1e-6
+
+  criterion:
+    type: PSNR
+    unit: dB
+
+test:
+  restore_iter: 0
+  pbar_len: 100
+  criterion:
+    type: PSNR
+    unit: dB
