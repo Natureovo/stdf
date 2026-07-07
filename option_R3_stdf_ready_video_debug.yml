@@ -94,6 +94,7 @@ network:
     nf: 32
     rate_dim: 1
     gain_scale: 0.20
+    use_confidence: False
     carrier_source: base
     carrier_kernel: 5
     rec_weight: 1.0
