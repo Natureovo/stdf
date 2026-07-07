@@ -287,8 +287,13 @@ def main():
                 rec_loss = outputs['reconstruction_loss']
                 residual_loss = outputs['residual_loss']
                 residual_bg_loss = outputs['residual_bg_loss']
+                residual_sign_loss = outputs['residual_sign_loss']
+                residual_sign_acc = float(outputs['residual_sign_acc'].detach().cpu())
+                residual_corr = float(outputs['residual_corr'].detach().cpu())
                 pred_residual_abs = float(outputs['pred_residual_abs'].detach().cpu())
                 target_residual_abs = float(outputs['target_residual_abs'].detach().cpu())
+                applied_pred_abs = float(outputs['applied_pred_residual_abs'].detach().cpu())
+                applied_target_abs = float(outputs['applied_target_residual_abs'].detach().cpu())
                 msg = (
                     f"iter: [{num_iter_accum}]/{num_iter}, "
                     f"epoch: [{current_epoch}]/{num_epoch - 1}, "
@@ -298,8 +303,13 @@ def main():
                     f"rec_loss: [{rec_loss.item():.4f}], "
                     f"res_loss: [{residual_loss.item():.4f}], "
                     f"res_bg: [{residual_bg_loss.item():.4f}], "
+                    f"res_sign: [{residual_sign_loss.item():.4f}], "
+                    f"sign_acc: [{residual_sign_acc:.4f}], "
+                    f"res_corr: [{residual_corr:.4f}], "
                     f"pred_res_abs: [{pred_residual_abs:.4f}], "
                     f"target_res_abs: [{target_residual_abs:.4f}], "
+                    f"applied_pred_abs: [{applied_pred_abs:.4f}], "
+                    f"applied_target_abs: [{applied_target_abs:.4f}], "
                     f"guidance_mean: [{guidance_mean:.4f}], "
                     f"write_area: [{write_area:.4f}], "
                     f"base_mean: [{base_mean:.4f}]"

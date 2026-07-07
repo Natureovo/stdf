@@ -52,19 +52,22 @@ network:
     loss_bg_weight: 0.05
     rec_weight: 1.0
     train_guidance_threshold: 0.3
-    train_residual_scale: 0.05
+    train_residual_scale: 0.1
     train_residual_clip: 0.1
-    train_use_hard_mask: True
+    residual_weight: 1.0
+    residual_bg_weight: 0.05
+    residual_sign_weight: 0.2
+    train_use_hard_mask: False
 
   guidance_net:
     enabled: True
     in_nc: 1
     nf: 32
     rate_dim: 1
-    target_threshold: 0.3
+    target_threshold: 0.2
     l1_weight: 1.0
-    bce_weight: 0.5
-    tv_weight: 0.05
+    bce_weight: 0.0
+    tv_weight: 0.002
 
   detail_guidance:
     gradient_weight: 0.35

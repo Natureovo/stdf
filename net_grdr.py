@@ -175,6 +175,7 @@ class GuidedResidualDiffusion(nn.Module):
             train_residual_clip=0.1,
             residual_weight=0.0,
             residual_bg_weight=0.0,
+            residual_sign_weight=0.0,
             train_use_hard_mask=True):
         super(GuidedResidualDiffusion, self).__init__()
         self.denoiser = denoiser
@@ -196,6 +197,7 @@ class GuidedResidualDiffusion(nn.Module):
         self.train_residual_clip = train_residual_clip
         self.residual_weight = residual_weight
         self.residual_bg_weight = residual_bg_weight
+        self.residual_sign_weight = residual_sign_weight
         self.train_use_hard_mask = train_use_hard_mask
 
         betas = torch.linspace(beta_start, beta_end, num_steps, dtype=torch.float32)
@@ -420,15 +422,46 @@ class GuidedResidualDiffusion(nn.Module):
         )
         pred_hybrid = (base + self.train_residual_scale * write_mask * pred_residual).clamp(0, 1)
         rec_loss = torch.sqrt((pred_hybrid - gt).pow(2) + 1e-6).mean()
-        residual_abs = torch.sqrt((pred_residual - target_residual).pow(2) + 1e-6)
-        residual_loss = (residual_abs * guidance_weight).sum() / (guidance_weight.sum() + 1e-6)
-        bg_weight = 1.0 - guidance_weight
+
+        applied_pred_residual = self.train_residual_scale * write_mask * pred_residual
+        applied_target_residual = write_mask * target_residual
+        residual_abs = torch.sqrt(
+            (applied_pred_residual - applied_target_residual).pow(2) + 1e-6
+        )
+        residual_loss = (residual_abs * write_mask).sum() / (write_mask.sum() + 1e-6)
+
+        bg_weight = (1.0 - write_mask.detach()).clamp(0, 1)
         residual_bg_loss = (pred_residual.abs() * bg_weight).sum() / (bg_weight.sum() + 1e-6)
+
+        valid_sign = (target_residual.abs() > 1e-4).float()
+        sign_weight = (write_mask.detach().clamp(0, 1) * valid_sign).detach()
+        target_sign = target_residual.detach().sign()
+        residual_sign_loss = (
+            F.relu(-pred_residual * target_sign) * sign_weight
+        ).sum() / (sign_weight.sum() + 1e-6)
+
+        with torch.no_grad():
+            sign_acc = (
+                ((pred_residual * target_residual) > 0).float() * sign_weight
+            ).sum() / (sign_weight.sum() + 1e-6)
+            w_sum = sign_weight.sum() + 1e-6
+            pred_det = pred_residual.detach()
+            target_det = target_residual.detach()
+            pred_mean = (pred_det * sign_weight).sum() / w_sum
+            target_mean = (target_det * sign_weight).sum() / w_sum
+            pred_centered = pred_det - pred_mean
+            target_centered = target_det - target_mean
+            covariance = (pred_centered * target_centered * sign_weight).sum() / w_sum
+            pred_var = (pred_centered.pow(2) * sign_weight).sum() / w_sum
+            target_var = (target_centered.pow(2) * sign_weight).sum() / w_sum
+            residual_corr = covariance / torch.sqrt(pred_var * target_var + 1e-12)
+
         total_loss = (
             diff_loss +
             self.rec_weight * rec_loss +
             self.residual_weight * residual_loss +
-            self.residual_bg_weight * residual_bg_loss
+            self.residual_bg_weight * residual_bg_loss +
+            self.residual_sign_weight * residual_sign_loss
         )
 
         return {
@@ -437,8 +470,13 @@ class GuidedResidualDiffusion(nn.Module):
             'reconstruction_loss': rec_loss,
             'residual_loss': residual_loss,
             'residual_bg_loss': residual_bg_loss,
+            'residual_sign_loss': residual_sign_loss,
+            'residual_sign_acc': sign_acc,
+            'residual_corr': residual_corr,
             'pred_residual_abs': pred_residual.abs().mean(),
             'target_residual_abs': target_residual.abs().mean(),
+            'applied_pred_residual_abs': applied_pred_residual.abs().mean(),
+            'applied_target_residual_abs': applied_target_residual.abs().mean(),
             'pred_hybrid': pred_hybrid,
             'write_mask': write_mask,
         }
@@ -554,5 +592,6 @@ def build_grdr(opts=None):
         train_residual_clip=opts.get('train_residual_clip', 0.1),
         residual_weight=opts.get('residual_weight', 0.0),
         residual_bg_weight=opts.get('residual_bg_weight', 0.0),
+        residual_sign_weight=opts.get('residual_sign_weight', 0.0),
         train_use_hard_mask=opts.get('train_use_hard_mask', True),
     )
