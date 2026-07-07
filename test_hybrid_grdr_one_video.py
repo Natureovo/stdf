@@ -263,7 +263,7 @@ def parse_args():
     parser.add_argument('--raw-yuv', default=None)
     parser.add_argument('--lq-yuv', default=None)
     parser.add_argument('--stdf_ckpt', required=True)
-    parser.add_argument('--grdr_ckpt', required=True)
+    parser.add_argument('--grdr_ckpt', default=None)
     parser.add_argument('--guidance_ckpt', default=None)
     parser.add_argument('--budget_ckpt', default=None)
     parser.add_argument('--out', default='outputs/hybrid_grdr')
@@ -285,6 +285,14 @@ def parse_args():
     parser.add_argument('--top_ratio', type=float, default=None)
     parser.add_argument('--residual_scale', type=float, default=0.05)
     parser.add_argument('--residual_clip', type=float, default=0.1)
+    parser.add_argument(
+        '--oracle_residual',
+        action='store_true',
+        help=(
+            'Diagnostic upper-bound mode: bypass GRDR sampling and use '
+            'base + write_mask * (GT - base).'
+        ),
+    )
     parser.add_argument(
         '--soft_guidance',
         action='store_true',
@@ -364,11 +372,14 @@ def main():
     stdf_state, _ = load_state_dict(args.stdf_ckpt)
     model.enhancer.load_state_dict(stdf_state, strict=True)
 
-    _, grdr_checkpoint = load_state_dict(args.grdr_ckpt)
-    if 'diffusion_state_dict' in grdr_checkpoint:
-        model.diffusion.load_state_dict(grdr_checkpoint['diffusion_state_dict'], strict=True)
-    else:
-        model.load_state_dict(grdr_checkpoint['state_dict'], strict=False)
+    if args.grdr_ckpt is None and not args.oracle_residual:
+        raise ValueError('--grdr_ckpt is required unless --oracle_residual is set.')
+    if args.grdr_ckpt is not None:
+        _, grdr_checkpoint = load_state_dict(args.grdr_ckpt)
+        if 'diffusion_state_dict' in grdr_checkpoint:
+            model.diffusion.load_state_dict(grdr_checkpoint['diffusion_state_dict'], strict=True)
+        else:
+            model.load_state_dict(grdr_checkpoint['state_dict'], strict=False)
 
     if args.guidance_mode == 'predicted':
         if args.guidance_ckpt is None:
@@ -523,19 +534,6 @@ def main():
                 )
                 top_ratio = pred_budget
                 effective_mask_mode = 'top_ratio'
-            refined = model.diffusion.refine(
-                lq_center,
-                base,
-                guidance,
-                rate_cond=diffusion_rate_cond,
-                steps=args.sample_steps,
-                guidance_threshold=args.guidance_threshold,
-                mask_mode=effective_mask_mode,
-                top_ratio=top_ratio,
-                residual_scale=args.residual_scale,
-                residual_clip=args.residual_clip,
-                use_hard_mask=not args.soft_guidance,
-            )
             if args.soft_guidance:
                 write_mask = guidance.clamp(0, 1)
             else:
@@ -547,6 +545,22 @@ def main():
                     top_ratio=top_ratio,
                     rate_cond=diffusion_rate_cond,
                     content_source=lq_center,
+                )
+            if args.oracle_residual:
+                refined = (base + write_mask * (gt - base)).clamp(0, 1)
+            else:
+                refined = model.diffusion.refine(
+                    lq_center,
+                    base,
+                    guidance,
+                    rate_cond=diffusion_rate_cond,
+                    steps=args.sample_steps,
+                    guidance_threshold=args.guidance_threshold,
+                    mask_mode=effective_mask_mode,
+                    top_ratio=top_ratio,
+                    residual_scale=args.residual_scale,
+                    residual_clip=args.residual_clip,
+                    use_hard_mask=not args.soft_guidance,
                 )
             sync_if_cuda(device)
             hybrid_time_counter.accum(time.perf_counter() - hybrid_start)
@@ -674,6 +688,7 @@ def main():
         'budget_mode': args.budget_mode,
         'residual_scale': args.residual_scale,
         'residual_clip': args.residual_clip,
+        'oracle_residual': args.oracle_residual,
         'soft_guidance': args.soft_guidance,
         'guidance_source': args.guidance_mode,
         'qp': args.qp,
