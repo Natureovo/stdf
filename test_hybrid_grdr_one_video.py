@@ -80,18 +80,31 @@ def load_budget_weights(budget_net, path):
         budget_net.load_state_dict(budget_state, strict=True)
 
 
-def load_direct_residual_weights(direct_residual, path):
+def extract_direct_residual_state(path):
     state_dict, checkpoint = load_state_dict(path)
     if 'direct_residual_state_dict' in checkpoint:
-        direct_residual.load_state_dict(checkpoint['direct_residual_state_dict'], strict=True)
-    else:
-        direct_state = OrderedDict()
-        for key, value in state_dict.items():
-            if key.startswith('direct_residual.'):
-                direct_state[key[len('direct_residual.'):]] = value
-        if not direct_state:
-            direct_state = state_dict
-        direct_residual.load_state_dict(direct_state, strict=True)
+        return checkpoint['direct_residual_state_dict']
+
+    direct_state = OrderedDict()
+    for key, value in state_dict.items():
+        if key.startswith('direct_residual.'):
+            direct_state[key[len('direct_residual.'):]] = value
+    if not direct_state:
+        direct_state = state_dict
+    return direct_state
+
+
+def infer_direct_output_mode(path):
+    direct_state = extract_direct_residual_state(path)
+    out_weight = direct_state.get('out_conv.2.weight')
+    if out_weight is None:
+        return 'direct'
+    return 'sign_magnitude' if int(out_weight.shape[0]) == 2 else 'direct'
+
+
+def load_direct_residual_weights(direct_residual, path):
+    direct_state = extract_direct_residual_state(path)
+    direct_residual.load_state_dict(direct_state, strict=True)
 
 
 def psnr_np(x, y):
@@ -262,6 +275,11 @@ def build_opts(args):
             'in_nc': 1,
             'nf': args.direct_nf,
             'rate_dim': args.direct_rate_dim,
+            'output_mode': (
+                args.direct_output_mode
+                if args.direct_output_mode != 'auto' else
+                'direct'
+            ),
             'residual_clip': args.direct_residual_clip,
         },
         'detail_guidance': {
@@ -335,6 +353,12 @@ def parse_args():
     parser.add_argument('--guidance_target_threshold', type=float, default=0.3)
     parser.add_argument('--direct_nf', type=int, default=32)
     parser.add_argument('--direct_rate_dim', type=int, default=0)
+    parser.add_argument(
+        '--direct_output_mode',
+        default='auto',
+        choices=['auto', 'direct', 'sign_magnitude'],
+        help='Direct residual output mode. auto infers it from --direct_ckpt.',
+    )
     parser.add_argument('--direct_residual_clip', type=float, default=0.1)
     parser.add_argument('--budget_hidden_dim', type=int, default=64)
     parser.add_argument('--budget_min', type=float, default=0.02)
@@ -388,6 +412,13 @@ def main():
     save_yuv_path = op.join(args.out, save_name)
     report_path = op.join(args.out, op.splitext(save_name)[0] + '_report.json')
 
+    if args.refine_mode == 'direct':
+        if args.direct_ckpt is None:
+            raise ValueError('--direct_ckpt is required when --refine_mode direct.')
+        if args.direct_output_mode == 'auto':
+            args.direct_output_mode = infer_direct_output_mode(args.direct_ckpt)
+            print(f'auto direct_output_mode: {args.direct_output_mode}')
+
     print(f'loading raw/lq yuv: {args.video}, frames={nfs}, size={w}x{h}')
     raw_y = utils.import_yuv(
         seq_path=raw_yuv_path, h=h, w=w, tot_frm=nfs, start_frm=0, only_y=True
@@ -411,8 +442,6 @@ def main():
         else:
             model.load_state_dict(grdr_checkpoint['state_dict'], strict=False)
     if args.refine_mode == 'direct':
-        if args.direct_ckpt is None:
-            raise ValueError('--direct_ckpt is required when --refine_mode direct.')
         load_direct_residual_weights(model.direct_residual, args.direct_ckpt)
 
     if args.guidance_mode == 'predicted':
