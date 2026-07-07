@@ -123,6 +123,10 @@ def detail_refine_losses(
         gradient_weight=0.25,
         bg_weight=0.05,
         degrade_weight=0.5,
+        gain_weight=1.0,
+        energy_weight=1.0,
+        target_gain_clip=0.20,
+        carrier_eps=1e-4,
         gain_tv_weight=0.001,
         carrier_kernel=5):
     write_mask = write_mask.detach().clamp(0, 1)
@@ -153,6 +157,22 @@ def detail_refine_losses(
     degrade_loss = (F.relu(refined_err - base_err) * write_mask).sum() / mask_sum
 
     gain = aux.get('gain', correction)
+    confidence = aux.get('confidence', torch.ones_like(gain))
+    carrier = aux.get('carrier', high_frequency(base, carrier_kernel)).detach()
+    target_residual = (gt - base).detach()
+    target_gain = (
+        target_residual * carrier / (carrier.pow(2) + float(carrier_eps))
+    ).clamp(-float(target_gain_clip), float(target_gain_clip))
+    target_correction = (target_gain * carrier).detach()
+    target_weight = write_mask * (
+        carrier.abs() / (carrier.abs().mean(dim=(2, 3), keepdim=True) + 1e-6)
+    ).clamp(max=10.0)
+    gain_loss = (
+        (gain - target_gain).abs() * target_weight
+    ).sum() / (target_weight.sum() + 1e-6)
+    pred_energy = (correction.abs() * write_mask).sum() / mask_sum
+    target_energy = (target_correction.abs() * write_mask).sum() / mask_sum
+    energy_loss = (pred_energy - target_energy).abs()
     gain_tv = (
         (gain[:, :, :, 1:] - gain[:, :, :, :-1]).abs().mean() +
         (gain[:, :, 1:, :] - gain[:, :, :-1, :]).abs().mean()
@@ -163,6 +183,8 @@ def detail_refine_losses(
         gradient_weight * gradient_loss +
         bg_weight * bg_keep_loss +
         degrade_weight * degrade_loss +
+        gain_weight * gain_loss +
+        energy_weight * energy_loss +
         gain_tv_weight * gain_tv
     )
     with torch.no_grad():
@@ -170,6 +192,16 @@ def detail_refine_losses(
         refined_hf_mae = (refined_hf - gt_hf).abs().mean()
         base_grad_mae = (sobel_magnitude(base) - gt_grad).abs().mean()
         refined_grad_mae = (refined_grad - gt_grad).abs().mean()
+        gain_corr_weight = target_weight
+        w_sum = gain_corr_weight.sum() + 1e-6
+        gain_mean = (gain * gain_corr_weight).sum() / w_sum
+        target_gain_mean = (target_gain * gain_corr_weight).sum() / w_sum
+        gain_centered = gain - gain_mean
+        target_gain_centered = target_gain - target_gain_mean
+        covariance = (gain_centered * target_gain_centered * gain_corr_weight).sum() / w_sum
+        gain_var = (gain_centered.pow(2) * gain_corr_weight).sum() / w_sum
+        target_gain_var = (target_gain_centered.pow(2) * gain_corr_weight).sum() / w_sum
+        gain_corr = covariance / torch.sqrt(gain_var * target_gain_var + 1e-12)
     return {
         'loss': total_loss,
         'reconstruction_loss': rec_loss,
@@ -177,13 +209,20 @@ def detail_refine_losses(
         'gradient_loss': gradient_loss,
         'bg_keep_loss': bg_keep_loss,
         'degrade_loss': degrade_loss,
+        'gain_loss': gain_loss,
+        'energy_loss': energy_loss,
         'gain_tv_loss': gain_tv,
         'pred_refined': refined,
         'write_mask': write_mask,
         'correction_abs': correction.abs().mean(),
-        'gain_abs': aux['gain'].abs().mean(),
-        'confidence_mean': aux['confidence'].mean(),
-        'carrier_abs': aux['carrier'].abs().mean(),
+        'target_correction_abs': target_correction.abs().mean(),
+        'pred_energy': pred_energy,
+        'target_energy': target_energy,
+        'gain_abs': gain.abs().mean(),
+        'target_gain_abs': target_gain.abs().mean(),
+        'gain_corr': gain_corr,
+        'confidence_mean': confidence.mean(),
+        'carrier_abs': carrier.abs().mean(),
         'base_hf_mae': base_hf_mae,
         'refined_hf_mae': refined_hf_mae,
         'base_grad_mae': base_grad_mae,
