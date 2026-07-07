@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+from net_detail_refine import build_detail_refine_head, detail_refine_losses
 from net_direct_residual import build_direct_residual_head, direct_residual_losses
 from net_grdr import build_grdr
 from net_guidance import build_guidance_net, guidance_prediction_losses
@@ -33,10 +34,14 @@ class HybridSTDFGRDR(nn.Module):
         self.direct_residual = build_direct_residual_head(
             opts_dict.get('direct_residual', {})
         )
+        self.detail_refine = build_detail_refine_head(
+            opts_dict.get('detail_refine', {})
+        )
         self.guidance_opts = opts_dict.get('detail_guidance', {})
         self.guidance_net_opts = opts_dict.get('guidance_net', {})
         self.budget_net_opts = opts_dict.get('budget_net', {})
         self.direct_residual_opts = opts_dict.get('direct_residual', {})
+        self.detail_refine_opts = opts_dict.get('detail_refine', {})
 
     def center_frame(self, x):
         frm_lst = [
@@ -85,6 +90,14 @@ class HybridSTDFGRDR(nn.Module):
         for param in self.direct_residual.parameters():
             param.requires_grad = True
 
+    def freeze_detail_refine(self):
+        for param in self.detail_refine.parameters():
+            param.requires_grad = False
+
+    def unfreeze_detail_refine(self):
+        for param in self.detail_refine.parameters():
+            param.requires_grad = True
+
     def make_guidance(self, gt, base):
         maps = compute_detail_guidance(
             gt,
@@ -114,6 +127,21 @@ class HybridSTDFGRDR(nn.Module):
             rate_cond=None,
             return_aux=False):
         return self.direct_residual(
+            lq,
+            base,
+            guidance,
+            rate_cond=rate_cond,
+            return_aux=return_aux,
+        )
+
+    def predict_detail_refinement(
+            self,
+            lq,
+            base,
+            guidance,
+            rate_cond=None,
+            return_aux=False):
+        return self.detail_refine(
             lq,
             base,
             guidance,
@@ -363,6 +391,80 @@ class HybridSTDFGRDR(nn.Module):
             'base': base,
             'guidance': guidance,
             'direct_residual': direct_residual,
+            'oracle_guidance': guidance_maps['guidance'],
+            'guidance_maps': guidance_maps,
+        }
+
+    def detail_refine_training_loss(
+            self,
+            x,
+            gt,
+            rate_cond=None,
+            freeze_base=True,
+            guidance_mode='predicted',
+            detach_pred_guidance=True):
+        if freeze_base:
+            with torch.no_grad():
+                base = self.forward_base(x)
+        else:
+            base = self.forward_base(x)
+        lq = self.center_frame(x)
+        guidance_maps = self.make_guidance(gt, base.detach())
+        if guidance_mode == 'oracle':
+            guidance = guidance_maps['guidance']
+        elif guidance_mode == 'coarse':
+            guidance = self.make_coarse_guidance(lq, base.detach())
+        elif guidance_mode == 'predicted':
+            guidance = self.predict_guidance(lq, base.detach(), rate_cond=rate_cond)
+            if detach_pred_guidance:
+                guidance = guidance.detach()
+        else:
+            raise ValueError(f'Unsupported guidance_mode: {guidance_mode}')
+
+        write_mask = guidance.clamp(0, 1)
+        correction, aux = self.predict_detail_refinement(
+            lq,
+            base.detach() if freeze_base else base,
+            write_mask,
+            rate_cond=rate_cond,
+            return_aux=True,
+        )
+        loss_dict = detail_refine_losses(
+            correction,
+            aux,
+            base.detach() if freeze_base else base,
+            gt,
+            write_mask,
+            rec_weight=self.detail_refine_opts.get('rec_weight', 1.0),
+            highfreq_weight=self.detail_refine_opts.get('highfreq_weight', 0.5),
+            gradient_weight=self.detail_refine_opts.get('gradient_weight', 0.25),
+            bg_weight=self.detail_refine_opts.get('bg_weight', 0.05),
+            degrade_weight=self.detail_refine_opts.get('degrade_weight', 0.5),
+            gain_tv_weight=self.detail_refine_opts.get('gain_tv_weight', 0.001),
+            carrier_kernel=self.detail_refine_opts.get('carrier_kernel', 5),
+        )
+        return {
+            'loss': loss_dict['loss'],
+            'reconstruction_loss': loss_dict['reconstruction_loss'],
+            'highfreq_loss': loss_dict['highfreq_loss'],
+            'gradient_loss': loss_dict['gradient_loss'],
+            'bg_keep_loss': loss_dict['bg_keep_loss'],
+            'degrade_loss': loss_dict['degrade_loss'],
+            'gain_tv_loss': loss_dict['gain_tv_loss'],
+            'correction_abs': loss_dict['correction_abs'],
+            'gain_abs': loss_dict['gain_abs'],
+            'confidence_mean': loss_dict['confidence_mean'],
+            'carrier_abs': loss_dict['carrier_abs'],
+            'base_hf_mae': loss_dict['base_hf_mae'],
+            'refined_hf_mae': loss_dict['refined_hf_mae'],
+            'base_grad_mae': loss_dict['base_grad_mae'],
+            'refined_grad_mae': loss_dict['refined_grad_mae'],
+            'pred_refined': loss_dict['pred_refined'],
+            'write_mask': write_mask,
+            'base': base,
+            'guidance': guidance,
+            'detail_correction': correction,
+            'detail_aux': aux,
             'oracle_guidance': guidance_maps['guidance'],
             'guidance_maps': guidance_maps,
         }
