@@ -114,6 +114,8 @@ class HybridSTDFGRDR(nn.Module):
             guidance_maps['guidance'],
             threshold=self.guidance_net_opts.get('target_threshold', 0.3),
             l1_weight=self.guidance_net_opts.get('l1_weight', 1.0),
+            weighted_l1_weight=self.guidance_net_opts.get('weighted_l1_weight', 0.0),
+            weighted_l1_beta=self.guidance_net_opts.get('weighted_l1_beta', 4.0),
             bce_weight=self.guidance_net_opts.get('bce_weight', 0.5),
             dice_weight=self.guidance_net_opts.get('dice_weight', 0.0),
             soft_iou_weight=self.guidance_net_opts.get('soft_iou_weight', 0.0),
@@ -122,6 +124,7 @@ class HybridSTDFGRDR(nn.Module):
         return {
             'loss': loss_dict['loss'],
             'guidance_l1_loss': loss_dict['l1_loss'],
+            'guidance_weighted_l1_loss': loss_dict['weighted_l1_loss'],
             'guidance_bce_loss': loss_dict['bce_loss'],
             'guidance_dice_loss': loss_dict['dice_loss'],
             'guidance_soft_iou_loss': loss_dict['soft_iou_loss'],

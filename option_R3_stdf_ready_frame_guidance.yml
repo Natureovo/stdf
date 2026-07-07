@@ -75,11 +75,13 @@ network:
     rate_dim: 1
     target_threshold: 0.20
     log_thresholds: [0.15, 0.20, 0.25, 0.30]
-    l1_weight: 1.5
-    bce_weight: 0.3
-    dice_weight: 0.1
-    soft_iou_weight: 0.1
-    tv_weight: 0.01
+    l1_weight: 1.2
+    weighted_l1_weight: 1.0
+    weighted_l1_beta: 4.0
+    bce_weight: 0.15
+    dice_weight: 0.0
+    soft_iou_weight: 0.0
+    tv_weight: 0.005
 
   budget_net:
     enabled: True

@@ -105,6 +105,8 @@ def guidance_prediction_losses(
         target,
         threshold=0.3,
         l1_weight=1.0,
+        weighted_l1_weight=0.0,
+        weighted_l1_beta=4.0,
         bce_weight=0.5,
         dice_weight=0.0,
         soft_iou_weight=0.0,
@@ -112,6 +114,10 @@ def guidance_prediction_losses(
     target = target.detach().clamp(0, 1)
     pred = pred.clamp(1e-6, 1 - 1e-6)
     l1_loss = F.l1_loss(pred, target)
+    oracle_weight = 1.0 + weighted_l1_beta * target
+    weighted_l1_loss = (
+        (pred - target).abs() * oracle_weight
+    ).sum() / (oracle_weight.sum() + 1e-6)
     target_mask = (target >= threshold).float()
     bce_loss = F.binary_cross_entropy(pred, target_mask)
     dims = (1, 2, 3)
@@ -128,6 +134,7 @@ def guidance_prediction_losses(
     )
     loss = (
         l1_weight * l1_loss +
+        weighted_l1_weight * weighted_l1_loss +
         bce_weight * bce_loss +
         dice_weight * dice_loss +
         soft_iou_weight * soft_iou_loss +
@@ -136,6 +143,7 @@ def guidance_prediction_losses(
     return {
         'loss': loss,
         'l1_loss': l1_loss,
+        'weighted_l1_loss': weighted_l1_loss,
         'bce_loss': bce_loss,
         'dice_loss': dice_loss,
         'soft_iou_loss': soft_iou_loss,

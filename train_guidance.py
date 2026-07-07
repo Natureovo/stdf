@@ -300,6 +300,7 @@ def main():
                     f"epoch: [{current_epoch}]/{num_epoch - 1}, "
                     f"loss: [{loss.item():.4f}], "
                     f"l1: [{outputs['guidance_l1_loss'].item():.4f}], "
+                    f"weighted_l1: [{outputs['guidance_weighted_l1_loss'].item():.4f}], "
                     f"bce: [{outputs['guidance_bce_loss'].item():.4f}], "
                     f"dice: [{outputs['guidance_dice_loss'].item():.4f}], "
                     f"soft_iou_loss: [{outputs['guidance_soft_iou_loss'].item():.4f}], "
