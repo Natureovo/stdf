@@ -78,7 +78,12 @@ network:
     rec_weight: 1.0
     residual_weight: 1.0
     residual_bg_weight: 0.05
-    residual_sign_weight: 0.2
+    residual_sign_weight: 0.5
+    residual_energy_weight: 1.0
+    residual_focus_beta: 4.0
+    loss_top_ratio: 0.15
+    residual_sign_temperature: 0.02
+    residual_sign_eps: 0.002
 
   detail_guidance:
     gradient_weight: 0.35

@@ -66,23 +66,44 @@ def direct_residual_losses(
         rec_weight=1.0,
         residual_weight=1.0,
         residual_bg_weight=0.05,
-        residual_sign_weight=0.2):
+        residual_sign_weight=0.2,
+        residual_energy_weight=0.0,
+        residual_focus_beta=0.0,
+        loss_top_ratio=None,
+        residual_sign_temperature=0.02,
+        residual_sign_eps=1e-3):
     write_mask = write_mask.detach().clamp(0, 1)
+    if loss_top_ratio is not None and loss_top_ratio > 0:
+        loss_mask = _top_ratio_mask(write_mask, float(loss_top_ratio))
+    else:
+        loss_mask = write_mask
     pred_hybrid = (base + write_mask * pred_residual).clamp(0, 1)
     rec_loss = torch.sqrt((pred_hybrid - gt).pow(2) + 1e-6).mean()
 
+    target_strength = target_residual.detach().abs()
+    mask_sum = loss_mask.sum() + 1e-6
+    target_strength_mean = (target_strength * loss_mask).sum() / mask_sum
+    normalized_strength = target_strength / (target_strength_mean + 1e-6)
+    focus_weight = loss_mask * (
+        1.0 + float(residual_focus_beta) * normalized_strength.clamp(max=10.0)
+    )
     residual_abs = torch.sqrt((pred_residual - target_residual).pow(2) + 1e-6)
-    residual_loss = (residual_abs * write_mask).sum() / (write_mask.sum() + 1e-6)
+    residual_loss = (residual_abs * focus_weight).sum() / (focus_weight.sum() + 1e-6)
 
     bg_weight = (1.0 - write_mask).clamp(0, 1)
     residual_bg_loss = (pred_residual.abs() * bg_weight).sum() / (bg_weight.sum() + 1e-6)
 
-    valid_sign = (target_residual.abs() > 1e-4).float()
-    sign_weight = (write_mask * valid_sign).detach()
+    valid_sign = (target_residual.abs() > float(residual_sign_eps)).float()
+    sign_weight = (loss_mask * valid_sign).detach()
     target_sign = target_residual.detach().sign()
     residual_sign_loss = (
-        F.relu(-pred_residual * target_sign) * sign_weight
+        F.softplus(-pred_residual * target_sign / float(residual_sign_temperature)) *
+        sign_weight
     ).sum() / (sign_weight.sum() + 1e-6)
+
+    pred_energy = (pred_residual.abs() * loss_mask).sum() / mask_sum
+    target_energy = (target_residual.detach().abs() * loss_mask).sum() / mask_sum
+    residual_energy_loss = (pred_energy - target_energy).abs()
 
     with torch.no_grad():
         sign_acc = (
@@ -104,7 +125,8 @@ def direct_residual_losses(
         rec_weight * rec_loss +
         residual_weight * residual_loss +
         residual_bg_weight * residual_bg_loss +
-        residual_sign_weight * residual_sign_loss
+        residual_sign_weight * residual_sign_loss +
+        residual_energy_weight * residual_energy_loss
     )
     applied_pred = write_mask * pred_residual
     applied_target = write_mask * target_residual
@@ -114,14 +136,27 @@ def direct_residual_losses(
         'residual_loss': residual_loss,
         'residual_bg_loss': residual_bg_loss,
         'residual_sign_loss': residual_sign_loss,
+        'residual_energy_loss': residual_energy_loss,
         'residual_sign_acc': sign_acc,
         'residual_corr': residual_corr,
         'pred_residual_abs': pred_residual.abs().mean(),
         'target_residual_abs': target_residual.abs().mean(),
         'applied_pred_residual_abs': applied_pred.abs().mean(),
         'applied_target_residual_abs': applied_target.abs().mean(),
+        'loss_mask_area': loss_mask.mean(),
+        'target_energy': target_energy,
+        'pred_energy': pred_energy,
         'pred_hybrid': pred_hybrid,
     }
+
+
+def _top_ratio_mask(score, ratio):
+    b = score.size(0)
+    flat = score.reshape(b, -1)
+    numel = flat.size(1)
+    k = max(1, min(numel, int(round(numel * ratio))))
+    threshold = flat.topk(k, dim=1).values[:, -1].view(b, 1, 1, 1)
+    return (score >= threshold).float()
 
 
 def build_direct_residual_head(opts=None):
