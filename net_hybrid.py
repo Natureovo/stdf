@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+from net_direct_residual import build_direct_residual_head, direct_residual_losses
 from net_grdr import build_grdr
 from net_guidance import build_guidance_net, guidance_prediction_losses
 from net_budget import build_budget_net, budget_prediction_losses
@@ -29,9 +30,13 @@ class HybridSTDFGRDR(nn.Module):
         self.diffusion = build_grdr(opts_dict.get('diffusion', {}))
         self.guidance_net = build_guidance_net(opts_dict.get('guidance_net', {}))
         self.budget_net = build_budget_net(opts_dict.get('budget_net', {}))
+        self.direct_residual = build_direct_residual_head(
+            opts_dict.get('direct_residual', {})
+        )
         self.guidance_opts = opts_dict.get('detail_guidance', {})
         self.guidance_net_opts = opts_dict.get('guidance_net', {})
         self.budget_net_opts = opts_dict.get('budget_net', {})
+        self.direct_residual_opts = opts_dict.get('direct_residual', {})
 
     def center_frame(self, x):
         frm_lst = [
@@ -72,6 +77,14 @@ class HybridSTDFGRDR(nn.Module):
         for param in self.budget_net.parameters():
             param.requires_grad = True
 
+    def freeze_direct_residual(self):
+        for param in self.direct_residual.parameters():
+            param.requires_grad = False
+
+    def unfreeze_direct_residual(self):
+        for param in self.direct_residual.parameters():
+            param.requires_grad = True
+
     def make_guidance(self, gt, base):
         maps = compute_detail_guidance(
             gt,
@@ -92,6 +105,9 @@ class HybridSTDFGRDR(nn.Module):
 
     def predict_budget(self, lq, base, guidance=None, rate_cond=None):
         return self.budget_net(lq, base, guidance=guidance, rate_cond=rate_cond)
+
+    def predict_direct_residual(self, lq, base, guidance, rate_cond=None):
+        return self.direct_residual(lq, base, guidance, rate_cond=rate_cond)
 
     def forward_base(self, x):
         return self.enhancer(x)
@@ -248,6 +264,75 @@ class HybridSTDFGRDR(nn.Module):
             'write_mask': loss_dict['write_mask'],
             'base': base,
             'guidance': guidance,
+            'oracle_guidance': guidance_maps['guidance'],
+            'guidance_maps': guidance_maps,
+        }
+
+    def direct_residual_training_loss(
+            self,
+            x,
+            gt,
+            rate_cond=None,
+            freeze_base=True,
+            guidance_mode='predicted',
+            detach_pred_guidance=True):
+        if freeze_base:
+            with torch.no_grad():
+                base = self.forward_base(x)
+        else:
+            base = self.forward_base(x)
+        lq = self.center_frame(x)
+        guidance_maps = self.make_guidance(gt, base.detach())
+        if guidance_mode == 'oracle':
+            guidance = guidance_maps['guidance']
+        elif guidance_mode == 'coarse':
+            guidance = self.make_coarse_guidance(lq, base.detach())
+        elif guidance_mode == 'predicted':
+            guidance = self.predict_guidance(lq, base.detach(), rate_cond=rate_cond)
+            if detach_pred_guidance:
+                guidance = guidance.detach()
+        else:
+            raise ValueError(f'Unsupported guidance_mode: {guidance_mode}')
+
+        write_mask = guidance.clamp(0, 1)
+        direct_residual = self.predict_direct_residual(
+            lq,
+            base.detach() if freeze_base else base,
+            write_mask,
+            rate_cond=rate_cond,
+        )
+        target_residual = (gt - base.detach()).detach()
+        residual_clip = self.direct_residual_opts.get('residual_clip', 0.1)
+        if residual_clip is not None and residual_clip > 0:
+            target_residual = target_residual.clamp(-residual_clip, residual_clip)
+        loss_dict = direct_residual_losses(
+            direct_residual,
+            target_residual,
+            base.detach() if freeze_base else base,
+            gt,
+            write_mask,
+            rec_weight=self.direct_residual_opts.get('rec_weight', 1.0),
+            residual_weight=self.direct_residual_opts.get('residual_weight', 1.0),
+            residual_bg_weight=self.direct_residual_opts.get('residual_bg_weight', 0.05),
+            residual_sign_weight=self.direct_residual_opts.get('residual_sign_weight', 0.2),
+        )
+        return {
+            'loss': loss_dict['loss'],
+            'reconstruction_loss': loss_dict['reconstruction_loss'],
+            'residual_loss': loss_dict['residual_loss'],
+            'residual_bg_loss': loss_dict['residual_bg_loss'],
+            'residual_sign_loss': loss_dict['residual_sign_loss'],
+            'residual_sign_acc': loss_dict['residual_sign_acc'],
+            'residual_corr': loss_dict['residual_corr'],
+            'pred_residual_abs': loss_dict['pred_residual_abs'],
+            'target_residual_abs': loss_dict['target_residual_abs'],
+            'applied_pred_residual_abs': loss_dict['applied_pred_residual_abs'],
+            'applied_target_residual_abs': loss_dict['applied_target_residual_abs'],
+            'pred_hybrid': loss_dict['pred_hybrid'],
+            'write_mask': write_mask,
+            'base': base,
+            'guidance': guidance,
+            'direct_residual': direct_residual,
             'oracle_guidance': guidance_maps['guidance'],
             'guidance_maps': guidance_maps,
         }

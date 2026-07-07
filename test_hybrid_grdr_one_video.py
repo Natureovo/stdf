@@ -80,6 +80,20 @@ def load_budget_weights(budget_net, path):
         budget_net.load_state_dict(budget_state, strict=True)
 
 
+def load_direct_residual_weights(direct_residual, path):
+    state_dict, checkpoint = load_state_dict(path)
+    if 'direct_residual_state_dict' in checkpoint:
+        direct_residual.load_state_dict(checkpoint['direct_residual_state_dict'], strict=True)
+    else:
+        direct_state = OrderedDict()
+        for key, value in state_dict.items():
+            if key.startswith('direct_residual.'):
+                direct_state[key[len('direct_residual.'):]] = value
+        if not direct_state:
+            direct_state = state_dict
+        direct_residual.load_state_dict(direct_state, strict=True)
+
+
 def psnr_np(x, y):
     return utils.calculate_psnr_np(x, y, data_range=1.0)
 
@@ -244,6 +258,12 @@ def build_opts(args):
             'max_budget': args.budget_max,
             'target_threshold': args.guidance_target_threshold,
         },
+        'direct_residual': {
+            'in_nc': 1,
+            'nf': args.direct_nf,
+            'rate_dim': args.direct_rate_dim,
+            'residual_clip': args.direct_residual_clip,
+        },
         'detail_guidance': {
             'gradient_weight': 0.35,
             'highfreq_weight': 0.40,
@@ -264,6 +284,7 @@ def parse_args():
     parser.add_argument('--lq-yuv', default=None)
     parser.add_argument('--stdf_ckpt', required=True)
     parser.add_argument('--grdr_ckpt', default=None)
+    parser.add_argument('--direct_ckpt', default=None)
     parser.add_argument('--guidance_ckpt', default=None)
     parser.add_argument('--budget_ckpt', default=None)
     parser.add_argument('--out', default='outputs/hybrid_grdr')
@@ -312,6 +333,9 @@ def parse_args():
     parser.add_argument('--guidance_nf', type=int, default=32)
     parser.add_argument('--guidance_rate_dim', type=int, default=0)
     parser.add_argument('--guidance_target_threshold', type=float, default=0.3)
+    parser.add_argument('--direct_nf', type=int, default=32)
+    parser.add_argument('--direct_rate_dim', type=int, default=0)
+    parser.add_argument('--direct_residual_clip', type=float, default=0.1)
     parser.add_argument('--budget_hidden_dim', type=int, default=64)
     parser.add_argument('--budget_min', type=float, default=0.02)
     parser.add_argument('--budget_max', type=float, default=0.45)
@@ -337,6 +361,12 @@ def parse_args():
         default='oracle',
         choices=['oracle', 'coarse', 'predicted'],
         help='oracle uses GT and is only an upper bound; predicted is the main no-GT path.'
+    )
+    parser.add_argument(
+        '--refine_mode',
+        default='grdr',
+        choices=['grdr', 'direct'],
+        help='direct uses deterministic residual head instead of GRDR sampling.',
     )
     parser.add_argument('--qp', type=float, default=None)
     parser.add_argument('--yuv-type', default='420p', choices=['420p'])
@@ -372,7 +402,7 @@ def main():
     stdf_state, _ = load_state_dict(args.stdf_ckpt)
     model.enhancer.load_state_dict(stdf_state, strict=True)
 
-    if args.grdr_ckpt is None and not args.oracle_residual:
+    if args.refine_mode == 'grdr' and args.grdr_ckpt is None and not args.oracle_residual:
         raise ValueError('--grdr_ckpt is required unless --oracle_residual is set.')
     if args.grdr_ckpt is not None:
         _, grdr_checkpoint = load_state_dict(args.grdr_ckpt)
@@ -380,6 +410,10 @@ def main():
             model.diffusion.load_state_dict(grdr_checkpoint['diffusion_state_dict'], strict=True)
         else:
             model.load_state_dict(grdr_checkpoint['state_dict'], strict=False)
+    if args.refine_mode == 'direct':
+        if args.direct_ckpt is None:
+            raise ValueError('--direct_ckpt is required when --refine_mode direct.')
+        load_direct_residual_weights(model.direct_residual, args.direct_ckpt)
 
     if args.guidance_mode == 'predicted':
         if args.guidance_ckpt is None:
@@ -407,6 +441,7 @@ def main():
         'diffusion': count_params(model.diffusion),
         'guidance_net': count_params(model.guidance_net),
         'budget_net': count_params(model.budget_net),
+        'direct_residual': count_params(model.direct_residual),
         'total': count_params(model),
     }
 
@@ -548,6 +583,17 @@ def main():
                 )
             if args.oracle_residual:
                 refined = (base + write_mask * (gt - base)).clamp(0, 1)
+            elif args.refine_mode == 'direct':
+                direct_rate_cond = None
+                if args.direct_rate_dim > 0 and rate_cond is not None:
+                    direct_rate_cond = rate_cond[:, :args.direct_rate_dim]
+                direct_residual = model.predict_direct_residual(
+                    lq_center,
+                    base,
+                    guidance.clamp(0, 1),
+                    rate_cond=direct_rate_cond,
+                )
+                refined = (base + write_mask * direct_residual).clamp(0, 1)
             else:
                 refined = model.diffusion.refine(
                     lq_center,
@@ -679,8 +725,10 @@ def main():
         'size': {'width': w, 'height': h},
         'stdf_ckpt': args.stdf_ckpt,
         'grdr_ckpt': args.grdr_ckpt,
+        'direct_ckpt': args.direct_ckpt,
         'guidance_ckpt': args.guidance_ckpt,
         'budget_ckpt': args.budget_ckpt,
+        'refine_mode': args.refine_mode,
         'sample_steps': args.sample_steps,
         'guidance_threshold': args.guidance_threshold,
         'mask_mode': args.mask_mode,

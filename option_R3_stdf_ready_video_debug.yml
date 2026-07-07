@@ -69,6 +69,17 @@ network:
     bce_weight: 0.0
     tv_weight: 0.002
 
+  direct_residual:
+    enabled: True
+    in_nc: 1
+    nf: 32
+    rate_dim: 1
+    residual_clip: 0.1
+    rec_weight: 1.0
+    residual_weight: 1.0
+    residual_bg_weight: 0.05
+    residual_sign_weight: 0.2
+
   detail_guidance:
     gradient_weight: 0.35
     highfreq_weight: 0.40
