@@ -271,6 +271,8 @@ def main():
                     f"res_bg: [{outputs['residual_bg_loss'].item():.4f}], "
                     f"res_sign: [{outputs['residual_sign_loss'].item():.4f}], "
                     f"res_energy: [{outputs['residual_energy_loss'].item():.4f}], "
+                    f"sign_cls: [{outputs['sign_cls_loss'].item():.4f}], "
+                    f"mag_loss: [{outputs['magnitude_loss'].item():.4f}], "
                     f"sign_acc: [{to_float(outputs['residual_sign_acc']):.4f}], "
                     f"res_corr: [{to_float(outputs['residual_corr']):.4f}], "
                     f"pred_res_abs: [{to_float(outputs['pred_residual_abs']):.4f}], "

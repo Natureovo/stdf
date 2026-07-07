@@ -106,8 +106,20 @@ class HybridSTDFGRDR(nn.Module):
     def predict_budget(self, lq, base, guidance=None, rate_cond=None):
         return self.budget_net(lq, base, guidance=guidance, rate_cond=rate_cond)
 
-    def predict_direct_residual(self, lq, base, guidance, rate_cond=None):
-        return self.direct_residual(lq, base, guidance, rate_cond=rate_cond)
+    def predict_direct_residual(
+            self,
+            lq,
+            base,
+            guidance,
+            rate_cond=None,
+            return_aux=False):
+        return self.direct_residual(
+            lq,
+            base,
+            guidance,
+            rate_cond=rate_cond,
+            return_aux=return_aux,
+        )
 
     def forward_base(self, x):
         return self.enhancer(x)
@@ -295,12 +307,14 @@ class HybridSTDFGRDR(nn.Module):
             raise ValueError(f'Unsupported guidance_mode: {guidance_mode}')
 
         write_mask = guidance.clamp(0, 1)
-        direct_residual = self.predict_direct_residual(
+        direct_out = self.predict_direct_residual(
             lq,
             base.detach() if freeze_base else base,
             write_mask,
             rate_cond=rate_cond,
+            return_aux=True,
         )
+        direct_residual, direct_aux = direct_out
         target_residual = (gt - base.detach()).detach()
         residual_clip = self.direct_residual_opts.get('residual_clip', 0.1)
         if residual_clip is not None and residual_clip > 0:
@@ -322,6 +336,9 @@ class HybridSTDFGRDR(nn.Module):
                 'residual_sign_temperature', 0.02,
             ),
             residual_sign_eps=self.direct_residual_opts.get('residual_sign_eps', 1e-3),
+            aux=direct_aux,
+            sign_cls_weight=self.direct_residual_opts.get('sign_cls_weight', 0.0),
+            magnitude_weight=self.direct_residual_opts.get('magnitude_weight', 0.0),
         )
         return {
             'loss': loss_dict['loss'],
@@ -330,6 +347,8 @@ class HybridSTDFGRDR(nn.Module):
             'residual_bg_loss': loss_dict['residual_bg_loss'],
             'residual_sign_loss': loss_dict['residual_sign_loss'],
             'residual_energy_loss': loss_dict['residual_energy_loss'],
+            'sign_cls_loss': loss_dict['sign_cls_loss'],
+            'magnitude_loss': loss_dict['magnitude_loss'],
             'residual_sign_acc': loss_dict['residual_sign_acc'],
             'residual_corr': loss_dict['residual_corr'],
             'pred_residual_abs': loss_dict['pred_residual_abs'],

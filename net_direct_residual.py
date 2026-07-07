@@ -22,12 +22,22 @@ class ConvBlock(nn.Module):
 class DirectResidualHead(nn.Module):
     """Deterministic local residual predictor for diagnosing GRDR bottlenecks."""
 
-    def __init__(self, in_nc=1, nf=32, rate_dim=0, residual_clip=0.1):
+    def __init__(
+            self,
+            in_nc=1,
+            nf=32,
+            rate_dim=0,
+            residual_clip=0.1,
+            output_mode='direct'):
         super(DirectResidualHead, self).__init__()
         self.in_nc = in_nc
         self.rate_dim = rate_dim
         self.residual_clip = residual_clip
+        self.output_mode = output_mode
+        if output_mode not in ('direct', 'sign_magnitude'):
+            raise ValueError(f'Unsupported direct residual output_mode: {output_mode}')
         input_nc = in_nc * 7 + 1 + rate_dim
+        out_nc = in_nc * 2 if output_mode == 'sign_magnitude' else in_nc
         self.in_conv = ConvBlock(input_nc, nf)
         self.down1 = nn.Sequential(nn.MaxPool2d(2), ConvBlock(nf, nf * 2))
         self.down2 = nn.Sequential(nn.MaxPool2d(2), ConvBlock(nf * 2, nf * 4))
@@ -37,11 +47,10 @@ class DirectResidualHead(nn.Module):
         self.out_conv = nn.Sequential(
             nn.Conv2d(nf, nf, 3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(nf, in_nc, 3, padding=1),
-            nn.Tanh(),
+            nn.Conv2d(nf, out_nc, 3, padding=1),
         )
 
-    def forward(self, lq, base, guidance, rate_cond=None):
+    def forward(self, lq, base, guidance, rate_cond=None, return_aux=False):
         if guidance.shape != base.shape:
             raise ValueError('guidance and base should have the same shape.')
         features = make_guidance_features(lq, base, rate_cond=rate_cond)
@@ -54,7 +63,23 @@ class DirectResidualHead(nn.Module):
         up1 = self.up1(torch.cat([up1, enc1], dim=1))
         up2 = F.interpolate(up1, size=enc0.shape[-2:], mode='bilinear', align_corners=False)
         up2 = self.up2(torch.cat([up2, enc0], dim=1))
-        return self.out_conv(up2) * float(self.residual_clip)
+        raw = self.out_conv(up2)
+        if self.output_mode == 'sign_magnitude':
+            sign_logit, mag_logit = torch.chunk(raw, 2, dim=1)
+            magnitude = torch.sigmoid(mag_logit) * float(self.residual_clip)
+            sign_value = torch.tanh(sign_logit)
+            residual = sign_value * magnitude
+            aux = {
+                'sign_logit': sign_logit,
+                'magnitude': magnitude,
+                'sign_value': sign_value,
+            }
+        else:
+            residual = torch.tanh(raw) * float(self.residual_clip)
+            aux = {}
+        if return_aux:
+            return residual, aux
+        return residual
 
 
 def direct_residual_losses(
@@ -71,7 +96,10 @@ def direct_residual_losses(
         residual_focus_beta=0.0,
         loss_top_ratio=None,
         residual_sign_temperature=0.02,
-        residual_sign_eps=1e-3):
+        residual_sign_eps=1e-3,
+        aux=None,
+        sign_cls_weight=0.0,
+        magnitude_weight=0.0):
     write_mask = write_mask.detach().clamp(0, 1)
     if loss_top_ratio is not None and loss_top_ratio > 0:
         loss_mask = _top_ratio_mask(write_mask, float(loss_top_ratio))
@@ -101,6 +129,24 @@ def direct_residual_losses(
         sign_weight
     ).sum() / (sign_weight.sum() + 1e-6)
 
+    sign_cls_loss = pred_residual.new_tensor(0.0)
+    magnitude_loss = pred_residual.new_tensor(0.0)
+    if aux is not None and 'sign_logit' in aux:
+        target_pos = (target_residual.detach() > 0).float()
+        sign_bce = F.binary_cross_entropy_with_logits(
+            aux['sign_logit'],
+            target_pos,
+            reduction='none',
+        )
+        sign_cls_loss = (sign_bce * sign_weight).sum() / (sign_weight.sum() + 1e-6)
+    if aux is not None and 'magnitude' in aux:
+        magnitude_abs = torch.sqrt(
+            (aux['magnitude'] - target_residual.detach().abs()).pow(2) + 1e-6
+        )
+        magnitude_loss = (
+            magnitude_abs * focus_weight
+        ).sum() / (focus_weight.sum() + 1e-6)
+
     pred_energy = (pred_residual.abs() * loss_mask).sum() / mask_sum
     target_energy = (target_residual.detach().abs() * loss_mask).sum() / mask_sum
     residual_energy_loss = (pred_energy - target_energy).abs()
@@ -126,7 +172,9 @@ def direct_residual_losses(
         residual_weight * residual_loss +
         residual_bg_weight * residual_bg_loss +
         residual_sign_weight * residual_sign_loss +
-        residual_energy_weight * residual_energy_loss
+        residual_energy_weight * residual_energy_loss +
+        sign_cls_weight * sign_cls_loss +
+        magnitude_weight * magnitude_loss
     )
     applied_pred = write_mask * pred_residual
     applied_target = write_mask * target_residual
@@ -137,6 +185,8 @@ def direct_residual_losses(
         'residual_bg_loss': residual_bg_loss,
         'residual_sign_loss': residual_sign_loss,
         'residual_energy_loss': residual_energy_loss,
+        'sign_cls_loss': sign_cls_loss,
+        'magnitude_loss': magnitude_loss,
         'residual_sign_acc': sign_acc,
         'residual_corr': residual_corr,
         'pred_residual_abs': pred_residual.abs().mean(),
@@ -166,4 +216,5 @@ def build_direct_residual_head(opts=None):
         nf=opts.get('nf', 32),
         rate_dim=opts.get('rate_dim', 0),
         residual_clip=opts.get('residual_clip', 0.1),
+        output_mode=opts.get('output_mode', 'direct'),
     )

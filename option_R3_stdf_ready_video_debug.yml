@@ -74,6 +74,7 @@ network:
     in_nc: 1
     nf: 32
     rate_dim: 1
+    output_mode: sign_magnitude
     residual_clip: 0.1
     rec_weight: 1.0
     residual_weight: 1.0
@@ -84,6 +85,8 @@ network:
     loss_top_ratio: 0.15
     residual_sign_temperature: 0.02
     residual_sign_eps: 0.002
+    sign_cls_weight: 1.0
+    magnitude_weight: 1.0
 
   detail_guidance:
     gradient_weight: 0.35
