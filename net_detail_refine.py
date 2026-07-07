@@ -39,9 +39,10 @@ def sobel_magnitude(x):
 class DetailRefineHead(nn.Module):
     """Carrier-guided local detail modulation.
 
-    The head predicts a bounded gain and confidence, while the signed direction
-    comes from a high-frequency carrier extracted from STDF/LQ. This avoids
-    asking a small no-GT branch to infer arbitrary per-pixel residual signs.
+    The head predicts a bounded gain, while the signed direction comes from a
+    high-frequency carrier extracted from STDF/LQ. This avoids asking a small
+    no-GT branch to infer arbitrary per-pixel residual signs. Confidence is
+    kept as an optional safety gate for ablations.
     """
 
     def __init__(
@@ -50,6 +51,7 @@ class DetailRefineHead(nn.Module):
             nf=32,
             rate_dim=0,
             gain_scale=0.25,
+            use_confidence=False,
             carrier_source='base',
             carrier_kernel=5):
         super(DetailRefineHead, self).__init__()
@@ -58,6 +60,7 @@ class DetailRefineHead(nn.Module):
         self.in_nc = in_nc
         self.rate_dim = rate_dim
         self.gain_scale = gain_scale
+        self.use_confidence = use_confidence
         self.carrier_source = carrier_source
         self.carrier_kernel = carrier_kernel
         input_nc = in_nc * 7 + 1 + rate_dim
@@ -100,10 +103,12 @@ class DetailRefineHead(nn.Module):
         gain = torch.tanh(gain_logit) * float(self.gain_scale)
         confidence = torch.sigmoid(conf_logit)
         carrier = self.make_carrier(lq, base)
-        correction = gain * confidence * carrier
+        gate = confidence if self.use_confidence else torch.ones_like(confidence)
+        correction = gain * gate * carrier
         aux = {
             'gain': gain,
             'confidence': confidence,
+            'gate': gate,
             'carrier': carrier,
             'correction': correction,
         }
@@ -237,6 +242,7 @@ def build_detail_refine_head(opts=None):
         nf=opts.get('nf', 32),
         rate_dim=opts.get('rate_dim', 0),
         gain_scale=opts.get('gain_scale', 0.25),
+        use_confidence=opts.get('use_confidence', False),
         carrier_source=opts.get('carrier_source', 'base'),
         carrier_kernel=opts.get('carrier_kernel', 5),
     )
