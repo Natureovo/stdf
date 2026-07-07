@@ -64,8 +64,10 @@ network:
     train_content_ratio_weight: 0.50
     train_content_ratio_min_scale: 0.70
     train_content_ratio_max_scale: 1.35
-    train_residual_scale: 0.05
-    train_residual_clip: 0.1
+    train_residual_scale: 1.0
+    train_residual_clip: 0.25
+    residual_weight: 1.0
+    residual_bg_weight: 0.05
     train_use_hard_mask: False
 
   guidance_net:

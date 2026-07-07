@@ -285,6 +285,10 @@ def main():
                 base_mean = float(outputs['base'].mean().detach().cpu())
                 diff_loss = outputs['diffusion_loss']
                 rec_loss = outputs['reconstruction_loss']
+                residual_loss = outputs['residual_loss']
+                residual_bg_loss = outputs['residual_bg_loss']
+                pred_residual_abs = float(outputs['pred_residual_abs'].detach().cpu())
+                target_residual_abs = float(outputs['target_residual_abs'].detach().cpu())
                 msg = (
                     f"iter: [{num_iter_accum}]/{num_iter}, "
                     f"epoch: [{current_epoch}]/{num_epoch - 1}, "
@@ -292,6 +296,10 @@ def main():
                     f"loss: [{loss.item():.4f}], "
                     f"diff_loss: [{diff_loss.item():.4f}], "
                     f"rec_loss: [{rec_loss.item():.4f}], "
+                    f"res_loss: [{residual_loss.item():.4f}], "
+                    f"res_bg: [{residual_bg_loss.item():.4f}], "
+                    f"pred_res_abs: [{pred_residual_abs:.4f}], "
+                    f"target_res_abs: [{target_residual_abs:.4f}], "
                     f"guidance_mean: [{guidance_mean:.4f}], "
                     f"write_area: [{write_area:.4f}], "
                     f"base_mean: [{base_mean:.4f}]"
