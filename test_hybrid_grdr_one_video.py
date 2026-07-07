@@ -107,6 +107,21 @@ def load_direct_residual_weights(direct_residual, path):
     direct_residual.load_state_dict(direct_state, strict=True)
 
 
+def load_detail_refine_weights(detail_refine, path):
+    state_dict, checkpoint = load_state_dict(path)
+    if 'detail_refine_state_dict' in checkpoint:
+        detail_refine.load_state_dict(checkpoint['detail_refine_state_dict'], strict=True)
+        return
+
+    detail_state = OrderedDict()
+    for key, value in state_dict.items():
+        if key.startswith('detail_refine.'):
+            detail_state[key[len('detail_refine.'):]] = value
+    if not detail_state:
+        detail_state = state_dict
+    detail_refine.load_state_dict(detail_state, strict=True)
+
+
 def psnr_np(x, y):
     return utils.calculate_psnr_np(x, y, data_range=1.0)
 
@@ -282,6 +297,14 @@ def build_opts(args):
             ),
             'residual_clip': args.direct_residual_clip,
         },
+        'detail_refine': {
+            'in_nc': 1,
+            'nf': args.detail_nf,
+            'rate_dim': args.detail_rate_dim,
+            'gain_scale': args.detail_gain_scale,
+            'carrier_source': args.detail_carrier_source,
+            'carrier_kernel': args.detail_carrier_kernel,
+        },
         'detail_guidance': {
             'gradient_weight': 0.35,
             'highfreq_weight': 0.40,
@@ -303,6 +326,7 @@ def parse_args():
     parser.add_argument('--stdf_ckpt', required=True)
     parser.add_argument('--grdr_ckpt', default=None)
     parser.add_argument('--direct_ckpt', default=None)
+    parser.add_argument('--detail_ckpt', default=None)
     parser.add_argument('--guidance_ckpt', default=None)
     parser.add_argument('--budget_ckpt', default=None)
     parser.add_argument('--out', default='outputs/hybrid_grdr')
@@ -360,6 +384,15 @@ def parse_args():
         help='Direct residual output mode. auto infers it from --direct_ckpt.',
     )
     parser.add_argument('--direct_residual_clip', type=float, default=0.1)
+    parser.add_argument('--detail_nf', type=int, default=32)
+    parser.add_argument('--detail_rate_dim', type=int, default=0)
+    parser.add_argument('--detail_gain_scale', type=float, default=0.20)
+    parser.add_argument(
+        '--detail_carrier_source',
+        default='base',
+        choices=['base', 'lq', 'base_lq'],
+    )
+    parser.add_argument('--detail_carrier_kernel', type=int, default=5)
     parser.add_argument('--budget_hidden_dim', type=int, default=64)
     parser.add_argument('--budget_min', type=float, default=0.02)
     parser.add_argument('--budget_max', type=float, default=0.45)
@@ -389,8 +422,8 @@ def parse_args():
     parser.add_argument(
         '--refine_mode',
         default='grdr',
-        choices=['grdr', 'direct'],
-        help='direct uses deterministic residual head instead of GRDR sampling.',
+        choices=['grdr', 'direct', 'detail'],
+        help='detail uses carrier-guided local high-frequency modulation.',
     )
     parser.add_argument('--qp', type=float, default=None)
     parser.add_argument('--yuv-type', default='420p', choices=['420p'])
@@ -418,6 +451,8 @@ def main():
         if args.direct_output_mode == 'auto':
             args.direct_output_mode = infer_direct_output_mode(args.direct_ckpt)
             print(f'auto direct_output_mode: {args.direct_output_mode}')
+    if args.refine_mode == 'detail' and args.detail_ckpt is None:
+        raise ValueError('--detail_ckpt is required when --refine_mode detail.')
 
     print(f'loading raw/lq yuv: {args.video}, frames={nfs}, size={w}x{h}')
     raw_y = utils.import_yuv(
@@ -443,6 +478,8 @@ def main():
             model.load_state_dict(grdr_checkpoint['state_dict'], strict=False)
     if args.refine_mode == 'direct':
         load_direct_residual_weights(model.direct_residual, args.direct_ckpt)
+    if args.refine_mode == 'detail':
+        load_detail_refine_weights(model.detail_refine, args.detail_ckpt)
 
     if args.guidance_mode == 'predicted':
         if args.guidance_ckpt is None:
@@ -471,6 +508,7 @@ def main():
         'guidance_net': count_params(model.guidance_net),
         'budget_net': count_params(model.budget_net),
         'direct_residual': count_params(model.direct_residual),
+        'detail_refine': count_params(model.detail_refine),
         'total': count_params(model),
     }
 
@@ -623,6 +661,17 @@ def main():
                     rate_cond=direct_rate_cond,
                 )
                 refined = (base + write_mask * direct_residual).clamp(0, 1)
+            elif args.refine_mode == 'detail':
+                detail_rate_cond = None
+                if args.detail_rate_dim > 0 and rate_cond is not None:
+                    detail_rate_cond = rate_cond[:, :args.detail_rate_dim]
+                detail_correction = model.predict_detail_refinement(
+                    lq_center,
+                    base,
+                    guidance.clamp(0, 1),
+                    rate_cond=detail_rate_cond,
+                )
+                refined = (base + write_mask * detail_correction).clamp(0, 1)
             else:
                 refined = model.diffusion.refine(
                     lq_center,
@@ -755,6 +804,7 @@ def main():
         'stdf_ckpt': args.stdf_ckpt,
         'grdr_ckpt': args.grdr_ckpt,
         'direct_ckpt': args.direct_ckpt,
+        'detail_ckpt': args.detail_ckpt,
         'guidance_ckpt': args.guidance_ckpt,
         'budget_ckpt': args.budget_ckpt,
         'refine_mode': args.refine_mode,

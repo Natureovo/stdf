@@ -88,6 +88,21 @@ network:
     sign_cls_weight: 1.0
     magnitude_weight: 1.0
 
+  detail_refine:
+    enabled: True
+    in_nc: 1
+    nf: 32
+    rate_dim: 1
+    gain_scale: 0.20
+    carrier_source: base
+    carrier_kernel: 5
+    rec_weight: 1.0
+    highfreq_weight: 0.5
+    gradient_weight: 0.25
+    bg_weight: 0.05
+    degrade_weight: 1.0
+    gain_tv_weight: 0.001
+
   detail_guidance:
     gradient_weight: 0.35
     highfreq_weight: 0.40
