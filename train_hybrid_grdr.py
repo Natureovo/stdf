@@ -24,6 +24,17 @@ def parse_args():
         required=True,
         help='Path to a trained STDF checkpoint, e.g. exp/.../ckp_290000.pt.',
     )
+    parser.add_argument(
+        '--guidance_mode',
+        choices=['oracle', 'predicted', 'coarse'],
+        default='oracle',
+        help='Guidance source for GRDR training. oracle is upper bound only.',
+    )
+    parser.add_argument(
+        '--guidance_ckpt',
+        default=None,
+        help='GuidanceNet checkpoint, required when --guidance_mode predicted.',
+    )
     parser.add_argument('--local_rank', type=int, default=0)
     parser.add_argument('--num_iter', type=int, default=None)
     parser.add_argument('--interval_print', type=int, default=None)
@@ -80,6 +91,25 @@ def load_stdf_weights(enhancer, ckp_path):
     enhancer.load_state_dict(clean_state, strict=True)
 
 
+def load_guidance_weights(guidance_net, ckp_path):
+    checkpoint = torch.load(ckp_path, map_location='cpu')
+    if 'guidance_state_dict' in checkpoint:
+        guidance_net.load_state_dict(checkpoint['guidance_state_dict'], strict=True)
+        return
+
+    state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+    clean_state = OrderedDict()
+    guidance_state = OrderedDict()
+    for k, v in state_dict.items():
+        if k.startswith('module.'):
+            k = k[7:]
+        if k.startswith('guidance_net.'):
+            guidance_state[k[len('guidance_net.'):]] = v
+        else:
+            clean_state[k] = v
+    guidance_net.load_state_dict(guidance_state or clean_state, strict=True)
+
+
 def count_trainable_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -112,9 +142,17 @@ def main():
     interval_print = int(opts_dict['train']['interval_print'])
     interval_save = int(opts_dict['train']['interval_val'])
     diffusion_opts = opts_dict['network'].get('diffusion', {})
+    guidance_opts = opts_dict['network'].get('guidance_net', {})
     mask_mode = diffusion_opts.get('train_mask_mode', 'threshold')
     needs_qp = 'qp' in str(mask_mode)
-    rate_dim = max(diffusion_opts.get('rate_dim', 0), 1 if needs_qp else 0)
+    guidance_needs_rate = args.guidance_mode == 'predicted' and guidance_opts.get('rate_dim', 0) > 0
+    rate_dim = max(
+        diffusion_opts.get('rate_dim', 0),
+        guidance_opts.get('rate_dim', 0) if guidance_needs_rate else 0,
+        1 if needs_qp else 0,
+    )
+    if args.guidance_mode == 'predicted' and args.guidance_ckpt is None:
+        raise ValueError('--guidance_ckpt is required when --guidance_mode predicted.')
 
     if rank == 0:
         exp_dir = op.dirname(opts_dict['train']['log_path'])
@@ -124,6 +162,8 @@ def main():
             f"{'<' * 10} Hybrid GRDR Training {'>' * 10}\n"
             f"Timestamp: [{utils.get_timestr()}]\n"
             f"STDF checkpoint: [{args.stdf_ckpt}]\n"
+            f"Guidance mode: [{args.guidance_mode}]\n"
+            f"Guidance checkpoint: [{args.guidance_ckpt}]\n"
             f"\n{'<' * 10} Options {'>' * 10}\n"
             f"{utils.dict2str(opts_dict)}"
         )
@@ -163,15 +203,25 @@ def main():
 
     model = build_hybrid_stdf_grdr(opts_dict['network'])
     load_stdf_weights(model.enhancer, args.stdf_ckpt)
+    if args.guidance_mode == 'predicted':
+        load_guidance_weights(model.guidance_net, args.guidance_ckpt)
+    for param in model.parameters():
+        param.requires_grad = False
     model.freeze_enhancer()
+    model.freeze_guidance_net()
+    model.freeze_budget_net()
+    model.unfreeze_diffusion()
     model = model.to(device)
     model.enhancer.eval()
+    model.guidance_net.eval()
+    model.budget_net.eval()
     model.diffusion.train()
 
-    assert opts_dict['train']['optim'].pop('type') == 'Adam', 'Not implemented.'
+    optim_opts = dict(opts_dict['train']['optim'])
+    assert optim_opts.pop('type') == 'Adam', 'Not implemented.'
     optimizer = optim.Adam(
         [p for p in model.diffusion.parameters() if p.requires_grad],
-        **opts_dict['train']['optim'],
+        **optim_opts,
     )
 
     if rank == 0:
@@ -221,6 +271,8 @@ def main():
                 gt_data,
                 rate_cond=rate_cond,
                 freeze_base=True,
+                guidance_mode=args.guidance_mode,
+                detach_pred_guidance=True,
             )
             loss = outputs['loss']
             loss.backward()
@@ -258,6 +310,8 @@ def main():
                 state = {
                     'num_iter_accum': num_iter_accum,
                     'stdf_ckpt': args.stdf_ckpt,
+                    'guidance_mode': args.guidance_mode,
+                    'guidance_ckpt': args.guidance_ckpt,
                     'state_dict': model.state_dict(),
                     'diffusion_state_dict': model.diffusion.state_dict(),
                     'optimizer': optimizer.state_dict(),
