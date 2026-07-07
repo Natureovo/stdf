@@ -388,6 +388,7 @@ def parse_args():
     parser.add_argument('--detail_nf', type=int, default=32)
     parser.add_argument('--detail_rate_dim', type=int, default=0)
     parser.add_argument('--detail_gain_scale', type=float, default=0.20)
+    parser.add_argument('--detail_correction_scale', type=float, default=1.0)
     parser.add_argument(
         '--detail_use_confidence',
         action='store_true',
@@ -677,7 +678,7 @@ def main():
                     guidance.clamp(0, 1),
                     rate_cond=detail_rate_cond,
                 )
-                refined = (base + write_mask * detail_correction).clamp(0, 1)
+                refined = (base + write_mask * args.detail_correction_scale * detail_correction).clamp(0, 1)
             else:
                 refined = model.diffusion.refine(
                     lq_center,
