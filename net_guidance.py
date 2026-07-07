@@ -107,6 +107,7 @@ def guidance_prediction_losses(
         l1_weight=1.0,
         weighted_l1_weight=0.0,
         weighted_l1_beta=4.0,
+        weighted_l1_gamma=1.0,
         bce_weight=0.5,
         dice_weight=0.0,
         soft_iou_weight=0.0,
@@ -114,7 +115,8 @@ def guidance_prediction_losses(
     target = target.detach().clamp(0, 1)
     pred = pred.clamp(1e-6, 1 - 1e-6)
     l1_loss = F.l1_loss(pred, target)
-    oracle_weight = 1.0 + weighted_l1_beta * target
+    focal_target = target.pow(weighted_l1_gamma)
+    oracle_weight = 1.0 + weighted_l1_beta * focal_target
     weighted_l1_loss = (
         (pred - target).abs() * oracle_weight
     ).sum() / (oracle_weight.sum() + 1e-6)

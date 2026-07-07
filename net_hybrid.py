@@ -116,6 +116,7 @@ class HybridSTDFGRDR(nn.Module):
             l1_weight=self.guidance_net_opts.get('l1_weight', 1.0),
             weighted_l1_weight=self.guidance_net_opts.get('weighted_l1_weight', 0.0),
             weighted_l1_beta=self.guidance_net_opts.get('weighted_l1_beta', 4.0),
+            weighted_l1_gamma=self.guidance_net_opts.get('weighted_l1_gamma', 1.0),
             bce_weight=self.guidance_net_opts.get('bce_weight', 0.5),
             dice_weight=self.guidance_net_opts.get('dice_weight', 0.0),
             soft_iou_weight=self.guidance_net_opts.get('soft_iou_weight', 0.0),
