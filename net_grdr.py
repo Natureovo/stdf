@@ -184,6 +184,7 @@ class GuidedResidualDiffusion(nn.Module):
             target_highfreq_kernel=5,
             carrier_source='base',
             carrier_gain_clip=0.5,
+            carrier_norm_clip=3.0,
             carrier_eps=1e-4,
             highfreq_magnitude_weight=0.0,
             highfreq_under_weight=0.0,
@@ -202,7 +203,8 @@ class GuidedResidualDiffusion(nn.Module):
                 'pixel_residual',
                 'highfreq_residual',
                 'highfreq_gt',
-                'carrier_gain'):
+                'carrier_gain',
+                'carrier_amp'):
             raise ValueError(f'Unsupported diffusion target_mode: {target_mode}')
         if carrier_source not in ('base', 'lq', 'base_lq'):
             raise ValueError(f'Unsupported carrier_source: {carrier_source}')
@@ -232,6 +234,7 @@ class GuidedResidualDiffusion(nn.Module):
         self.target_highfreq_kernel = target_highfreq_kernel
         self.carrier_source = carrier_source
         self.carrier_gain_clip = carrier_gain_clip
+        self.carrier_norm_clip = carrier_norm_clip
         self.carrier_eps = carrier_eps
         self.highfreq_magnitude_weight = highfreq_magnitude_weight
         self.highfreq_under_weight = highfreq_under_weight
@@ -276,7 +279,7 @@ class GuidedResidualDiffusion(nn.Module):
         return torch.nan_to_num(pred_residual, nan=0.0, posinf=0.0, neginf=0.0)
 
     def is_carrier_guided(self):
-        return self.target_mode == 'carrier_gain'
+        return self.target_mode in ('carrier_gain', 'carrier_amp')
 
     def make_carrier(self, lq, base):
         base_hf = high_frequency(base, self.target_highfreq_kernel)
@@ -287,6 +290,19 @@ class GuidedResidualDiffusion(nn.Module):
             return lq_hf
         return 0.5 * (base_hf + lq_hf)
 
+    def make_carrier_direction(self, lq, base):
+        carrier = self.make_carrier(lq, base)
+        carrier_norm = carrier.abs().mean(dim=(2, 3), keepdim=True).clamp(
+            min=float(self.carrier_eps)
+        )
+        direction = carrier / carrier_norm
+        if self.carrier_norm_clip is not None and self.carrier_norm_clip > 0:
+            direction = direction.clamp(
+                min=-float(self.carrier_norm_clip),
+                max=float(self.carrier_norm_clip),
+            )
+        return direction
+
     def positive_gain(self, signal):
         gain = 0.5 * (signal + torch.sqrt(signal.pow(2) + 1e-6))
         if self.carrier_gain_clip is not None and self.carrier_gain_clip > 0:
@@ -296,9 +312,12 @@ class GuidedResidualDiffusion(nn.Module):
     def signal_to_correction(self, signal, lq, base):
         if not self.is_carrier_guided():
             return signal, signal
-        gain = self.positive_gain(signal)
+        prior = self.positive_gain(signal)
+        if self.target_mode == 'carrier_amp':
+            carrier_direction = self.make_carrier_direction(lq, base)
+            return prior * carrier_direction, prior
         carrier = self.make_carrier(lq, base)
-        return gain * carrier, gain
+        return prior * carrier, prior
 
     def make_target_signal(self, lq, base, gt):
         if self.target_mode == 'pixel_residual':
@@ -315,6 +334,12 @@ class GuidedResidualDiffusion(nn.Module):
             if self.carrier_gain_clip is not None and self.carrier_gain_clip > 0:
                 target_gain = target_gain.clamp(max=float(self.carrier_gain_clip))
             return target_gain
+        if self.target_mode == 'carrier_amp':
+            target_mag = (gt_hf.abs() * float(self.highfreq_under_ratio)).detach()
+            target_amp = F.relu(target_mag - base_hf.abs().detach())
+            if self.carrier_gain_clip is not None and self.carrier_gain_clip > 0:
+                target_amp = target_amp.clamp(max=float(self.carrier_gain_clip))
+            return target_amp
         return gt_hf - base_hf
 
     def make_detail_gate(self, lq, base, guidance, rate_cond=None):
@@ -754,6 +779,7 @@ def build_grdr(opts=None):
         target_highfreq_kernel=opts.get('target_highfreq_kernel', 5),
         carrier_source=opts.get('carrier_source', 'base'),
         carrier_gain_clip=opts.get('carrier_gain_clip', 0.5),
+        carrier_norm_clip=opts.get('carrier_norm_clip', 3.0),
         carrier_eps=opts.get('carrier_eps', 1e-4),
         highfreq_magnitude_weight=opts.get('highfreq_magnitude_weight', 0.0),
         highfreq_under_weight=opts.get('highfreq_under_weight', 0.0),

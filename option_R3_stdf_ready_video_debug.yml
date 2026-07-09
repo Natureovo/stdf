@@ -51,10 +51,11 @@ network:
     loss_type: l1
     loss_bg_weight: 0.05
     rec_weight: 1.0
-    target_mode: carrier_gain
+    target_mode: carrier_amp
     target_highfreq_kernel: 5
     carrier_source: base_lq
-    carrier_gain_clip: 0.50
+    carrier_gain_clip: 0.08
+    carrier_norm_clip: 3.0
     carrier_eps: !!float 1e-4
     detail_gate_mode: multi_cue
     detail_gate_temperature: 8.0
@@ -64,7 +65,7 @@ network:
     detail_gate_qp_weight: 0.25
     detail_gate_min: 0.05
     train_guidance_threshold: 0.3
-    train_residual_scale: 0.2
+    train_residual_scale: 0.5
     train_residual_clip: 0.05
     residual_weight: 0.5
     residual_bg_weight: 0.02
