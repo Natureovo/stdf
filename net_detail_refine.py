@@ -130,6 +130,8 @@ def detail_refine_losses(
         degrade_weight=0.5,
         gain_weight=1.0,
         energy_weight=1.0,
+        correction_weight=0.0,
+        correction_focus_beta=4.0,
         target_gain_clip=0.20,
         carrier_eps=1e-4,
         gain_tv_weight=0.001,
@@ -142,6 +144,7 @@ def detail_refine_losses(
     refined_hf = high_frequency(refined, carrier_kernel)
     gt_hf = high_frequency(gt, carrier_kernel)
     base_hf = high_frequency(base, carrier_kernel)
+    target_detail = (gt_hf - base_hf).detach()
     highfreq_loss = (
         torch.sqrt((refined_hf - gt_hf).pow(2) + 1e-6) * write_mask
     ).sum() / mask_sum
@@ -169,6 +172,17 @@ def detail_refine_losses(
         target_residual * carrier / (carrier.pow(2) + float(carrier_eps))
     ).clamp(-float(target_gain_clip), float(target_gain_clip))
     target_correction = (target_gain * carrier).detach()
+    pred_detail = write_mask * correction
+    target_detail_masked = write_mask * target_detail
+    detail_strength = target_detail.abs()
+    detail_norm = detail_strength.mean(dim=(2, 3), keepdim=True) + 1e-6
+    correction_weight_map = write_mask * (
+        1.0 + float(correction_focus_beta) * detail_strength / detail_norm
+    ).clamp(max=10.0)
+    correction_loss = (
+        torch.sqrt((pred_detail - target_detail_masked).pow(2) + 1e-6) *
+        correction_weight_map
+    ).sum() / (correction_weight_map.sum() + 1e-6)
     target_weight = write_mask * (
         carrier.abs() / (carrier.abs().mean(dim=(2, 3), keepdim=True) + 1e-6)
     ).clamp(max=10.0)
@@ -190,6 +204,7 @@ def detail_refine_losses(
         degrade_weight * degrade_loss +
         gain_weight * gain_loss +
         energy_weight * energy_loss +
+        correction_weight * correction_loss +
         gain_tv_weight * gain_tv
     )
     with torch.no_grad():
@@ -207,6 +222,23 @@ def detail_refine_losses(
         gain_var = (gain_centered.pow(2) * gain_corr_weight).sum() / w_sum
         target_gain_var = (target_gain_centered.pow(2) * gain_corr_weight).sum() / w_sum
         gain_corr = covariance / torch.sqrt(gain_var * target_gain_var + 1e-12)
+        c_sum = correction_weight_map.sum() + 1e-6
+        pred_detail_mean = (pred_detail * correction_weight_map).sum() / c_sum
+        target_detail_mean = (target_detail_masked * correction_weight_map).sum() / c_sum
+        pred_detail_centered = pred_detail - pred_detail_mean
+        target_detail_centered = target_detail_masked - target_detail_mean
+        detail_covariance = (
+            pred_detail_centered * target_detail_centered * correction_weight_map
+        ).sum() / c_sum
+        pred_detail_var = (
+            pred_detail_centered.pow(2) * correction_weight_map
+        ).sum() / c_sum
+        target_detail_var = (
+            target_detail_centered.pow(2) * correction_weight_map
+        ).sum() / c_sum
+        correction_corr = detail_covariance / torch.sqrt(
+            pred_detail_var * target_detail_var + 1e-12
+        )
     return {
         'loss': total_loss,
         'reconstruction_loss': rec_loss,
@@ -216,11 +248,15 @@ def detail_refine_losses(
         'degrade_loss': degrade_loss,
         'gain_loss': gain_loss,
         'energy_loss': energy_loss,
+        'correction_loss': correction_loss,
         'gain_tv_loss': gain_tv,
         'pred_refined': refined,
         'write_mask': write_mask,
         'correction_abs': correction.abs().mean(),
         'target_correction_abs': target_correction.abs().mean(),
+        'pred_detail_abs': pred_detail.abs().sum() / mask_sum,
+        'target_detail_abs': target_detail_masked.abs().sum() / mask_sum,
+        'correction_corr': correction_corr,
         'pred_energy': pred_energy,
         'target_energy': target_energy,
         'gain_abs': gain.abs().mean(),

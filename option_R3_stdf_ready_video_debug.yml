@@ -104,6 +104,8 @@ network:
     degrade_weight: 0.5
     gain_weight: 2.0
     energy_weight: 8.0
+    correction_weight: 50.0
+    correction_focus_beta: 4.0
     target_gain_clip: 0.40
     carrier_eps: !!float 1e-4
     gain_tv_weight: 0.001
