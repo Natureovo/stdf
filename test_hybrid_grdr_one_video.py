@@ -274,6 +274,9 @@ def build_opts(args):
             'loss_type': 'l1',
             'target_mode': args.diffusion_target_mode,
             'target_highfreq_kernel': args.diffusion_target_highfreq_kernel,
+            'carrier_source': args.diffusion_carrier_source,
+            'carrier_gain_clip': args.diffusion_carrier_gain_clip,
+            'carrier_eps': args.diffusion_carrier_eps,
             'detail_gate_mode': args.diffusion_detail_gate_mode,
             'detail_gate_temperature': args.diffusion_detail_gate_temperature,
             'detail_gate_hf_weight': args.diffusion_detail_gate_hf_weight,
@@ -387,9 +390,16 @@ def parse_args():
     parser.add_argument(
         '--diffusion_target_mode',
         default='pixel_residual',
-        choices=['pixel_residual', 'highfreq_residual', 'highfreq_gt'],
+        choices=['pixel_residual', 'highfreq_residual', 'highfreq_gt', 'carrier_gain'],
     )
     parser.add_argument('--diffusion_target_highfreq_kernel', type=int, default=5)
+    parser.add_argument(
+        '--diffusion_carrier_source',
+        default='base',
+        choices=['base', 'lq', 'base_lq'],
+    )
+    parser.add_argument('--diffusion_carrier_gain_clip', type=float, default=0.5)
+    parser.add_argument('--diffusion_carrier_eps', type=float, default=1e-4)
     parser.add_argument(
         '--diffusion_detail_gate_mode',
         default='none',
@@ -863,6 +873,9 @@ def main():
         'mask_mode': args.mask_mode,
         'top_ratio': args.top_ratio,
         'budget_mode': args.budget_mode,
+        'diffusion_target_mode': args.diffusion_target_mode,
+        'diffusion_carrier_source': args.diffusion_carrier_source,
+        'diffusion_carrier_gain_clip': args.diffusion_carrier_gain_clip,
         'residual_scale': args.residual_scale,
         'residual_clip': args.residual_clip,
         'oracle_residual': args.oracle_residual,
