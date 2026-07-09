@@ -303,6 +303,7 @@ def build_opts(args):
             'rate_dim': args.detail_rate_dim,
             'gain_scale': args.detail_gain_scale,
             'gain_mode': args.detail_gain_mode,
+            'gain_init_bias': args.detail_gain_init_bias,
             'use_confidence': args.detail_use_confidence,
             'carrier_source': args.detail_carrier_source,
             'carrier_kernel': args.detail_carrier_kernel,
@@ -395,6 +396,7 @@ def parse_args():
         choices=['positive', 'signed'],
         help='positive treats gain as local detail enhancement strength; signed keeps the old ablation behavior.',
     )
+    parser.add_argument('--detail_gain_init_bias', type=float, default=-4.0)
     parser.add_argument('--detail_correction_scale', type=float, default=1.0)
     parser.add_argument(
         '--detail_use_confidence',

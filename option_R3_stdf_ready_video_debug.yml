@@ -93,24 +93,27 @@ network:
     in_nc: 1
     nf: 32
     rate_dim: 1
-    gain_scale: 0.40
+    gain_scale: 0.80
     gain_mode: positive
+    gain_init_bias: -2.0
     use_confidence: False
     carrier_source: base
     carrier_kernel: 5
     rec_weight: 1.0
     highfreq_weight: 0.5
-    highfreq_magnitude_weight: 1.0
+    highfreq_magnitude_weight: 2.0
+    highfreq_under_weight: 2.0
+    highfreq_under_ratio: 0.90
     gradient_weight: 0.25
     bg_weight: 0.05
-    degrade_weight: 1.0
+    degrade_weight: 0.5
     gain_weight: 0.0
     energy_weight: 0.0
     correction_weight: 0.0
     correction_focus_beta: 4.0
     target_gain_clip: 0.40
     carrier_eps: !!float 1e-4
-    gain_tv_weight: 0.001
+    gain_tv_weight: 0.0001
 
   detail_guidance:
     gradient_weight: 0.35

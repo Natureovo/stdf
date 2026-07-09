@@ -52,6 +52,7 @@ class DetailRefineHead(nn.Module):
             rate_dim=0,
             gain_scale=0.25,
             gain_mode='positive',
+            gain_init_bias=-4.0,
             use_confidence=False,
             carrier_source='base',
             carrier_kernel=5):
@@ -64,6 +65,7 @@ class DetailRefineHead(nn.Module):
         self.rate_dim = rate_dim
         self.gain_scale = gain_scale
         self.gain_mode = gain_mode
+        self.gain_init_bias = gain_init_bias
         self.use_confidence = use_confidence
         self.carrier_source = carrier_source
         self.carrier_kernel = carrier_kernel
@@ -87,7 +89,7 @@ class DetailRefineHead(nn.Module):
         nn.init.zeros_(last.bias)
         if self.gain_mode == 'positive':
             with torch.no_grad():
-                last.bias[:self.in_nc].fill_(-4.0)
+                last.bias[:self.in_nc].fill_(float(self.gain_init_bias))
 
     def make_carrier(self, lq, base):
         if self.carrier_source == 'base':
@@ -142,6 +144,8 @@ def detail_refine_losses(
         rec_weight=1.0,
         highfreq_weight=0.5,
         highfreq_magnitude_weight=0.0,
+        highfreq_under_weight=0.0,
+        highfreq_under_ratio=0.9,
         gradient_weight=0.25,
         bg_weight=0.05,
         degrade_weight=0.5,
@@ -167,6 +171,10 @@ def detail_refine_losses(
     ).sum() / mask_sum
     highfreq_magnitude_loss = (
         torch.sqrt((refined_hf.abs() - gt_hf.abs()).pow(2) + 1e-6) * write_mask
+    ).sum() / mask_sum
+    highfreq_under_target = (gt_hf.abs() * float(highfreq_under_ratio)).detach()
+    highfreq_under_loss = (
+        F.relu(highfreq_under_target - refined_hf.abs()) * write_mask
     ).sum() / mask_sum
 
     refined_grad = sobel_magnitude(refined)
@@ -220,6 +228,7 @@ def detail_refine_losses(
         rec_weight * rec_loss +
         highfreq_weight * highfreq_loss +
         highfreq_magnitude_weight * highfreq_magnitude_loss +
+        highfreq_under_weight * highfreq_under_loss +
         gradient_weight * gradient_loss +
         bg_weight * bg_keep_loss +
         degrade_weight * degrade_loss +
@@ -233,6 +242,12 @@ def detail_refine_losses(
         refined_hf_mae = (refined_hf - gt_hf).abs().mean()
         base_hf_mag_mae = (base_hf.abs() - gt_hf.abs()).abs().mean()
         refined_hf_mag_mae = (refined_hf.abs() - gt_hf.abs()).abs().mean()
+        base_hf_under = (
+            F.relu(highfreq_under_target - base_hf.abs()) * write_mask
+        ).sum() / mask_sum
+        refined_hf_under = (
+            F.relu(highfreq_under_target - refined_hf.abs()) * write_mask
+        ).sum() / mask_sum
         base_grad_mae = (sobel_magnitude(base) - gt_grad).abs().mean()
         refined_grad_mae = (refined_grad - gt_grad).abs().mean()
         gain_corr_weight = target_weight
@@ -267,6 +282,7 @@ def detail_refine_losses(
         'reconstruction_loss': rec_loss,
         'highfreq_loss': highfreq_loss,
         'highfreq_magnitude_loss': highfreq_magnitude_loss,
+        'highfreq_under_loss': highfreq_under_loss,
         'gradient_loss': gradient_loss,
         'bg_keep_loss': bg_keep_loss,
         'degrade_loss': degrade_loss,
@@ -292,6 +308,8 @@ def detail_refine_losses(
         'refined_hf_mae': refined_hf_mae,
         'base_hf_mag_mae': base_hf_mag_mae,
         'refined_hf_mag_mae': refined_hf_mag_mae,
+        'base_hf_under': base_hf_under,
+        'refined_hf_under': refined_hf_under,
         'base_grad_mae': base_grad_mae,
         'refined_grad_mae': refined_grad_mae,
     }
@@ -305,6 +323,7 @@ def build_detail_refine_head(opts=None):
         rate_dim=opts.get('rate_dim', 0),
         gain_scale=opts.get('gain_scale', 0.25),
         gain_mode=opts.get('gain_mode', 'positive'),
+        gain_init_bias=opts.get('gain_init_bias', -4.0),
         use_confidence=opts.get('use_confidence', False),
         carrier_source=opts.get('carrier_source', 'base'),
         carrier_kernel=opts.get('carrier_kernel', 5),
