@@ -9,6 +9,20 @@ def high_frequency(x, kernel_size=5):
     return x - F.avg_pool2d(x, kernel_size, stride=1, padding=kernel_size // 2)
 
 
+def gradient_magnitude(x):
+    dx = F.pad((x[:, :, :, 1:] - x[:, :, :, :-1]).abs(), (0, 1, 0, 0))
+    dy = F.pad((x[:, :, 1:, :] - x[:, :, :-1, :]).abs(), (0, 0, 0, 1))
+    return 0.5 * (dx + dy)
+
+
+def zero_conv(in_nc, out_nc, kernel_size=1, padding=0):
+    conv = nn.Conv2d(in_nc, out_nc, kernel_size, padding=padding)
+    nn.init.zeros_(conv.weight)
+    if conv.bias is not None:
+        nn.init.zeros_(conv.bias)
+    return conv
+
+
 def _extract(values, timesteps, target_shape):
     out = values.gather(0, timesteps)
     return out.view(timesteps.shape[0], *((1,) * (len(target_shape) - 1)))
@@ -118,10 +132,30 @@ class GuidedResidualDenoiser(nn.Module):
         predicted noise for residual diffusion.
     """
 
-    def __init__(self, in_nc=1, nf=48, cond_dim=128, rate_dim=0):
+    def __init__(
+            self,
+            in_nc=1,
+            nf=48,
+            cond_dim=128,
+            rate_dim=0,
+            control_enabled=False,
+            control_use_rate=True,
+            control_main_input='full',
+            control_hf_kernel=5):
         super(GuidedResidualDenoiser, self).__init__()
+        if control_main_input not in ('full', 'noise'):
+            raise ValueError(f'Unsupported control_main_input: {control_main_input}')
+        self.in_nc = in_nc
+        self.rate_dim = rate_dim
+        self.control_enabled = control_enabled
+        self.control_use_rate = control_use_rate
+        self.control_main_input = control_main_input
+        self.control_hf_kernel = control_hf_kernel
         self.cond = ConditionMLP(time_dim=cond_dim, rate_dim=rate_dim)
-        input_nc = in_nc * 3 + 1  # noisy residual, LQ, STDF/base, guidance
+        if control_enabled and control_main_input == 'noise':
+            input_nc = in_nc
+        else:
+            input_nc = in_nc * 3 + 1  # noisy residual, LQ, STDF/base, guidance
         self.in_conv = nn.Conv2d(input_nc, nf, 3, padding=1)
         self.down1 = DownBlock(nf, nf * 2, cond_dim)
         self.down2 = DownBlock(nf * 2, nf * 4, cond_dim)
@@ -132,18 +166,94 @@ class GuidedResidualDenoiser(nn.Module):
             nn.SiLU(),
             nn.Conv2d(nf, in_nc, 3, padding=1),
         )
+        if control_enabled:
+            control_nc = in_nc * 8
+            if control_use_rate and rate_dim > 0:
+                control_nc += 1
+            self.control_in = nn.Sequential(
+                nn.Conv2d(control_nc, nf, 3, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(nf, nf, 3, padding=1),
+                nn.SiLU(),
+            )
+            self.control_down1 = nn.Sequential(
+                nn.Conv2d(nf, nf * 2, 4, stride=2, padding=1),
+                nn.SiLU(),
+            )
+            self.control_down2 = nn.Sequential(
+                nn.Conv2d(nf * 2, nf * 4, 4, stride=2, padding=1),
+                nn.SiLU(),
+            )
+            self.control_zero_in = zero_conv(nf, nf)
+            self.control_zero_down1 = zero_conv(nf * 2, nf * 2)
+            self.control_zero_down2 = zero_conv(nf * 4, nf * 4)
+            self.control_zero_mid = zero_conv(nf * 4, nf * 4)
+            self.control_zero_up1 = zero_conv(nf * 2, nf * 2)
+            self.control_zero_up2 = zero_conv(nf, nf)
+        else:
+            self.control_in = None
+
+    def make_control_features(self, lq, base, guidance, rate_cond=None):
+        abs_diff = (base - lq).abs()
+        lq_hf = high_frequency(lq, self.control_hf_kernel)
+        base_hf = high_frequency(base, self.control_hf_kernel)
+        lq_grad = gradient_magnitude(lq)
+        base_grad = gradient_magnitude(base)
+        control_inputs = [
+            lq,
+            base,
+            guidance.clamp(0, 1),
+            abs_diff,
+            lq_hf,
+            base_hf,
+            lq_grad,
+            base_grad,
+        ]
+        if self.control_use_rate and self.rate_dim > 0:
+            if rate_cond is None:
+                rate_map = base.new_zeros(base.size(0), 1, base.size(2), base.size(3))
+            else:
+                if rate_cond.dim() == 1:
+                    rate_cond = rate_cond[:, None]
+                rate_map = rate_cond[:, :1].to(base.device).float()
+                rate_map = rate_map[:, :, None, None].expand(-1, -1, base.size(2), base.size(3))
+            control_inputs.append(rate_map)
+        ctrl = torch.cat(control_inputs, dim=1)
+        c0 = self.control_in(ctrl)
+        c1 = self.control_down1(c0)
+        c2 = self.control_down2(c1)
+        return c0, c1, c2
 
     def forward(self, noisy_residual, lq, base, guidance, t, rate_cond=None):
         if guidance.shape[-2:] != base.shape[-2:]:
             guidance = F.interpolate(guidance, size=base.shape[-2:], mode='bilinear', align_corners=False)
         cond = self.cond(t, rate_cond=rate_cond)
-        x = torch.cat([noisy_residual, lq, base, guidance], dim=1)
+        if self.control_enabled:
+            c0, c1, c2 = self.make_control_features(lq, base, guidance, rate_cond=rate_cond)
+        else:
+            c0 = c1 = c2 = None
+        if self.control_enabled and self.control_main_input == 'noise':
+            x = noisy_residual
+        else:
+            x = torch.cat([noisy_residual, lq, base, guidance], dim=1)
         x = self.in_conv(x)
+        if self.control_enabled:
+            x = x + self.control_zero_in(c0)
         x, skip0 = self.down1(x, cond)
+        if self.control_enabled:
+            x = x + self.control_zero_down1(c1)
         x, skip1 = self.down2(x, cond)
+        if self.control_enabled:
+            x = x + self.control_zero_down2(c2)
         x = self.mid(x, cond)
+        if self.control_enabled:
+            x = x + self.control_zero_mid(c2)
         x = self.up1(x, skip1, cond)
+        if self.control_enabled:
+            x = x + self.control_zero_up1(c1)
         x = self.up2(x, skip0, cond)
+        if self.control_enabled:
+            x = x + self.control_zero_up2(c0)
         return self.out_conv(x)
 
 
@@ -751,6 +861,13 @@ def build_grdr(opts=None):
         nf=opts.get('nf', 48),
         cond_dim=opts.get('cond_dim', 128),
         rate_dim=opts.get('rate_dim', 0),
+        control_enabled=opts.get('control_enabled', False),
+        control_use_rate=opts.get('control_use_rate', True),
+        control_main_input=opts.get('control_main_input', 'full'),
+        control_hf_kernel=opts.get(
+            'control_hf_kernel',
+            opts.get('target_highfreq_kernel', 5),
+        ),
     )
     return GuidedResidualDiffusion(
         denoiser=denoiser,

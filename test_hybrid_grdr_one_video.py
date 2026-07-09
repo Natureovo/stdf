@@ -269,6 +269,10 @@ def build_opts(args):
             'nf': args.diff_nf,
             'cond_dim': args.cond_dim,
             'rate_dim': args.rate_dim,
+            'control_enabled': args.diffusion_control_enabled,
+            'control_use_rate': args.diffusion_control_use_rate,
+            'control_main_input': args.diffusion_control_main_input,
+            'control_hf_kernel': args.diffusion_control_hf_kernel,
             'num_steps': args.num_steps,
             'sample_steps': args.sample_steps,
             'loss_type': 'l1',
@@ -388,6 +392,25 @@ def parse_args():
     parser.add_argument('--diff_nf', type=int, default=48)
     parser.add_argument('--cond_dim', type=int, default=128)
     parser.add_argument('--rate_dim', type=int, default=0)
+    parser.add_argument(
+        '--diffusion_control_enabled',
+        action='store_true',
+        help='Enable ControlNet-style zero-conv condition injection in GRDR.',
+    )
+    parser.add_argument(
+        '--diffusion_no_control_rate',
+        dest='diffusion_control_use_rate',
+        action='store_false',
+        help='Disable QP/rate map in the zero-conv control branch.',
+    )
+    parser.set_defaults(diffusion_control_use_rate=True)
+    parser.add_argument(
+        '--diffusion_control_main_input',
+        default='full',
+        choices=['full', 'noise'],
+        help='full keeps the old concat input plus zero-conv control; noise conditions only through zero-conv.',
+    )
+    parser.add_argument('--diffusion_control_hf_kernel', type=int, default=5)
     parser.add_argument(
         '--diffusion_target_mode',
         default='pixel_residual',
@@ -875,6 +898,8 @@ def main():
         'mask_mode': args.mask_mode,
         'top_ratio': args.top_ratio,
         'budget_mode': args.budget_mode,
+        'diffusion_control_enabled': args.diffusion_control_enabled,
+        'diffusion_control_main_input': args.diffusion_control_main_input,
         'diffusion_target_mode': args.diffusion_target_mode,
         'diffusion_carrier_source': args.diffusion_carrier_source,
         'diffusion_carrier_gain_clip': args.diffusion_carrier_gain_clip,
