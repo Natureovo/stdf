@@ -288,12 +288,19 @@ def main():
                 residual_loss = outputs['residual_loss']
                 residual_bg_loss = outputs['residual_bg_loss']
                 residual_sign_loss = outputs['residual_sign_loss']
+                hf_mag_loss = outputs['highfreq_magnitude_loss']
+                hf_under_loss = outputs['highfreq_under_loss']
+                degrade_loss = outputs['degrade_loss']
                 residual_sign_acc = float(outputs['residual_sign_acc'].detach().cpu())
                 residual_corr = float(outputs['residual_corr'].detach().cpu())
                 pred_residual_abs = float(outputs['pred_residual_abs'].detach().cpu())
                 target_residual_abs = float(outputs['target_residual_abs'].detach().cpu())
                 applied_pred_abs = float(outputs['applied_pred_residual_abs'].detach().cpu())
                 applied_target_abs = float(outputs['applied_target_residual_abs'].detach().cpu())
+                detail_gate_mean = float(outputs['detail_gate_mean'].detach().cpu())
+                effective_write_area = float(outputs['effective_write_area'].detach().cpu())
+                base_hf_mag_mae = float(outputs['base_hf_mag_mae'].detach().cpu())
+                pred_hf_mag_mae = float(outputs['pred_hf_mag_mae'].detach().cpu())
                 msg = (
                     f"iter: [{num_iter_accum}]/{num_iter}, "
                     f"epoch: [{current_epoch}]/{num_epoch - 1}, "
@@ -304,12 +311,18 @@ def main():
                     f"res_loss: [{residual_loss.item():.4f}], "
                     f"res_bg: [{residual_bg_loss.item():.4f}], "
                     f"res_sign: [{residual_sign_loss.item():.4f}], "
+                    f"hf_mag: [{hf_mag_loss.item():.4f}], "
+                    f"hf_under: [{hf_under_loss.item():.4f}], "
+                    f"degrade: [{degrade_loss.item():.4f}], "
                     f"sign_acc: [{residual_sign_acc:.4f}], "
                     f"res_corr: [{residual_corr:.4f}], "
                     f"pred_res_abs: [{pred_residual_abs:.4f}], "
                     f"target_res_abs: [{target_residual_abs:.4f}], "
                     f"applied_pred_abs: [{applied_pred_abs:.4f}], "
                     f"applied_target_abs: [{applied_target_abs:.4f}], "
+                    f"gate_mean: [{detail_gate_mean:.4f}], "
+                    f"eff_area: [{effective_write_area:.4f}], "
+                    f"hf_mag_mae: [{base_hf_mag_mae:.6f}/{pred_hf_mag_mae:.6f}], "
                     f"guidance_mean: [{guidance_mean:.4f}], "
                     f"write_area: [{write_area:.4f}], "
                     f"base_mean: [{base_mean:.4f}]"

@@ -45,18 +45,31 @@ network:
     in_nc: 1
     nf: 48
     cond_dim: 128
-    rate_dim: 0
+    rate_dim: 1
     num_steps: 1000
     sample_steps: 20
     loss_type: l1
     loss_bg_weight: 0.05
     rec_weight: 1.0
+    target_mode: highfreq_residual
+    target_highfreq_kernel: 5
+    detail_gate_mode: multi_cue
+    detail_gate_temperature: 8.0
+    detail_gate_hf_weight: 1.0
+    detail_gate_diff_weight: 0.5
+    detail_gate_guidance_weight: 0.5
+    detail_gate_qp_weight: 0.25
+    detail_gate_min: 0.05
     train_guidance_threshold: 0.3
-    train_residual_scale: 0.1
-    train_residual_clip: 0.1
-    residual_weight: 1.0
-    residual_bg_weight: 0.05
-    residual_sign_weight: 0.2
+    train_residual_scale: 0.2
+    train_residual_clip: 0.05
+    residual_weight: 0.5
+    residual_bg_weight: 0.02
+    residual_sign_weight: 0.0
+    highfreq_magnitude_weight: 1.0
+    highfreq_under_weight: 0.5
+    highfreq_under_ratio: 0.9
+    degrade_weight: 1.0
     train_use_hard_mask: False
 
   guidance_net:

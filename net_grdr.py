@@ -5,6 +5,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def high_frequency(x, kernel_size=5):
+    return x - F.avg_pool2d(x, kernel_size, stride=1, padding=kernel_size // 2)
+
+
 def _extract(values, timesteps, target_shape):
     out = values.gather(0, timesteps)
     return out.view(timesteps.shape[0], *((1,) * (len(target_shape) - 1)))
@@ -176,8 +180,25 @@ class GuidedResidualDiffusion(nn.Module):
             residual_weight=0.0,
             residual_bg_weight=0.0,
             residual_sign_weight=0.0,
+            target_mode='pixel_residual',
+            target_highfreq_kernel=5,
+            highfreq_magnitude_weight=0.0,
+            highfreq_under_weight=0.0,
+            highfreq_under_ratio=0.9,
+            degrade_weight=0.0,
+            detail_gate_mode='none',
+            detail_gate_temperature=8.0,
+            detail_gate_hf_weight=1.0,
+            detail_gate_diff_weight=0.5,
+            detail_gate_guidance_weight=0.5,
+            detail_gate_qp_weight=0.25,
+            detail_gate_min=0.0,
             train_use_hard_mask=True):
         super(GuidedResidualDiffusion, self).__init__()
+        if target_mode not in ('pixel_residual', 'highfreq_residual', 'highfreq_gt'):
+            raise ValueError(f'Unsupported diffusion target_mode: {target_mode}')
+        if detail_gate_mode not in ('none', 'hf_gap', 'multi_cue'):
+            raise ValueError(f'Unsupported detail_gate_mode: {detail_gate_mode}')
         self.denoiser = denoiser
         self.num_steps = num_steps
         self.loss_type = loss_type
@@ -198,6 +219,19 @@ class GuidedResidualDiffusion(nn.Module):
         self.residual_weight = residual_weight
         self.residual_bg_weight = residual_bg_weight
         self.residual_sign_weight = residual_sign_weight
+        self.target_mode = target_mode
+        self.target_highfreq_kernel = target_highfreq_kernel
+        self.highfreq_magnitude_weight = highfreq_magnitude_weight
+        self.highfreq_under_weight = highfreq_under_weight
+        self.highfreq_under_ratio = highfreq_under_ratio
+        self.degrade_weight = degrade_weight
+        self.detail_gate_mode = detail_gate_mode
+        self.detail_gate_temperature = detail_gate_temperature
+        self.detail_gate_hf_weight = detail_gate_hf_weight
+        self.detail_gate_diff_weight = detail_gate_diff_weight
+        self.detail_gate_guidance_weight = detail_gate_guidance_weight
+        self.detail_gate_qp_weight = detail_gate_qp_weight
+        self.detail_gate_min = detail_gate_min
         self.train_use_hard_mask = train_use_hard_mask
 
         betas = torch.linspace(beta_start, beta_end, num_steps, dtype=torch.float32)
@@ -228,6 +262,43 @@ class GuidedResidualDiffusion(nn.Module):
             _extract(self.sqrt_one_minus_alphas_cumprod, t, noisy_residual.shape) * pred_noise
         ) / (_extract(self.sqrt_alphas_cumprod, t, noisy_residual.shape) + 1e-6)
         return torch.nan_to_num(pred_residual, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def make_target_signal(self, base, gt):
+        if self.target_mode == 'pixel_residual':
+            return gt - base
+        gt_hf = high_frequency(gt, self.target_highfreq_kernel)
+        if self.target_mode == 'highfreq_gt':
+            return gt_hf
+        base_hf = high_frequency(base, self.target_highfreq_kernel)
+        return gt_hf - base_hf
+
+    def make_detail_gate(self, lq, base, guidance, rate_cond=None):
+        if self.detail_gate_mode == 'none':
+            return torch.ones_like(base)
+
+        lq_hf = high_frequency(lq, self.target_highfreq_kernel).abs()
+        base_hf = high_frequency(base, self.target_highfreq_kernel).abs()
+        hf_norm = (lq_hf.mean(dim=(2, 3), keepdim=True) +
+                   base_hf.mean(dim=(2, 3), keepdim=True) + 1e-6)
+        hf_gap = (lq_hf - base_hf) / hf_norm
+        logit = float(self.detail_gate_hf_weight) * hf_gap
+
+        if self.detail_gate_mode == 'multi_cue':
+            diff = (base - lq).abs()
+            diff_norm = diff / (diff.mean(dim=(2, 3), keepdim=True) + 1e-6)
+            logit = logit + float(self.detail_gate_diff_weight) * (diff_norm - 1.0)
+            logit = logit + float(self.detail_gate_guidance_weight) * (guidance.clamp(0, 1) - 0.5)
+            if rate_cond is not None:
+                if rate_cond.dim() == 1:
+                    rate_cond = rate_cond[:, None]
+                qp_norm = rate_cond[:, :1].to(base.device).float()
+                logit = logit + float(self.detail_gate_qp_weight) * qp_norm[:, :, None, None]
+
+        gate = torch.sigmoid(float(self.detail_gate_temperature) * logit)
+        gate_min = float(self.detail_gate_min)
+        if gate_min > 0:
+            gate = gate_min + (1.0 - gate_min) * gate
+        return gate.clamp(0, 1)
 
     def _top_ratio_mask(self, guidance, top_ratio):
         if top_ratio is None:
@@ -384,7 +455,7 @@ class GuidedResidualDiffusion(nn.Module):
         return guidance
 
     def training_losses(self, lq, base, gt, guidance, rate_cond=None):
-        residual = gt - base
+        residual = self.make_target_signal(base, gt)
         t = torch.randint(0, self.num_steps, (gt.size(0),), device=gt.device).long()
         noise = torch.randn_like(residual)
         noisy_residual = self.q_sample(residual, t, noise=noise)
@@ -420,25 +491,40 @@ class GuidedResidualDiffusion(nn.Module):
             content_ratio_min_scale=self.train_content_ratio_min_scale,
             content_ratio_max_scale=self.train_content_ratio_max_scale,
         )
-        pred_hybrid = (base + self.train_residual_scale * write_mask * pred_residual).clamp(0, 1)
+        detail_gate = self.make_detail_gate(lq, base, guidance, rate_cond=rate_cond).detach()
+        effective_mask = write_mask * detail_gate
+        pred_hybrid = (base + self.train_residual_scale * effective_mask * pred_residual).clamp(0, 1)
         rec_loss = torch.sqrt((pred_hybrid - gt).pow(2) + 1e-6).mean()
 
-        applied_pred_residual = self.train_residual_scale * write_mask * pred_residual
-        applied_target_residual = write_mask * target_residual
+        applied_pred_residual = self.train_residual_scale * effective_mask * pred_residual
+        applied_target_residual = self.train_residual_scale * effective_mask * target_residual
         residual_abs = torch.sqrt(
-            (applied_pred_residual - applied_target_residual).pow(2) + 1e-6
+            (pred_residual - target_residual).pow(2) + 1e-6
         )
-        residual_loss = (residual_abs * write_mask).sum() / (write_mask.sum() + 1e-6)
+        residual_loss = (residual_abs * effective_mask).sum() / (effective_mask.sum() + 1e-6)
 
-        bg_weight = (1.0 - write_mask.detach()).clamp(0, 1)
+        bg_weight = (1.0 - effective_mask.detach()).clamp(0, 1)
         residual_bg_loss = (pred_residual.abs() * bg_weight).sum() / (bg_weight.sum() + 1e-6)
 
         valid_sign = (target_residual.abs() > 1e-4).float()
-        sign_weight = (write_mask.detach().clamp(0, 1) * valid_sign).detach()
+        sign_weight = (effective_mask.detach().clamp(0, 1) * valid_sign).detach()
         target_sign = target_residual.detach().sign()
         residual_sign_loss = (
             F.relu(-pred_residual * target_sign) * sign_weight
         ).sum() / (sign_weight.sum() + 1e-6)
+
+        pred_hf = high_frequency(pred_hybrid, self.target_highfreq_kernel)
+        gt_hf = high_frequency(gt, self.target_highfreq_kernel)
+        highfreq_magnitude_loss = (
+            torch.sqrt((pred_hf.abs() - gt_hf.abs()).pow(2) + 1e-6) * effective_mask
+        ).sum() / (effective_mask.sum() + 1e-6)
+        under_target = (gt_hf.abs() * float(self.highfreq_under_ratio)).detach()
+        highfreq_under_loss = (
+            F.relu(under_target - pred_hf.abs()) * effective_mask
+        ).sum() / (effective_mask.sum() + 1e-6)
+        degrade_loss = (
+            F.relu((pred_hybrid - gt).abs() - (base - gt).abs().detach()) * effective_mask
+        ).sum() / (effective_mask.sum() + 1e-6)
 
         with torch.no_grad():
             sign_acc = (
@@ -455,13 +541,19 @@ class GuidedResidualDiffusion(nn.Module):
             pred_var = (pred_centered.pow(2) * sign_weight).sum() / w_sum
             target_var = (target_centered.pow(2) * sign_weight).sum() / w_sum
             residual_corr = covariance / torch.sqrt(pred_var * target_var + 1e-12)
+            base_hf = high_frequency(base, self.target_highfreq_kernel)
+            base_hf_mag_mae = (base_hf.abs() - gt_hf.abs()).abs().mean()
+            pred_hf_mag_mae = (pred_hf.abs() - gt_hf.abs()).abs().mean()
 
         total_loss = (
             diff_loss +
             self.rec_weight * rec_loss +
             self.residual_weight * residual_loss +
             self.residual_bg_weight * residual_bg_loss +
-            self.residual_sign_weight * residual_sign_loss
+            self.residual_sign_weight * residual_sign_loss +
+            self.highfreq_magnitude_weight * highfreq_magnitude_loss +
+            self.highfreq_under_weight * highfreq_under_loss +
+            self.degrade_weight * degrade_loss
         )
 
         return {
@@ -471,14 +563,23 @@ class GuidedResidualDiffusion(nn.Module):
             'residual_loss': residual_loss,
             'residual_bg_loss': residual_bg_loss,
             'residual_sign_loss': residual_sign_loss,
+            'highfreq_magnitude_loss': highfreq_magnitude_loss,
+            'highfreq_under_loss': highfreq_under_loss,
+            'degrade_loss': degrade_loss,
             'residual_sign_acc': sign_acc,
             'residual_corr': residual_corr,
             'pred_residual_abs': pred_residual.abs().mean(),
             'target_residual_abs': target_residual.abs().mean(),
             'applied_pred_residual_abs': applied_pred_residual.abs().mean(),
             'applied_target_residual_abs': applied_target_residual.abs().mean(),
+            'detail_gate_mean': detail_gate.mean(),
+            'effective_write_area': effective_mask.mean(),
+            'base_hf_mag_mae': base_hf_mag_mae,
+            'pred_hf_mag_mae': pred_hf_mag_mae,
             'pred_hybrid': pred_hybrid,
-            'write_mask': write_mask,
+            'write_mask': effective_mask,
+            'raw_write_mask': write_mask,
+            'detail_gate': detail_gate,
         }
 
     def training_loss(self, lq, base, gt, guidance, rate_cond=None):
@@ -558,6 +659,8 @@ class GuidedResidualDiffusion(nn.Module):
             content_ratio_min_scale=content_ratio_min_scale,
             content_ratio_max_scale=content_ratio_max_scale,
         )
+        detail_gate = self.make_detail_gate(lq, base, guidance, rate_cond=rate_cond)
+        mask = mask * detail_gate
 
         return (base + residual_scale * mask * residual).clamp(0, 1)
 
@@ -593,5 +696,18 @@ def build_grdr(opts=None):
         residual_weight=opts.get('residual_weight', 0.0),
         residual_bg_weight=opts.get('residual_bg_weight', 0.0),
         residual_sign_weight=opts.get('residual_sign_weight', 0.0),
+        target_mode=opts.get('target_mode', 'pixel_residual'),
+        target_highfreq_kernel=opts.get('target_highfreq_kernel', 5),
+        highfreq_magnitude_weight=opts.get('highfreq_magnitude_weight', 0.0),
+        highfreq_under_weight=opts.get('highfreq_under_weight', 0.0),
+        highfreq_under_ratio=opts.get('highfreq_under_ratio', 0.9),
+        degrade_weight=opts.get('degrade_weight', 0.0),
+        detail_gate_mode=opts.get('detail_gate_mode', 'none'),
+        detail_gate_temperature=opts.get('detail_gate_temperature', 8.0),
+        detail_gate_hf_weight=opts.get('detail_gate_hf_weight', 1.0),
+        detail_gate_diff_weight=opts.get('detail_gate_diff_weight', 0.5),
+        detail_gate_guidance_weight=opts.get('detail_gate_guidance_weight', 0.5),
+        detail_gate_qp_weight=opts.get('detail_gate_qp_weight', 0.25),
+        detail_gate_min=opts.get('detail_gate_min', 0.0),
         train_use_hard_mask=opts.get('train_use_hard_mask', True),
     )

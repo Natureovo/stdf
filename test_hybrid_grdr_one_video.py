@@ -272,6 +272,15 @@ def build_opts(args):
             'num_steps': args.num_steps,
             'sample_steps': args.sample_steps,
             'loss_type': 'l1',
+            'target_mode': args.diffusion_target_mode,
+            'target_highfreq_kernel': args.diffusion_target_highfreq_kernel,
+            'detail_gate_mode': args.diffusion_detail_gate_mode,
+            'detail_gate_temperature': args.diffusion_detail_gate_temperature,
+            'detail_gate_hf_weight': args.diffusion_detail_gate_hf_weight,
+            'detail_gate_diff_weight': args.diffusion_detail_gate_diff_weight,
+            'detail_gate_guidance_weight': args.diffusion_detail_gate_guidance_weight,
+            'detail_gate_qp_weight': args.diffusion_detail_gate_qp_weight,
+            'detail_gate_min': args.diffusion_detail_gate_min,
         },
         'guidance_net': {
             'in_nc': 1,
@@ -375,6 +384,23 @@ def parse_args():
     parser.add_argument('--diff_nf', type=int, default=48)
     parser.add_argument('--cond_dim', type=int, default=128)
     parser.add_argument('--rate_dim', type=int, default=0)
+    parser.add_argument(
+        '--diffusion_target_mode',
+        default='pixel_residual',
+        choices=['pixel_residual', 'highfreq_residual', 'highfreq_gt'],
+    )
+    parser.add_argument('--diffusion_target_highfreq_kernel', type=int, default=5)
+    parser.add_argument(
+        '--diffusion_detail_gate_mode',
+        default='none',
+        choices=['none', 'hf_gap', 'multi_cue'],
+    )
+    parser.add_argument('--diffusion_detail_gate_temperature', type=float, default=8.0)
+    parser.add_argument('--diffusion_detail_gate_hf_weight', type=float, default=1.0)
+    parser.add_argument('--diffusion_detail_gate_diff_weight', type=float, default=0.5)
+    parser.add_argument('--diffusion_detail_gate_guidance_weight', type=float, default=0.5)
+    parser.add_argument('--diffusion_detail_gate_qp_weight', type=float, default=0.25)
+    parser.add_argument('--diffusion_detail_gate_min', type=float, default=0.0)
     parser.add_argument('--guidance_nf', type=int, default=32)
     parser.add_argument('--guidance_rate_dim', type=int, default=0)
     parser.add_argument('--guidance_target_threshold', type=float, default=0.3)
@@ -664,6 +690,7 @@ def main():
                     rate_cond=diffusion_rate_cond,
                     content_source=lq_center,
                 )
+            effective_write_mask = write_mask
             if args.oracle_residual:
                 refined = (base + write_mask * (gt - base)).clamp(0, 1)
             elif args.refine_mode == 'direct':
@@ -689,6 +716,13 @@ def main():
                 )
                 refined = (base + write_mask * args.detail_correction_scale * detail_correction).clamp(0, 1)
             else:
+                detail_gate = model.diffusion.make_detail_gate(
+                    lq_center,
+                    base,
+                    guidance.clamp(0, 1),
+                    rate_cond=diffusion_rate_cond,
+                )
+                effective_write_mask = write_mask * detail_gate
                 refined = model.diffusion.refine(
                     lq_center,
                     base,
@@ -707,12 +741,12 @@ def main():
             total_time_counter.accum(time.perf_counter() - total_start)
 
             oracle_mask = oracle_guidance >= oracle_budget_threshold
-            compare_mask = write_mask >= 0.5
+            compare_mask = effective_write_mask >= 0.5
             cur_mask_metrics = mask_metrics(compare_mask, oracle_mask)
             cur_mask_metrics.update(soft_guidance_metrics(guidance, oracle_guidance))
             oracle_budget = float(oracle_mask.float().mean().cpu())
             oracle_soft_budget = float(oracle_guidance.mean().cpu())
-            write_area = float(write_mask.mean().detach().cpu())
+            write_area = float(effective_write_mask.mean().detach().cpu())
             cur_mask_metrics['oracle_budget'] = oracle_budget
             cur_mask_metrics['oracle_soft_budget'] = oracle_soft_budget
             cur_mask_metrics['write_oracle_budget_abs_gap'] = abs(write_area - oracle_budget)
