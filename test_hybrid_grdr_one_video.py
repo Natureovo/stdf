@@ -302,6 +302,7 @@ def build_opts(args):
             'nf': args.detail_nf,
             'rate_dim': args.detail_rate_dim,
             'gain_scale': args.detail_gain_scale,
+            'gain_mode': args.detail_gain_mode,
             'use_confidence': args.detail_use_confidence,
             'carrier_source': args.detail_carrier_source,
             'carrier_kernel': args.detail_carrier_kernel,
@@ -388,6 +389,12 @@ def parse_args():
     parser.add_argument('--detail_nf', type=int, default=32)
     parser.add_argument('--detail_rate_dim', type=int, default=0)
     parser.add_argument('--detail_gain_scale', type=float, default=0.20)
+    parser.add_argument(
+        '--detail_gain_mode',
+        default='positive',
+        choices=['positive', 'signed'],
+        help='positive treats gain as local detail enhancement strength; signed keeps the old ablation behavior.',
+    )
     parser.add_argument('--detail_correction_scale', type=float, default=1.0)
     parser.add_argument(
         '--detail_use_confidence',

@@ -94,17 +94,19 @@ network:
     nf: 32
     rate_dim: 1
     gain_scale: 0.40
+    gain_mode: positive
     use_confidence: False
     carrier_source: base
     carrier_kernel: 5
     rec_weight: 1.0
     highfreq_weight: 0.5
+    highfreq_magnitude_weight: 1.0
     gradient_weight: 0.25
     bg_weight: 0.05
-    degrade_weight: 0.5
-    gain_weight: 2.0
-    energy_weight: 8.0
-    correction_weight: 50.0
+    degrade_weight: 1.0
+    gain_weight: 0.0
+    energy_weight: 0.0
+    correction_weight: 0.0
     correction_focus_beta: 4.0
     target_gain_clip: 0.40
     carrier_eps: !!float 1e-4
