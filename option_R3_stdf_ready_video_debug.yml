@@ -78,11 +78,15 @@ network:
     highfreq_magnitude_weight: 1.0
     highfreq_under_weight: 0.5
     highfreq_under_ratio: 0.9
-    degrade_weight: 1.0
-    amplitude_over_weight: 2.0
+    degrade_weight: 0.5
+    amplitude_over_weight: 1.0
     amplitude_mean_weight: 1.0
-    amplitude_sparsity_weight: 0.2
+    amplitude_sparsity_weight: 0.05
     amplitude_sparsity_gamma: 2.0
+    amplitude_focal_weight: 1.0
+    amplitude_focal_beta: 4.0
+    amplitude_focal_gamma: 2.0
+    amplitude_cosine_weight: 0.05
     train_use_hard_mask: False
 
   guidance_net:
