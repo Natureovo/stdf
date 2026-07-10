@@ -361,6 +361,12 @@ def parse_args():
         help='Use DDIM for accelerated sampling; DDPM requires all num_steps.',
     )
     parser.add_argument('--diffusion_ddim_eta', type=float, default=0.0)
+    parser.add_argument(
+        '--diffusion_noise_mode',
+        default='independent',
+        choices=['independent', 'shared'],
+        help='Reuse one initial DDIM noise tensor across frames in shared mode.',
+    )
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--guidance_threshold', type=float, default=0.6)
     parser.add_argument(
@@ -531,6 +537,12 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.diffusion_noise_mode == 'shared' and (
+            args.diffusion_sampler != 'ddim' or
+            args.diffusion_ddim_eta != 0.0):
+        raise ValueError(
+            'shared diffusion noise requires DDIM with --diffusion_ddim_eta 0.'
+        )
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -683,6 +695,7 @@ def main():
     prev_lq_np = None
     prev_base_np = None
     prev_refined_np = None
+    shared_diffusion_noise = None
 
     pbar = tqdm(total=nfs, ncols=100)
     for idx in range(nfs):
@@ -804,6 +817,13 @@ def main():
                 )
                 refined = (base + write_mask * args.detail_correction_scale * detail_correction).clamp(0, 1)
             else:
+                initial_noise = None
+                if args.diffusion_noise_mode == 'shared':
+                    if (
+                            shared_diffusion_noise is None or
+                            shared_diffusion_noise.shape != base.shape):
+                        shared_diffusion_noise = torch.randn_like(base)
+                    initial_noise = shared_diffusion_noise
                 detail_gate = model.diffusion.make_detail_gate(
                     lq_center,
                     base,
@@ -825,6 +845,7 @@ def main():
                     use_hard_mask=not args.soft_guidance,
                     sampler=args.diffusion_sampler,
                     ddim_eta=args.diffusion_ddim_eta,
+                    initial_noise=initial_noise,
                 )
             sync_if_cuda(device)
             hybrid_time_counter.accum(time.perf_counter() - hybrid_start)
@@ -951,6 +972,7 @@ def main():
         'sample_steps': args.sample_steps,
         'diffusion_sampler': args.diffusion_sampler,
         'diffusion_ddim_eta': args.diffusion_ddim_eta,
+        'diffusion_noise_mode': args.diffusion_noise_mode,
         'seed': args.seed,
         'guidance_threshold': args.guidance_threshold,
         'mask_mode': args.mask_mode,
