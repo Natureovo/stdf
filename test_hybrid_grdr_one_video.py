@@ -353,6 +353,14 @@ def parse_args():
     parser.add_argument('--save-name', default=None)
     parser.add_argument('--max_frames', type=int, default=None)
     parser.add_argument('--sample_steps', type=int, default=20)
+    parser.add_argument(
+        '--diffusion_sampler',
+        default='ddim',
+        choices=['ddim', 'ddpm'],
+        help='Use DDIM for accelerated sampling; DDPM requires all num_steps.',
+    )
+    parser.add_argument('--diffusion_ddim_eta', type=float, default=0.0)
+    parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--guidance_threshold', type=float, default=0.6)
     parser.add_argument(
         '--mask_mode',
@@ -374,6 +382,14 @@ def parse_args():
         help=(
             'Diagnostic upper-bound mode: bypass GRDR sampling and use '
             'base + write_mask * (GT - base).'
+        ),
+    )
+    parser.add_argument(
+        '--oracle_diffusion_target',
+        action='store_true',
+        help=(
+            'Diagnostic upper bound: bypass diffusion sampling and apply the '
+            'GT-derived target signal through the configured carrier and gate.'
         ),
     )
     parser.add_argument(
@@ -509,6 +525,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     raw_yuv_path = args.raw_yuv or op.join(args.raw_dir, args.video)
@@ -545,8 +564,14 @@ def main():
     stdf_state, _ = load_state_dict(args.stdf_ckpt)
     model.enhancer.load_state_dict(stdf_state, strict=True)
 
-    if args.refine_mode == 'grdr' and args.grdr_ckpt is None and not args.oracle_residual:
-        raise ValueError('--grdr_ckpt is required unless --oracle_residual is set.')
+    if (
+            args.refine_mode == 'grdr' and
+            args.grdr_ckpt is None and
+            not args.oracle_residual and
+            not args.oracle_diffusion_target):
+        raise ValueError(
+            '--grdr_ckpt is required unless an oracle diagnostic is set.'
+        )
     if args.grdr_ckpt is not None:
         _, grdr_checkpoint = load_state_dict(args.grdr_ckpt)
         if 'diffusion_state_dict' in grdr_checkpoint:
@@ -728,6 +753,28 @@ def main():
             effective_write_mask = write_mask
             if args.oracle_residual:
                 refined = (base + write_mask * (gt - base)).clamp(0, 1)
+            elif args.oracle_diffusion_target:
+                detail_gate = model.diffusion.make_detail_gate(
+                    lq_center,
+                    base,
+                    guidance.clamp(0, 1),
+                    rate_cond=diffusion_rate_cond,
+                )
+                effective_write_mask = write_mask * detail_gate
+                target_signal = model.diffusion.make_target_signal(
+                    lq_center,
+                    base,
+                    gt,
+                )
+                target_correction, _ = model.diffusion.signal_to_correction(
+                    target_signal,
+                    lq_center,
+                    base,
+                )
+                refined = (
+                    base +
+                    args.residual_scale * effective_write_mask * target_correction
+                ).clamp(0, 1)
             elif args.refine_mode == 'direct':
                 direct_rate_cond = None
                 if args.direct_rate_dim > 0 and rate_cond is not None:
@@ -770,6 +817,8 @@ def main():
                     residual_scale=args.residual_scale,
                     residual_clip=args.residual_clip,
                     use_hard_mask=not args.soft_guidance,
+                    sampler=args.diffusion_sampler,
+                    ddim_eta=args.diffusion_ddim_eta,
                 )
             sync_if_cuda(device)
             hybrid_time_counter.accum(time.perf_counter() - hybrid_start)
@@ -894,6 +943,9 @@ def main():
         'budget_ckpt': args.budget_ckpt,
         'refine_mode': args.refine_mode,
         'sample_steps': args.sample_steps,
+        'diffusion_sampler': args.diffusion_sampler,
+        'diffusion_ddim_eta': args.diffusion_ddim_eta,
+        'seed': args.seed,
         'guidance_threshold': args.guidance_threshold,
         'mask_mode': args.mask_mode,
         'top_ratio': args.top_ratio,
@@ -907,6 +959,7 @@ def main():
         'residual_scale': args.residual_scale,
         'residual_clip': args.residual_clip,
         'oracle_residual': args.oracle_residual,
+        'oracle_diffusion_target': args.oracle_diffusion_target,
         'soft_guidance': args.soft_guidance,
         'guidance_source': args.guidance_mode,
         'qp': args.qp,
