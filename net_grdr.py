@@ -305,6 +305,10 @@ class GuidedResidualDiffusion(nn.Module):
             amplitude_mean_weight=0.0,
             amplitude_sparsity_weight=0.0,
             amplitude_sparsity_gamma=2.0,
+            amplitude_focal_weight=0.0,
+            amplitude_focal_beta=4.0,
+            amplitude_focal_gamma=2.0,
+            amplitude_cosine_weight=0.0,
             detail_gate_mode='none',
             detail_gate_temperature=8.0,
             detail_gate_hf_weight=1.0,
@@ -367,6 +371,10 @@ class GuidedResidualDiffusion(nn.Module):
         self.amplitude_mean_weight = amplitude_mean_weight
         self.amplitude_sparsity_weight = amplitude_sparsity_weight
         self.amplitude_sparsity_gamma = amplitude_sparsity_gamma
+        self.amplitude_focal_weight = amplitude_focal_weight
+        self.amplitude_focal_beta = amplitude_focal_beta
+        self.amplitude_focal_gamma = amplitude_focal_gamma
+        self.amplitude_cosine_weight = amplitude_cosine_weight
         self.detail_gate_mode = detail_gate_mode
         self.detail_gate_temperature = detail_gate_temperature
         self.detail_gate_hf_weight = detail_gate_hf_weight
@@ -764,11 +772,36 @@ class GuidedResidualDiffusion(nn.Module):
             amplitude_sparsity_loss = (
                 pred_prior * low_target_weight * amp_mask
             ).sum() / amp_denom
+
+            focal_weight = 1.0 + float(self.amplitude_focal_beta) * target_unit.pow(
+                float(self.amplitude_focal_gamma)
+            )
+            focal_denom = (focal_weight * amp_mask).sum() + 1e-6
+            amplitude_focal_loss = (
+                (pred_prior - target_prior.detach()).abs() *
+                focal_weight *
+                amp_mask
+            ).sum() / focal_denom
+
+            cosine_mask = amp_mask.sqrt()
+            pred_vector = (pred_prior * cosine_mask).flatten(1)
+            target_vector = (target_prior.detach() * cosine_mask).flatten(1)
+            pred_norm = pred_vector.norm(dim=1)
+            target_norm = target_vector.norm(dim=1)
+            cosine = (pred_vector * target_vector).sum(dim=1) / (
+                pred_norm * target_norm + 1e-8
+            )
+            valid_cosine = (target_norm > 1e-6).float()
+            amplitude_cosine_loss = (
+                (1.0 - cosine.clamp(-1.0, 1.0)) * valid_cosine
+            ).sum() / (valid_cosine.sum() + 1e-6)
         else:
             zero_loss = pred_prior.sum() * 0.0
             amplitude_over_loss = zero_loss
             amplitude_mean_loss = zero_loss
             amplitude_sparsity_loss = zero_loss
+            amplitude_focal_loss = zero_loss
+            amplitude_cosine_loss = zero_loss
 
         with torch.no_grad():
             sign_acc = (
@@ -800,7 +833,9 @@ class GuidedResidualDiffusion(nn.Module):
             self.degrade_weight * degrade_loss +
             self.amplitude_over_weight * amplitude_over_loss +
             self.amplitude_mean_weight * amplitude_mean_loss +
-            self.amplitude_sparsity_weight * amplitude_sparsity_loss
+            self.amplitude_sparsity_weight * amplitude_sparsity_loss +
+            self.amplitude_focal_weight * amplitude_focal_loss +
+            self.amplitude_cosine_weight * amplitude_cosine_loss
         )
 
         return {
@@ -816,6 +851,8 @@ class GuidedResidualDiffusion(nn.Module):
             'amplitude_over_loss': amplitude_over_loss,
             'amplitude_mean_loss': amplitude_mean_loss,
             'amplitude_sparsity_loss': amplitude_sparsity_loss,
+            'amplitude_focal_loss': amplitude_focal_loss,
+            'amplitude_cosine_loss': amplitude_cosine_loss,
             'residual_sign_acc': sign_acc,
             'residual_corr': residual_corr,
             'pred_residual_abs': pred_prior.abs().mean(),
@@ -1048,6 +1085,10 @@ def build_grdr(opts=None):
         amplitude_mean_weight=opts.get('amplitude_mean_weight', 0.0),
         amplitude_sparsity_weight=opts.get('amplitude_sparsity_weight', 0.0),
         amplitude_sparsity_gamma=opts.get('amplitude_sparsity_gamma', 2.0),
+        amplitude_focal_weight=opts.get('amplitude_focal_weight', 0.0),
+        amplitude_focal_beta=opts.get('amplitude_focal_beta', 4.0),
+        amplitude_focal_gamma=opts.get('amplitude_focal_gamma', 2.0),
+        amplitude_cosine_weight=opts.get('amplitude_cosine_weight', 0.0),
         detail_gate_mode=opts.get('detail_gate_mode', 'none'),
         detail_gate_temperature=opts.get('detail_gate_temperature', 8.0),
         detail_gate_hf_weight=opts.get('detail_gate_hf_weight', 1.0),
