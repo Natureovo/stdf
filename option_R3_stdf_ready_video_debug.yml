@@ -61,6 +61,7 @@ network:
     carrier_gain_clip: 0.08
     carrier_norm_clip: 3.0
     carrier_eps: !!float 1e-4
+    carrier_amp_normalize: True
     detail_gate_mode: multi_cue
     detail_gate_temperature: 8.0
     detail_gate_hf_weight: 1.0
@@ -78,6 +79,10 @@ network:
     highfreq_under_weight: 0.5
     highfreq_under_ratio: 0.9
     degrade_weight: 1.0
+    amplitude_over_weight: 2.0
+    amplitude_mean_weight: 1.0
+    amplitude_sparsity_weight: 0.2
+    amplitude_sparsity_gamma: 2.0
     train_use_hard_mask: False
 
   guidance_net:

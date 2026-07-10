@@ -291,6 +291,9 @@ def main():
                 hf_mag_loss = outputs['highfreq_magnitude_loss']
                 hf_under_loss = outputs['highfreq_under_loss']
                 degrade_loss = outputs['degrade_loss']
+                amp_over_loss = outputs['amplitude_over_loss']
+                amp_mean_loss = outputs['amplitude_mean_loss']
+                amp_sparse_loss = outputs['amplitude_sparsity_loss']
                 residual_sign_acc = float(outputs['residual_sign_acc'].detach().cpu())
                 residual_corr = float(outputs['residual_corr'].detach().cpu())
                 pred_residual_abs = float(outputs['pred_residual_abs'].detach().cpu())
@@ -314,6 +317,9 @@ def main():
                     f"hf_mag: [{hf_mag_loss.item():.4f}], "
                     f"hf_under: [{hf_under_loss.item():.4f}], "
                     f"degrade: [{degrade_loss.item():.4f}], "
+                    f"amp_over: [{amp_over_loss.item():.4f}], "
+                    f"amp_mean: [{amp_mean_loss.item():.4f}], "
+                    f"amp_sparse: [{amp_sparse_loss.item():.4f}], "
                     f"sign_acc: [{residual_sign_acc:.4f}], "
                     f"res_corr: [{residual_corr:.4f}], "
                     f"pred_res_abs: [{pred_residual_abs:.4f}], "
