@@ -296,10 +296,15 @@ class GuidedResidualDiffusion(nn.Module):
             carrier_gain_clip=0.5,
             carrier_norm_clip=3.0,
             carrier_eps=1e-4,
+            carrier_amp_normalize=False,
             highfreq_magnitude_weight=0.0,
             highfreq_under_weight=0.0,
             highfreq_under_ratio=0.9,
             degrade_weight=0.0,
+            amplitude_over_weight=0.0,
+            amplitude_mean_weight=0.0,
+            amplitude_sparsity_weight=0.0,
+            amplitude_sparsity_gamma=2.0,
             detail_gate_mode='none',
             detail_gate_temperature=8.0,
             detail_gate_hf_weight=1.0,
@@ -346,10 +351,22 @@ class GuidedResidualDiffusion(nn.Module):
         self.carrier_gain_clip = carrier_gain_clip
         self.carrier_norm_clip = carrier_norm_clip
         self.carrier_eps = carrier_eps
+        self.carrier_amp_normalize = carrier_amp_normalize
+        if (
+                self.target_mode == 'carrier_amp' and
+                self.carrier_amp_normalize and
+                (self.carrier_gain_clip is None or self.carrier_gain_clip <= 0)):
+            raise ValueError(
+                'carrier_amp_normalize requires a positive carrier_gain_clip.'
+            )
         self.highfreq_magnitude_weight = highfreq_magnitude_weight
         self.highfreq_under_weight = highfreq_under_weight
         self.highfreq_under_ratio = highfreq_under_ratio
         self.degrade_weight = degrade_weight
+        self.amplitude_over_weight = amplitude_over_weight
+        self.amplitude_mean_weight = amplitude_mean_weight
+        self.amplitude_sparsity_weight = amplitude_sparsity_weight
+        self.amplitude_sparsity_gamma = amplitude_sparsity_gamma
         self.detail_gate_mode = detail_gate_mode
         self.detail_gate_temperature = detail_gate_temperature
         self.detail_gate_hf_weight = detail_gate_hf_weight
@@ -422,7 +439,13 @@ class GuidedResidualDiffusion(nn.Module):
     def signal_to_correction(self, signal, lq, base):
         if not self.is_carrier_guided():
             return signal, signal
-        prior = self.positive_gain(signal)
+        if self.target_mode == 'carrier_amp' and self.carrier_amp_normalize:
+            prior = (
+                0.5 * (signal.clamp(-1.0, 1.0) + 1.0) *
+                float(self.carrier_gain_clip)
+            )
+        else:
+            prior = self.positive_gain(signal)
         if self.target_mode == 'carrier_amp':
             carrier_direction = self.make_carrier_direction(lq, base)
             return prior * carrier_direction, prior
@@ -449,6 +472,9 @@ class GuidedResidualDiffusion(nn.Module):
             target_amp = F.relu(target_mag - base_hf.abs().detach())
             if self.carrier_gain_clip is not None and self.carrier_gain_clip > 0:
                 target_amp = target_amp.clamp(max=float(self.carrier_gain_clip))
+            if self.carrier_amp_normalize:
+                target_unit = target_amp / float(self.carrier_gain_clip)
+                return target_unit.clamp(0.0, 1.0) * 2.0 - 1.0
             return target_amp
         return gt_hf - base_hf
 
@@ -711,6 +737,39 @@ class GuidedResidualDiffusion(nn.Module):
             F.relu((pred_hybrid - gt).abs() - (base - gt).abs().detach()) * effective_mask
         ).sum() / (effective_mask.sum() + 1e-6)
 
+        if self.target_mode == 'carrier_amp':
+            amp_mask = effective_mask.detach().clamp(0, 1)
+            amp_denom = amp_mask.sum() + 1e-6
+            amplitude_over_loss = (
+                F.relu(pred_prior - target_prior.detach()) * amp_mask
+            ).sum() / amp_denom
+
+            spatial_dims = tuple(range(1, pred_prior.dim()))
+            sample_denom = amp_mask.sum(dim=spatial_dims).clamp_min(1e-6)
+            pred_amp_mean = (
+                pred_prior * amp_mask
+            ).sum(dim=spatial_dims) / sample_denom
+            target_amp_mean = (
+                target_prior.detach() * amp_mask
+            ).sum(dim=spatial_dims) / sample_denom
+            amplitude_mean_loss = (
+                pred_amp_mean - target_amp_mean
+            ).abs().mean()
+
+            amp_scale = max(float(self.carrier_gain_clip), float(self.carrier_eps))
+            target_unit = (target_prior.detach() / amp_scale).clamp(0, 1)
+            low_target_weight = (1.0 - target_unit).pow(
+                float(self.amplitude_sparsity_gamma)
+            )
+            amplitude_sparsity_loss = (
+                pred_prior * low_target_weight * amp_mask
+            ).sum() / amp_denom
+        else:
+            zero_loss = pred_prior.sum() * 0.0
+            amplitude_over_loss = zero_loss
+            amplitude_mean_loss = zero_loss
+            amplitude_sparsity_loss = zero_loss
+
         with torch.no_grad():
             sign_acc = (
                 ((pred_correction * target_correction) > 0).float() * sign_weight
@@ -738,7 +797,10 @@ class GuidedResidualDiffusion(nn.Module):
             self.residual_sign_weight * residual_sign_loss +
             self.highfreq_magnitude_weight * highfreq_magnitude_loss +
             self.highfreq_under_weight * highfreq_under_loss +
-            self.degrade_weight * degrade_loss
+            self.degrade_weight * degrade_loss +
+            self.amplitude_over_weight * amplitude_over_loss +
+            self.amplitude_mean_weight * amplitude_mean_loss +
+            self.amplitude_sparsity_weight * amplitude_sparsity_loss
         )
 
         return {
@@ -751,6 +813,9 @@ class GuidedResidualDiffusion(nn.Module):
             'highfreq_magnitude_loss': highfreq_magnitude_loss,
             'highfreq_under_loss': highfreq_under_loss,
             'degrade_loss': degrade_loss,
+            'amplitude_over_loss': amplitude_over_loss,
+            'amplitude_mean_loss': amplitude_mean_loss,
+            'amplitude_sparsity_loss': amplitude_sparsity_loss,
             'residual_sign_acc': sign_acc,
             'residual_corr': residual_corr,
             'pred_residual_abs': pred_prior.abs().mean(),
@@ -823,6 +888,8 @@ class GuidedResidualDiffusion(nn.Module):
                 pred_signal = (
                     residual - torch.sqrt(1.0 - alpha_bar_t) * pred_noise
                 ) / (torch.sqrt(alpha_bar_t) + 1e-6)
+                if self.target_mode == 'carrier_amp' and self.carrier_amp_normalize:
+                    pred_signal = pred_signal.clamp(-1.0, 1.0)
 
                 if step_idx + 1 < len(step_ids):
                     prev_scalar = int(step_ids[step_idx + 1].item())
@@ -972,10 +1039,15 @@ def build_grdr(opts=None):
         carrier_gain_clip=opts.get('carrier_gain_clip', 0.5),
         carrier_norm_clip=opts.get('carrier_norm_clip', 3.0),
         carrier_eps=opts.get('carrier_eps', 1e-4),
+        carrier_amp_normalize=opts.get('carrier_amp_normalize', False),
         highfreq_magnitude_weight=opts.get('highfreq_magnitude_weight', 0.0),
         highfreq_under_weight=opts.get('highfreq_under_weight', 0.0),
         highfreq_under_ratio=opts.get('highfreq_under_ratio', 0.9),
         degrade_weight=opts.get('degrade_weight', 0.0),
+        amplitude_over_weight=opts.get('amplitude_over_weight', 0.0),
+        amplitude_mean_weight=opts.get('amplitude_mean_weight', 0.0),
+        amplitude_sparsity_weight=opts.get('amplitude_sparsity_weight', 0.0),
+        amplitude_sparsity_gamma=opts.get('amplitude_sparsity_gamma', 2.0),
         detail_gate_mode=opts.get('detail_gate_mode', 'none'),
         detail_gate_temperature=opts.get('detail_gate_temperature', 8.0),
         detail_gate_hf_weight=opts.get('detail_gate_hf_weight', 1.0),

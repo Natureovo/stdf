@@ -282,6 +282,7 @@ def build_opts(args):
             'carrier_gain_clip': args.diffusion_carrier_gain_clip,
             'carrier_norm_clip': args.diffusion_carrier_norm_clip,
             'carrier_eps': args.diffusion_carrier_eps,
+            'carrier_amp_normalize': args.diffusion_carrier_amp_normalize,
             'detail_gate_mode': args.diffusion_detail_gate_mode,
             'detail_gate_temperature': args.diffusion_detail_gate_temperature,
             'detail_gate_hf_weight': args.diffusion_detail_gate_hf_weight,
@@ -441,6 +442,11 @@ def parse_args():
     parser.add_argument('--diffusion_carrier_gain_clip', type=float, default=0.5)
     parser.add_argument('--diffusion_carrier_norm_clip', type=float, default=3.0)
     parser.add_argument('--diffusion_carrier_eps', type=float, default=1e-4)
+    parser.add_argument(
+        '--diffusion_carrier_amp_normalize',
+        action='store_true',
+        help='Diffuse carrier amplitude in a normalized [-1, 1] domain.',
+    )
     parser.add_argument(
         '--diffusion_detail_gate_mode',
         default='none',
@@ -956,6 +962,7 @@ def main():
         'diffusion_carrier_source': args.diffusion_carrier_source,
         'diffusion_carrier_gain_clip': args.diffusion_carrier_gain_clip,
         'diffusion_carrier_norm_clip': args.diffusion_carrier_norm_clip,
+        'diffusion_carrier_amp_normalize': args.diffusion_carrier_amp_normalize,
         'residual_scale': args.residual_scale,
         'residual_clip': args.residual_clip,
         'oracle_residual': args.oracle_residual,
