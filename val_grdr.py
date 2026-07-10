@@ -32,6 +32,12 @@ def parse_args():
     parser.add_argument('--sample_steps', type=int, default=5)
     parser.add_argument('--sampler', choices=['ddim', 'ddpm'], default='ddim')
     parser.add_argument('--ddim_eta', type=float, default=0.0)
+    parser.add_argument(
+        '--noise_mode',
+        choices=['independent', 'shared'],
+        default='independent',
+        help='Reuse one initial noise tensor per compressed video sequence.',
+    )
     parser.add_argument('--residual_scale', type=float, default=0.2)
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--num_workers', type=int, default=0)
@@ -131,6 +137,9 @@ def averaged(totals, prefix, count):
 
 def main():
     args = parse_args()
+    if args.noise_mode == 'shared' and (
+            args.sampler != 'ddim' or args.ddim_eta != 0.0):
+        raise ValueError('shared noise requires DDIM with --ddim_eta 0.')
     if args.guidance_mode == 'predicted' and args.guidance_ckpt is None:
         raise ValueError('--guidance_ckpt is required for predicted guidance.')
 
@@ -173,6 +182,7 @@ def main():
     totals = defaultdict(float)
     qp_totals = defaultdict(lambda: defaultdict(float))
     previous = {}
+    shared_noises = {}
     temporal_count = 0
     sample_count = 0
 
@@ -218,6 +228,14 @@ def main():
                 rate_cond=diffusion_rate,
             )
             effective_mask = guidance * detail_gate
+            name = data['name_vid'][0]
+            initial_noise = None
+            if args.noise_mode == 'shared':
+                if (
+                        name not in shared_noises or
+                        shared_noises[name].shape != base.shape):
+                    shared_noises[name] = torch.randn_like(base)
+                initial_noise = shared_noises[name]
             refined = model.diffusion.refine(
                 lq_center,
                 base,
@@ -228,6 +246,7 @@ def main():
                 use_hard_mask=False,
                 sampler=args.sampler,
                 ddim_eta=args.ddim_eta,
+                initial_noise=initial_noise,
             )
 
             target_signal = model.diffusion.make_target_signal(lq_center, base, gt)
@@ -259,7 +278,6 @@ def main():
             ).item()
             qp_totals[qp_key]['count'] += 1
 
-            name = data['name_vid'][0]
             if name in previous:
                 prev_gt, prev_base, prev_hybrid = previous[name]
                 totals['base_temporal_error'] += float(
@@ -281,6 +299,7 @@ def main():
         'guidance_mode': args.guidance_mode,
         'sample_steps': args.sample_steps,
         'sampler': args.sampler,
+        'noise_mode': args.noise_mode,
         'base': base_values,
         'hybrid': hybrid_values,
         'oracle_target': oracle_values,
@@ -314,7 +333,10 @@ def main():
         }
 
     print('\n========== GRDR validation ==========')
-    print(f"split: {args.split}, samples: {sample_count}, guidance: {args.guidance_mode}")
+    print(
+        f"split: {args.split}, samples: {sample_count}, "
+        f"guidance: {args.guidance_mode}, noise: {args.noise_mode}"
+    )
     print(
         'PSNR base/hybrid/oracle/delta: '
         f"{base_values['psnr']:.6f}/{hybrid_values['psnr']:.6f}/"

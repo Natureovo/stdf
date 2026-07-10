@@ -887,7 +887,8 @@ class GuidedResidualDiffusion(nn.Module):
             rate_cond=None,
             steps=None,
             sampler='ddim',
-            ddim_eta=0.0):
+            ddim_eta=0.0,
+            initial_noise=None):
         steps = steps or self.num_steps
         if steps > self.num_steps:
             raise ValueError('steps should be <= num_steps.')
@@ -915,7 +916,18 @@ class GuidedResidualDiffusion(nn.Module):
                 steps,
                 device=base.device,
             ).round().long()
-        residual = torch.randn_like(base)
+        if initial_noise is None:
+            residual = torch.randn_like(base)
+        else:
+            if initial_noise.shape != base.shape:
+                raise ValueError(
+                    'initial_noise shape should match base: '
+                    f'{tuple(initial_noise.shape)} vs {tuple(base.shape)}'
+                )
+            residual = initial_noise.to(
+                device=base.device,
+                dtype=base.dtype,
+            ).clone()
 
         for step_idx, t_scalar in enumerate(step_ids):
             t = torch.full((base.size(0),), int(t_scalar.item()), device=base.device, dtype=torch.long)
@@ -988,7 +1000,8 @@ class GuidedResidualDiffusion(nn.Module):
             residual_clip=0.1,
             use_hard_mask=True,
             sampler='ddim',
-            ddim_eta=0.0):
+            ddim_eta=0.0,
+            initial_noise=None):
         guidance = guidance.clamp(0, 1)
         if residual_scale is None or residual_scale <= 0:
             return base.clamp(0, 1)
@@ -1001,6 +1014,7 @@ class GuidedResidualDiffusion(nn.Module):
             steps=steps,
             sampler=sampler,
             ddim_eta=ddim_eta,
+            initial_noise=initial_noise,
         )
         signal = torch.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
         if (
