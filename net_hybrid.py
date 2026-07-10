@@ -519,7 +519,9 @@ class HybridSTDFGRDR(nn.Module):
             use_hard_mask=True,
             guidance_mode='coarse',
             budget=None,
-            budget_mode='none'):
+            budget_mode='none',
+            sampler='ddim',
+            ddim_eta=0.0):
         base = self.forward_base(x)
         lq = self.center_frame(x)
         if guidance is None:
@@ -557,6 +559,8 @@ class HybridSTDFGRDR(nn.Module):
             residual_scale=residual_scale,
             residual_clip=residual_clip,
             use_hard_mask=use_hard_mask,
+            sampler=sampler,
+            ddim_eta=ddim_eta,
         )
         return {
             'base': base,

@@ -777,16 +777,80 @@ class GuidedResidualDiffusion(nn.Module):
         )['loss']
 
     @torch.no_grad()
-    def sample_residual(self, lq, base, guidance, rate_cond=None, steps=None):
+    def sample_residual(
+            self,
+            lq,
+            base,
+            guidance,
+            rate_cond=None,
+            steps=None,
+            sampler='ddim',
+            ddim_eta=0.0):
         steps = steps or self.num_steps
         if steps > self.num_steps:
             raise ValueError('steps should be <= num_steps.')
-        step_ids = torch.linspace(self.num_steps - 1, 0, steps, device=base.device).long()
+        if sampler not in ('ddim', 'ddpm'):
+            raise ValueError(f'Unsupported diffusion sampler: {sampler}')
+        if sampler == 'ddpm' and steps != self.num_steps:
+            raise ValueError(
+                'Sparse DDPM sampling is invalid with the adjacent-step update. '
+                'Use sampler="ddim" for accelerated sampling or set '
+                'steps=num_steps for DDPM.'
+            )
+
+        if sampler == 'ddpm':
+            step_ids = torch.arange(
+                self.num_steps - 1,
+                -1,
+                -1,
+                device=base.device,
+                dtype=torch.long,
+            )
+        else:
+            step_ids = torch.linspace(
+                self.num_steps - 1,
+                0,
+                steps,
+                device=base.device,
+            ).round().long()
         residual = torch.randn_like(base)
 
-        for t_scalar in step_ids:
+        for step_idx, t_scalar in enumerate(step_ids):
             t = torch.full((base.size(0),), int(t_scalar.item()), device=base.device, dtype=torch.long)
             pred_noise = self.denoiser(residual, lq, base, guidance, t, rate_cond=rate_cond)
+            if sampler == 'ddim':
+                alpha_bar_t = _extract(self.alphas_cumprod, t, residual.shape)
+                pred_signal = (
+                    residual - torch.sqrt(1.0 - alpha_bar_t) * pred_noise
+                ) / (torch.sqrt(alpha_bar_t) + 1e-6)
+
+                if step_idx + 1 < len(step_ids):
+                    prev_scalar = int(step_ids[step_idx + 1].item())
+                    prev_t = torch.full_like(t, prev_scalar)
+                    alpha_bar_prev = _extract(
+                        self.alphas_cumprod,
+                        prev_t,
+                        residual.shape,
+                    )
+                else:
+                    alpha_bar_prev = torch.ones_like(alpha_bar_t)
+
+                eta = max(float(ddim_eta), 0.0)
+                sigma = eta * torch.sqrt(
+                    ((1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t + 1e-6)) *
+                    (1.0 - alpha_bar_t / (alpha_bar_prev + 1e-6))
+                ).clamp(min=0.0)
+                direction_scale = torch.sqrt(
+                    (1.0 - alpha_bar_prev - sigma.pow(2)).clamp(min=0.0)
+                )
+                random_noise = torch.randn_like(residual) if eta > 0 else 0.0
+                residual = (
+                    torch.sqrt(alpha_bar_prev) * pred_signal +
+                    direction_scale * pred_noise +
+                    sigma * random_noise
+                )
+                continue
+
             alpha_t = _extract(self.alphas, t, residual.shape)
             alpha_bar_t = _extract(self.alphas_cumprod, t, residual.shape)
             beta_t = _extract(self.betas, t, residual.shape)
@@ -818,12 +882,22 @@ class GuidedResidualDiffusion(nn.Module):
             content_ratio_max_scale=None,
             residual_scale=0.05,
             residual_clip=0.1,
-            use_hard_mask=True):
+            use_hard_mask=True,
+            sampler='ddim',
+            ddim_eta=0.0):
         guidance = guidance.clamp(0, 1)
         if residual_scale is None or residual_scale <= 0:
             return base.clamp(0, 1)
 
-        signal = self.sample_residual(lq, base, guidance, rate_cond=rate_cond, steps=steps)
+        signal = self.sample_residual(
+            lq,
+            base,
+            guidance,
+            rate_cond=rate_cond,
+            steps=steps,
+            sampler=sampler,
+            ddim_eta=ddim_eta,
+        )
         signal = torch.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
         if (
                 not self.is_carrier_guided() and
