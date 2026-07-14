@@ -41,6 +41,14 @@ def parse_args():
     parser.add_argument('--interval_save', type=int, default=None)
     parser.add_argument('--exp_name', default=None)
     parser.add_argument(
+        '--resume_ckpt',
+        default=None,
+        help=(
+            'Resume diffusion weights, optimizer, and absolute iteration from '
+            'a GRDR checkpoint. --num_iter remains the final total iteration.'
+        ),
+    )
+    parser.add_argument(
         '--qp',
         type=float,
         default=None,
@@ -114,6 +122,56 @@ def count_trainable_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def load_resume_state(
+        model,
+        optimizer,
+        path,
+        guidance_mode,
+        guidance_ckpt,
+        stdf_ckpt):
+    checkpoint = torch.load(path, map_location='cpu')
+    saved_mode = checkpoint.get('guidance_mode')
+    if saved_mode is not None and saved_mode != guidance_mode:
+        raise ValueError(
+            'Resume guidance mode mismatch: '
+            f'checkpoint={saved_mode}, requested={guidance_mode}'
+        )
+    for key, requested in (
+            ('guidance_ckpt', guidance_ckpt),
+            ('stdf_ckpt', stdf_ckpt)):
+        saved = checkpoint.get(key)
+        if saved is not None and requested is not None:
+            if op.normpath(str(saved)) != op.normpath(str(requested)):
+                raise ValueError(
+                    f'Resume {key} mismatch: checkpoint={saved}, '
+                    f'requested={requested}'
+                )
+
+    state_dict = checkpoint.get('diffusion_state_dict')
+    if state_dict is None:
+        full_state = checkpoint.get('state_dict', checkpoint)
+        state_dict = OrderedDict()
+        for key, value in full_state.items():
+            if key.startswith('module.'):
+                key = key[7:]
+            if key.startswith('diffusion.'):
+                state_dict[key[len('diffusion.'):]] = value
+        if not state_dict:
+            state_dict = full_state
+    model.diffusion.load_state_dict(state_dict, strict=True)
+
+    if 'optimizer' not in checkpoint:
+        raise ValueError(
+            'Resume checkpoint does not contain optimizer state: '
+            f'{path}'
+        )
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    start_iter = int(checkpoint.get('num_iter_accum', 0))
+    if start_iter < 0:
+        raise ValueError(f'Invalid resume iteration: {start_iter}')
+    return start_iter, checkpoint
+
+
 def make_rate_cond(batch_size, device, rate_dim, qp):
     if rate_dim <= 0:
         return None
@@ -164,6 +222,7 @@ def main():
             f"STDF checkpoint: [{args.stdf_ckpt}]\n"
             f"Guidance mode: [{args.guidance_mode}]\n"
             f"Guidance checkpoint: [{args.guidance_ckpt}]\n"
+            f"Resume checkpoint: [{args.resume_ckpt}]\n"
             f"\n{'<' * 10} Options {'>' * 10}\n"
             f"{utils.dict2str(opts_dict)}"
         )
@@ -223,11 +282,28 @@ def main():
         [p for p in model.diffusion.parameters() if p.requires_grad],
         **optim_opts,
     )
+    start_iter = 0
+    if args.resume_ckpt is not None:
+        start_iter, _ = load_resume_state(
+            model,
+            optimizer,
+            args.resume_ckpt,
+            args.guidance_mode,
+            args.guidance_ckpt,
+            args.stdf_ckpt,
+        )
+        if start_iter >= num_iter:
+            raise ValueError(
+                f'--num_iter ({num_iter}) must be greater than the resume '
+                f'iteration ({start_iter}).'
+            )
 
     if rank == 0:
         msg = (
             f"\n{'<' * 10} Dataloader {'>' * 10}\n"
             f"total iters: [{num_iter}]\n"
+            f"start iter: [{start_iter}]\n"
+            f"remaining iters: [{num_iter - start_iter}]\n"
             f"total epochs: [{num_epoch}]\n"
             f"iter per epoch: [{num_iter_per_epoch}]\n"
             f"trainable params: [{count_trainable_params(model)}]\n"
@@ -237,11 +313,18 @@ def main():
         log_fp.write(msg + '\n')
         log_fp.flush()
 
-    num_iter_accum = 0
-    for current_epoch in range(num_epoch + 1):
+    num_iter_accum = start_iter
+    start_epoch = start_iter // num_iter_per_epoch
+    first_epoch_offset = start_iter % num_iter_per_epoch
+    for current_epoch in range(start_epoch, num_epoch):
         train_sampler.set_epoch(current_epoch)
         prefetcher.reset()
         train_data = prefetcher.next()
+        if current_epoch == start_epoch and first_epoch_offset > 0:
+            for _ in range(first_epoch_offset):
+                if train_data is None:
+                    break
+                train_data = prefetcher.next()
 
         while train_data is not None:
             num_iter_accum += 1
@@ -353,6 +436,7 @@ def main():
                     'stdf_ckpt': args.stdf_ckpt,
                     'guidance_mode': args.guidance_mode,
                     'guidance_ckpt': args.guidance_ckpt,
+                    'resumed_from': args.resume_ckpt,
                     'state_dict': model.state_dict(),
                     'diffusion_state_dict': model.diffusion.state_dict(),
                     'optimizer': optimizer.state_dict(),
