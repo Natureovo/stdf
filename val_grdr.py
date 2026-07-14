@@ -6,7 +6,7 @@ from collections import OrderedDict, defaultdict
 
 import torch
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 import dataset
@@ -42,6 +42,12 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--max_samples', type=int, default=None)
+    parser.add_argument(
+        '--sample_mode',
+        choices=['sequential', 'uniform', 'video_balanced'],
+        default='sequential',
+        help='Subset strategy used when --max_samples is set.',
+    )
     parser.add_argument('--report_path', default=None)
     return parser.parse_args()
 
@@ -135,6 +141,103 @@ def averaged(totals, prefix, count):
     }
 
 
+def evenly_spaced(items, count):
+    items = list(items)
+    count = min(int(count), len(items))
+    if count <= 0:
+        return []
+    if count == 1:
+        return [items[len(items) // 2]]
+    return [
+        items[round(idx * (len(items) - 1) / (count - 1))]
+        for idx in range(count)
+    ]
+
+
+def dataset_video_names(ds):
+    names = getattr(ds, 'data_info', {}).get('name_vid')
+    if names and len(names) == len(ds):
+        return list(names)
+
+    samples = getattr(ds, 'samples', None)
+    entries = getattr(ds, 'video_entries', None)
+    if samples is not None and entries is not None and len(samples) == len(ds):
+        return [entries[int(index_vid)]['name_vid'] for index_vid, _ in samples]
+    return None
+
+
+def selected_indices(ds, max_samples, mode):
+    total = min(int(max_samples), len(ds))
+    if mode == 'uniform':
+        return evenly_spaced(range(len(ds)), total)
+    if mode != 'video_balanced':
+        return list(range(total))
+
+    names = dataset_video_names(ds)
+    if not names:
+        raise ValueError(
+            'video_balanced sampling requires dataset video metadata.'
+        )
+    groups = OrderedDict()
+    for index, name in enumerate(names):
+        groups.setdefault(name, []).append(index)
+    base_count, remainder = divmod(total, len(groups))
+    result = []
+    for group_index, indices in enumerate(groups.values()):
+        count = base_count + (1 if group_index < remainder else 0)
+        result.extend(evenly_spaced(indices, count))
+    return sorted(result)
+
+
+def update_pair_sums(totals, prefix, x, y):
+    x = x.detach().double().reshape(-1)
+    y = y.detach().double().reshape(-1)
+    totals[f'{prefix}_n'] += x.numel()
+    totals[f'{prefix}_sum_x'] += float(x.sum().cpu())
+    totals[f'{prefix}_sum_y'] += float(y.sum().cpu())
+    totals[f'{prefix}_sum_x2'] += float(x.square().sum().cpu())
+    totals[f'{prefix}_sum_y2'] += float(y.square().sum().cpu())
+    totals[f'{prefix}_sum_xy'] += float((x * y).sum().cpu())
+
+
+def pair_diagnostics(totals, prefix):
+    n = max(totals[f'{prefix}_n'], 1.0)
+    sum_x = totals[f'{prefix}_sum_x']
+    sum_y = totals[f'{prefix}_sum_y']
+    sum_x2 = totals[f'{prefix}_sum_x2']
+    sum_y2 = totals[f'{prefix}_sum_y2']
+    sum_xy = totals[f'{prefix}_sum_xy']
+    cov = sum_xy - sum_x * sum_y / n
+    var_x = max(sum_x2 - sum_x * sum_x / n, 0.0)
+    var_y = max(sum_y2 - sum_y * sum_y / n, 0.0)
+    pearson = cov / max((var_x * var_y) ** 0.5, 1e-12)
+    cosine = sum_xy / max((sum_x2 * sum_y2) ** 0.5, 1e-12)
+    return {'pearson': pearson, 'cosine': cosine}
+
+
+def optimal_scale_diagnostics(totals, prefix):
+    base_sse = totals['diagnostic_base_sse']
+    pixel_count = max(totals['diagnostic_pixel_count'], 1.0)
+    error_dot = totals[f'{prefix}_error_dot_correction']
+    correction_sse = totals[f'{prefix}_correction_sse']
+    scale = max(-error_dot / max(correction_sse, 1e-12), 0.0)
+    optimal_sse = max(
+        base_sse + 2.0 * scale * error_dot + scale * scale * correction_sse,
+        1e-12,
+    )
+    base_mse = max(base_sse / pixel_count, 1e-12)
+    optimal_mse = max(optimal_sse / pixel_count, 1e-12)
+    psnr_delta = -10.0 * torch.log10(
+        torch.tensor(optimal_mse / base_mse)
+    ).item()
+    return {
+        'scale': scale,
+        'psnr_delta': psnr_delta,
+        'uses_gt': True,
+        'assumes_unclipped_linear_output': True,
+    }
+
+
 def main():
     args = parse_args()
     if args.noise_mode == 'shared' and (
@@ -163,6 +266,14 @@ def main():
         opts_dict=split_opts,
         radius=opts['network']['radius'],
     )
+    source_sample_count = len(ds)
+    selected_sample_count = source_sample_count
+    if args.max_samples is not None:
+        selected_sample_count = min(int(args.max_samples), source_sample_count)
+        if args.sample_mode != 'sequential':
+            indices = selected_indices(ds, args.max_samples, args.sample_mode)
+            ds = Subset(ds, indices)
+            selected_sample_count = len(indices)
     loader = DataLoader(
         ds,
         batch_size=1,
@@ -185,6 +296,7 @@ def main():
     shared_noises = {}
     temporal_count = 0
     sample_count = 0
+    video_counts = defaultdict(int)
 
     with torch.no_grad():
         for data in tqdm(loader):
@@ -236,27 +348,43 @@ def main():
                         shared_noises[name].shape != base.shape):
                     shared_noises[name] = torch.randn_like(base)
                 initial_noise = shared_noises[name]
-            refined = model.diffusion.refine(
+            pred_signal = model.diffusion.sample_residual(
                 lq_center,
                 base,
                 guidance,
                 rate_cond=diffusion_rate,
                 steps=args.sample_steps,
-                residual_scale=args.residual_scale,
-                use_hard_mask=False,
                 sampler=args.sampler,
                 ddim_eta=args.ddim_eta,
                 initial_noise=initial_noise,
             )
+            pred_signal = torch.nan_to_num(
+                pred_signal,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            if not model.diffusion.is_carrier_guided():
+                pred_signal = pred_signal.clamp(-0.1, 0.1)
+            pred_correction, pred_prior = model.diffusion.signal_to_correction(
+                pred_signal,
+                lq_center,
+                base,
+            )
+            pred_unit_correction = effective_mask * pred_correction
+            refined = (
+                base + args.residual_scale * pred_unit_correction
+            ).clamp(0, 1)
 
             target_signal = model.diffusion.make_target_signal(lq_center, base, gt)
-            target_correction, _ = model.diffusion.signal_to_correction(
+            target_correction, target_prior = model.diffusion.signal_to_correction(
                 target_signal,
                 lq_center,
                 base,
             )
+            target_unit_correction = effective_mask * target_correction
             oracle_target = (
-                base + args.residual_scale * effective_mask * target_correction
+                base + args.residual_scale * target_unit_correction
             ).clamp(0, 1)
 
             add_values(totals, 'base', frame_values(gt, base, hf_kernel))
@@ -265,6 +393,31 @@ def main():
             totals['write_abs'] += float((refined - base).abs().mean().cpu())
             totals['oracle_write_abs'] += float((oracle_target - base).abs().mean().cpu())
             totals['write_area'] += float(effective_mask.mean().cpu())
+            update_pair_sums(
+                totals,
+                'prior',
+                pred_prior,
+                target_prior,
+            )
+            update_pair_sums(
+                totals,
+                'correction',
+                pred_unit_correction,
+                target_unit_correction,
+            )
+            base_error = (base - gt).detach().double()
+            pred_diag = pred_unit_correction.detach().double()
+            target_diag = target_unit_correction.detach().double()
+            totals['diagnostic_pixel_count'] += base_error.numel()
+            totals['diagnostic_base_sse'] += float(base_error.square().sum().cpu())
+            totals['pred_error_dot_correction'] += float(
+                (base_error * pred_diag).sum().cpu()
+            )
+            totals['pred_correction_sse'] += float(pred_diag.square().sum().cpu())
+            totals['oracle_error_dot_correction'] += float(
+                (base_error * target_diag).sum().cpu()
+            )
+            totals['oracle_correction_sse'] += float(target_diag.square().sum().cpu())
 
             qp_value = float(qp.view(-1)[0])
             qp_key = str(int(qp_value)) if qp_value.is_integer() else str(qp_value)
@@ -277,17 +430,27 @@ def main():
                 torch.tensor(max(hybrid_mse, 1e-12))
             ).item()
             qp_totals[qp_key]['count'] += 1
+            video_counts[name] += 1
 
             if name in previous:
-                prev_gt, prev_base, prev_hybrid = previous[name]
+                prev_gt, prev_base, prev_hybrid, prev_frame_idx = previous[name]
                 totals['base_temporal_error'] += float(
                     ((base - prev_base) - (gt - prev_gt)).abs().mean().cpu()
                 )
                 totals['hybrid_temporal_error'] += float(
                     ((refined - prev_hybrid) - (gt - prev_gt)).abs().mean().cpu()
                 )
+                frame_idx = data.get('frame_idx')
+                if frame_idx is not None and prev_frame_idx is not None:
+                    totals['temporal_frame_gap'] += abs(
+                        int(frame_idx.view(-1)[0]) - prev_frame_idx
+                    )
+                else:
+                    totals['temporal_frame_gap'] += 1.0
                 temporal_count += 1
-            previous[name] = (gt.clone(), base.clone(), refined.clone())
+            frame_idx = data.get('frame_idx')
+            frame_idx = int(frame_idx.view(-1)[0]) if frame_idx is not None else None
+            previous[name] = (gt.clone(), base.clone(), refined.clone(), frame_idx)
             sample_count += 1
 
     base_values = averaged(totals, 'base', sample_count)
@@ -296,10 +459,15 @@ def main():
     report = {
         'split': args.split,
         'samples': sample_count,
+        'source_samples': source_sample_count,
+        'sample_mode': args.sample_mode,
+        'selected_samples': selected_sample_count,
+        'per_video_samples': dict(sorted(video_counts.items())),
         'guidance_mode': args.guidance_mode,
         'sample_steps': args.sample_steps,
         'sampler': args.sampler,
         'noise_mode': args.noise_mode,
+        'residual_scale': args.residual_scale,
         'base': base_values,
         'hybrid': hybrid_values,
         'oracle_target': oracle_values,
@@ -312,12 +480,32 @@ def main():
         'write_abs': totals['write_abs'] / max(sample_count, 1),
         'oracle_write_abs': totals['oracle_write_abs'] / max(sample_count, 1),
         'write_area': totals['write_area'] / max(sample_count, 1),
+        'correction_diagnostics': {
+            'prior': pair_diagnostics(totals, 'prior'),
+            'applied_unit_correction': pair_diagnostics(totals, 'correction'),
+            'pred_vs_oracle_abs_ratio': (
+                totals['write_abs'] /
+                max(totals['oracle_write_abs'], 1e-12)
+            ),
+            'optimal_global_scale_pred': optimal_scale_diagnostics(
+                totals,
+                'pred',
+            ),
+            'optimal_global_scale_oracle': optimal_scale_diagnostics(
+                totals,
+                'oracle',
+            ),
+        },
         'temporal_error': {
             'base': totals['base_temporal_error'] / max(temporal_count, 1),
             'hybrid': totals['hybrid_temporal_error'] / max(temporal_count, 1),
             'delta': (
                 totals['hybrid_temporal_error'] - totals['base_temporal_error']
             ) / max(temporal_count, 1),
+            'pairs': temporal_count,
+            'mean_frame_gap': (
+                totals['temporal_frame_gap'] / max(temporal_count, 1)
+            ),
         },
         'per_qp': {},
     }
@@ -335,8 +523,15 @@ def main():
     print('\n========== GRDR validation ==========')
     print(
         f"split: {args.split}, samples: {sample_count}, "
+        f"sampling: {args.sample_mode} ({sample_count}/{source_sample_count}), "
         f"guidance: {args.guidance_mode}, noise: {args.noise_mode}"
     )
+    if video_counts:
+        counts = list(video_counts.values())
+        print(
+            'sampled videos/count min-max: '
+            f"{len(counts)}/{min(counts)}-{max(counts)}"
+        )
     print(
         'PSNR base/hybrid/oracle/delta: '
         f"{base_values['psnr']:.6f}/{hybrid_values['psnr']:.6f}/"
@@ -360,6 +555,26 @@ def main():
         'write_abs pred/oracle, area: '
         f"{report['write_abs']:.8f}/{report['oracle_write_abs']:.8f}/"
         f"{report['write_area']:.6f}"
+    )
+    correction_diag = report['correction_diagnostics']
+    print(
+        'prior pearson/cosine, correction pearson/cosine: '
+        f"{correction_diag['prior']['pearson']:.6f}/"
+        f"{correction_diag['prior']['cosine']:.6f}, "
+        f"{correction_diag['applied_unit_correction']['pearson']:.6f}/"
+        f"{correction_diag['applied_unit_correction']['cosine']:.6f}"
+    )
+    pred_opt = correction_diag['optimal_global_scale_pred']
+    oracle_opt = correction_diag['optimal_global_scale_oracle']
+    print(
+        'GT diagnostic optimal global scale pred/oracle, PSNR delta: '
+        f"{pred_opt['scale']:.6f}/{oracle_opt['scale']:.6f}, "
+        f"{pred_opt['psnr_delta']:.6f}/{oracle_opt['psnr_delta']:.6f}"
+    )
+    print(
+        'temporal pairs/mean frame gap: '
+        f"{report['temporal_error']['pairs']}/"
+        f"{report['temporal_error']['mean_frame_gap']:.3f}"
     )
     for qp_key, values in report['per_qp'].items():
         print(f"QP{qp_key}: PSNR delta {values['delta']:.6f} ({values['count']} frames)")
