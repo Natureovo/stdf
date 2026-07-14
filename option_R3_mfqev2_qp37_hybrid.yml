@@ -1,0 +1,185 @@
+dataset:
+  train:
+    type: MFQEv2Dataset
+    root: /media/cp/SWH-4T机械红/MFQEv2_dataset
+    gt_path: mfqev2_train_gt.lmdb
+    lq_path: mfqev2_train_lq.lmdb
+    meta_info_fp: meta_info.txt
+    qp: 37
+    # Deterministic video-level validation split, sampled with seed 7.
+    exclude_video_ids: ['007', '010', '013', '020', '042', '047', '051', '069', '084', '106']
+    gt_size: 128
+    use_flip: true
+    use_rot: true
+    random_reverse: true
+    enlarge_ratio: 1
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 8
+
+  val:
+    type: VideoTestMFQEv2Dataset
+    root: /media/cp/SWH-4T机械红/MFQEv2_dataset
+    gt_path: train_108/raw
+    lq_path: train_108/HM16.5_LDP/QP37
+    qp: 37
+    include_video_ids: ['007', '010', '013', '020', '042', '047', '051', '069', '084', '106']
+
+  test:
+    type: VideoTestMFQEv2Dataset
+    root: /media/cp/SWH-4T机械红/MFQEv2_dataset
+    gt_path: test_18/raw
+    lq_path: test_18/HM16.5_LDP/QP37
+    qp: 37
+
+network:
+  radius: 3
+
+  stdf:
+    in_nc: 1
+    out_nc: 64
+    nf: 32
+    nb: 3
+    base_ks: 3
+    deform_ks: 3
+
+  qenet:
+    in_nc: 64
+    out_nc: 1
+    nf: 48
+    nb: 8
+    base_ks: 3
+
+  diffusion:
+    enabled: false
+    type: GRDR
+    freeze_stdf: true
+    in_nc: 1
+    nf: 48
+    cond_dim: 128
+    rate_dim: 1
+    control_enabled: true
+    control_use_rate: true
+    control_main_input: full
+    control_hf_kernel: 5
+    num_steps: 1000
+    sample_steps: 20
+    loss_type: l1
+    loss_bg_weight: 0.05
+    rec_weight: 1.0
+    target_mode: carrier_amp
+    target_highfreq_kernel: 5
+    carrier_source: base
+    carrier_gain_clip: 0.08
+    carrier_norm_clip: 3.0
+    carrier_eps: !!float 1e-4
+    carrier_amp_normalize: true
+    detail_gate_mode: multi_cue
+    detail_gate_temperature: 8.0
+    detail_gate_hf_weight: 1.0
+    detail_gate_diff_weight: 0.5
+    detail_gate_guidance_weight: 0.5
+    detail_gate_qp_weight: 0.25
+    detail_gate_min: 0.05
+    train_guidance_threshold: 0.3
+    train_residual_scale: 0.2
+    train_residual_clip: 0.05
+    residual_weight: 0.5
+    residual_bg_weight: 0.02
+    residual_sign_weight: 0.0
+    highfreq_magnitude_weight: 1.0
+    highfreq_under_weight: 0.5
+    highfreq_under_ratio: 0.9
+    degrade_weight: 0.5
+    amplitude_over_weight: 1.0
+    amplitude_mean_weight: 1.0
+    amplitude_sparsity_weight: 0.05
+    amplitude_sparsity_gamma: 2.0
+    amplitude_focal_weight: 1.0
+    amplitude_focal_beta: 4.0
+    amplitude_focal_gamma: 2.0
+    amplitude_cosine_weight: 0.05
+    train_use_hard_mask: false
+
+  guidance_net:
+    enabled: true
+    in_nc: 1
+    nf: 32
+    rate_dim: 1
+    target_threshold: 0.20
+    log_thresholds: [0.15, 0.20, 0.25, 0.30]
+    l1_weight: 1.0
+    weighted_l1_weight: 2.0
+    weighted_l1_beta: 8.0
+    weighted_l1_gamma: 2.0
+    bce_weight: 0.0
+    dice_weight: 0.0
+    soft_iou_weight: 0.0
+    tv_weight: 0.002
+
+  budget_net:
+    enabled: true
+    in_dim: 18
+    hidden_dim: 64
+    min_budget: 0.02
+    max_budget: 0.45
+    target_threshold: 0.20
+    target_mode: mean_guidance
+    l1_weight: 1.0
+    mse_weight: 0.25
+
+  direct_residual:
+    enabled: true
+    in_nc: 1
+    nf: 32
+    rate_dim: 1
+    output_mode: sign_magnitude
+    residual_clip: 0.1
+
+  detail_refine:
+    enabled: true
+    in_nc: 1
+    nf: 32
+    rate_dim: 1
+
+  detail_guidance:
+    gradient_weight: 0.35
+    highfreq_weight: 0.40
+    direction_weight: 0.15
+    variance_weight: 0.10
+
+train:
+  exp_name: MFQEv2_QP37_hybrid
+  random_seed: 7
+  pre-val: false
+  num_iter: 20000
+  interval_print: 100
+  interval_val: 2000
+  pbar_len: 100
+
+  optim:
+    type: Adam
+    lr: !!float 1e-4
+    betas: [0.9, 0.999]
+    eps: !!float 1e-8
+
+  scheduler:
+    is_on: false
+    type: CosineAnnealingRestartLR
+    periods: [!!float 2e4]
+    restart_weights: [1]
+    eta_min: !!float 1e-7
+
+  loss:
+    type: CharbonnierLoss
+    eps: !!float 1e-6
+
+  criterion:
+    type: PSNR
+    unit: dB
+
+test:
+  restore_iter: 0
+  pbar_len: 100
+  criterion:
+    type: PSNR
+    unit: dB
