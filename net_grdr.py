@@ -309,6 +309,7 @@ class GuidedResidualDiffusion(nn.Module):
             amplitude_focal_beta=4.0,
             amplitude_focal_gamma=2.0,
             amplitude_cosine_weight=0.0,
+            amplitude_correlation_weight=0.0,
             detail_gate_mode='none',
             detail_gate_temperature=8.0,
             detail_gate_hf_weight=1.0,
@@ -375,6 +376,7 @@ class GuidedResidualDiffusion(nn.Module):
         self.amplitude_focal_beta = amplitude_focal_beta
         self.amplitude_focal_gamma = amplitude_focal_gamma
         self.amplitude_cosine_weight = amplitude_cosine_weight
+        self.amplitude_correlation_weight = amplitude_correlation_weight
         self.detail_gate_mode = detail_gate_mode
         self.detail_gate_temperature = detail_gate_temperature
         self.detail_gate_hf_weight = detail_gate_hf_weight
@@ -795,6 +797,34 @@ class GuidedResidualDiffusion(nn.Module):
             amplitude_cosine_loss = (
                 (1.0 - cosine.clamp(-1.0, 1.0)) * valid_cosine
             ).sum() / (valid_cosine.sum() + 1e-6)
+
+            pred_unit = (pred_prior / amp_scale).clamp(0, 1)
+            corr_weight = amp_mask
+            corr_denom = corr_weight.sum(dim=spatial_dims).clamp_min(1e-6)
+            pred_corr_mean = (
+                pred_unit * corr_weight
+            ).sum(dim=spatial_dims) / corr_denom
+            target_corr_mean = (
+                target_unit * corr_weight
+            ).sum(dim=spatial_dims) / corr_denom
+            pred_corr_centered = pred_unit - pred_corr_mean.view(-1, 1, 1, 1)
+            target_corr_centered = target_unit - target_corr_mean.view(-1, 1, 1, 1)
+            covariance = (
+                pred_corr_centered * target_corr_centered * corr_weight
+            ).sum(dim=spatial_dims) / corr_denom
+            pred_variance = (
+                pred_corr_centered.square() * corr_weight
+            ).sum(dim=spatial_dims) / corr_denom
+            target_variance = (
+                target_corr_centered.square() * corr_weight
+            ).sum(dim=spatial_dims) / corr_denom
+            correlation = covariance / torch.sqrt(
+                pred_variance * target_variance + 1e-8
+            )
+            valid_correlation = (target_variance > 1e-8).float()
+            amplitude_correlation_loss = (
+                (1.0 - correlation.clamp(-1.0, 1.0)) * valid_correlation
+            ).sum() / (valid_correlation.sum() + 1e-6)
         else:
             zero_loss = pred_prior.sum() * 0.0
             amplitude_over_loss = zero_loss
@@ -802,6 +832,7 @@ class GuidedResidualDiffusion(nn.Module):
             amplitude_sparsity_loss = zero_loss
             amplitude_focal_loss = zero_loss
             amplitude_cosine_loss = zero_loss
+            amplitude_correlation_loss = zero_loss
 
         with torch.no_grad():
             sign_acc = (
@@ -835,7 +866,8 @@ class GuidedResidualDiffusion(nn.Module):
             self.amplitude_mean_weight * amplitude_mean_loss +
             self.amplitude_sparsity_weight * amplitude_sparsity_loss +
             self.amplitude_focal_weight * amplitude_focal_loss +
-            self.amplitude_cosine_weight * amplitude_cosine_loss
+            self.amplitude_cosine_weight * amplitude_cosine_loss +
+            self.amplitude_correlation_weight * amplitude_correlation_loss
         )
 
         return {
@@ -853,6 +885,7 @@ class GuidedResidualDiffusion(nn.Module):
             'amplitude_sparsity_loss': amplitude_sparsity_loss,
             'amplitude_focal_loss': amplitude_focal_loss,
             'amplitude_cosine_loss': amplitude_cosine_loss,
+            'amplitude_correlation_loss': amplitude_correlation_loss,
             'residual_sign_acc': sign_acc,
             'residual_corr': residual_corr,
             'pred_residual_abs': pred_prior.abs().mean(),
@@ -1103,6 +1136,10 @@ def build_grdr(opts=None):
         amplitude_focal_beta=opts.get('amplitude_focal_beta', 4.0),
         amplitude_focal_gamma=opts.get('amplitude_focal_gamma', 2.0),
         amplitude_cosine_weight=opts.get('amplitude_cosine_weight', 0.0),
+        amplitude_correlation_weight=opts.get(
+            'amplitude_correlation_weight',
+            0.0,
+        ),
         detail_gate_mode=opts.get('detail_gate_mode', 'none'),
         detail_gate_temperature=opts.get('detail_gate_temperature', 8.0),
         detail_gate_hf_weight=opts.get('detail_gate_hf_weight', 1.0),
