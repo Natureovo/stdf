@@ -1,5 +1,6 @@
 import glob
 import random
+import re
 import torch
 import os.path as op
 import numpy as np
@@ -13,6 +14,34 @@ def _bytes2img(img_bytes):
     img = np.expand_dims(cv2.imdecode(img_np, cv2.IMREAD_GRAYSCALE), 2)  # (H W 1)
     img = img.astype(np.float32) / 255.
     return img
+
+
+def _dataset_root(opts_dict):
+    return op.expanduser(str(opts_dict.get('root', 'data/MFQEv2')))
+
+
+def _dataset_qp(opts_dict):
+    if opts_dict.get('qp') is not None:
+        return float(opts_dict['qp'])
+    match = re.search(r'QP(\d+(?:\.\d+)?)', str(opts_dict.get('lq_path', '')))
+    return float(match.group(1)) if match else 37.0
+
+
+def _normalized_video_ids(values):
+    normalized = set()
+    for value in values or []:
+        value = str(value)
+        normalized.add(f'{int(value):03d}' if value.isdigit() else value)
+    return normalized
+
+
+def _keep_video(video_id, opts_dict):
+    video_id = str(video_id)
+    include_ids = _normalized_video_ids(opts_dict.get('include_video_ids'))
+    exclude_ids = _normalized_video_ids(opts_dict.get('exclude_video_ids'))
+    if include_ids and video_id not in include_ids:
+        return False
+    return video_id not in exclude_ids
 
 
 class MFQEv2Dataset(data.Dataset):
@@ -31,14 +60,10 @@ class MFQEv2Dataset(data.Dataset):
         self.opts_dict = opts_dict
         
         # dataset paths
-        self.gt_root = op.join(
-            'data/MFQEv2/', 
-            self.opts_dict['gt_path']
-            )
-        self.lq_root = op.join(
-            'data/MFQEv2/', 
-            self.opts_dict['lq_path']
-            )
+        self.root = _dataset_root(self.opts_dict)
+        self.qp = _dataset_qp(self.opts_dict)
+        self.gt_root = op.join(self.root, self.opts_dict['gt_path'])
+        self.lq_root = op.join(self.root, self.opts_dict['lq_path'])
 
         # extract keys from meta_info.txt
         self.meta_info_path = op.join(
@@ -47,6 +72,12 @@ class MFQEv2Dataset(data.Dataset):
             )
         with open(self.meta_info_path, 'r') as fin:
             self.keys = [line.split(' ')[0] for line in fin]
+        self.keys = [
+            key for key in self.keys
+            if _keep_video(key.split('/')[0], self.opts_dict)
+        ]
+        if not self.keys:
+            raise ValueError('No MFQEv2 LMDB samples remain after video filtering.')
 
         # define file client
         self.file_client = None
@@ -78,8 +109,9 @@ class MFQEv2Dataset(data.Dataset):
                 self.io_opts_dict.pop('type'), **self.io_opts_dict
             )
         # random reverse
+        neighbor_list = list(self.neighbor_list)
         if self.opts_dict['random_reverse'] and random.random() < 0.5:
-            self.neighbor_list.reverse()
+            neighbor_list.reverse()
 
         # ==========
         # get frames
@@ -96,7 +128,7 @@ class MFQEv2Dataset(data.Dataset):
 
         # get the neighboring LQ frames
         img_lqs = []
-        for neighbor in self.neighbor_list:
+        for neighbor in neighbor_list:
             img_lq_path = f'{clip}/{seq}/im{neighbor}.png'
             img_bytes = self.file_client.get(img_lq_path, 'lq')
             img_lq = _bytes2img(img_bytes)  # (H W 1)
@@ -125,6 +157,10 @@ class MFQEv2Dataset(data.Dataset):
         return {
             'lq': img_lqs,  # (T [RGB] H W)
             'gt': img_gt,  # ([RGB] H W)
+            'qp': torch.tensor(self.qp, dtype=torch.float32),
+            'name_vid': clip,
+            'frame_name': key,
+            'index_vid': int(clip) - 1 if clip.isdigit() else clip,
             }
 
     def __len__(self):
@@ -148,14 +184,10 @@ class VideoTestMFQEv2Dataset(data.Dataset):
         self.opts_dict = opts_dict
 
         # dataset paths
-        self.gt_root = op.join(
-            'data/MFQEv2/', 
-            self.opts_dict['gt_path']
-            )
-        self.lq_root = op.join(
-            'data/MFQEv2/', 
-            self.opts_dict['lq_path']
-            )
+        self.root = _dataset_root(self.opts_dict)
+        self.qp = _dataset_qp(self.opts_dict)
+        self.gt_root = op.join(self.root, self.opts_dict['gt_path'])
+        self.lq_root = op.join(self.root, self.opts_dict['lq_path'])
         
         # record data info for loading
         self.data_info = {
@@ -168,15 +200,25 @@ class VideoTestMFQEv2Dataset(data.Dataset):
             'index_vid': [], 
             'name_vid': [], 
             }
-        gt_path_list = sorted(glob.glob(op.join(self.gt_root, '*.yuv')))
+        all_gt_paths = sorted(glob.glob(op.join(self.gt_root, '*.yuv')))
+        gt_path_list = [
+            path for source_index, path in enumerate(all_gt_paths, start=1)
+            if _keep_video(f'{source_index:03d}', self.opts_dict)
+        ]
         self.vid_num = len(gt_path_list)
+        if self.vid_num == 0:
+            raise ValueError('No MFQEv2 YUV videos remain after video filtering.')
         for idx_vid, gt_vid_path in enumerate(gt_path_list):
-            name_vid = gt_vid_path.split('/')[-1]
+            name_vid = op.basename(gt_vid_path)
             w, h = map(int, name_vid.split('_')[-2].split('x'))
             nfs = int(name_vid.split('.')[-2].split('_')[-1])
             lq_vid_path = op.join(
                 self.lq_root,
                 name_vid
+                )
+            if not op.isfile(lq_vid_path):
+                raise FileNotFoundError(
+                    f'Missing compressed video for {name_vid}: {lq_vid_path}'
                 )
             for iter_frm in range(nfs):
                 lq_indexes = list(range(iter_frm - radius, iter_frm + radius + 1))
@@ -231,8 +273,10 @@ class VideoTestMFQEv2Dataset(data.Dataset):
         return {
             'lq': img_lqs,  # (T 1 H W)
             'gt': img_gt,  # (1 H W)
+            'qp': torch.tensor(self.qp, dtype=torch.float32),
             'name_vid': self.data_info['name_vid'][index], 
             'index_vid': self.data_info['index_vid'][index], 
+            'frame_idx': self.data_info['gt_index'][index],
             }
 
     def __len__(self):
