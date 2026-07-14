@@ -254,10 +254,9 @@ def main():
     )
     prefetcher = utils.CPUPrefetcher(train_loader)
 
-    batch_size = opts_dict['dataset']['train']['batch_size_per_gpu']
-    num_iter_per_epoch = math.ceil(
-        len(train_ds) * opts_dict['dataset']['train']['enlarge_ratio'] / batch_size
-    )
+    num_iter_per_epoch = len(train_loader)
+    if num_iter_per_epoch <= 0:
+        raise ValueError('Training dataloader has no batches.')
     num_epoch = math.ceil(num_iter / num_iter_per_epoch)
 
     model = build_hybrid_stdf_grdr(opts_dict['network'])
@@ -435,6 +434,7 @@ def main():
                 )
                 state = {
                     'num_iter_accum': num_iter_accum,
+                    'num_iter_per_epoch': num_iter_per_epoch,
                     'stdf_ckpt': args.stdf_ckpt,
                     'guidance_mode': args.guidance_mode,
                     'guidance_ckpt': args.guidance_ckpt,
