@@ -3,7 +3,7 @@ from collections import OrderedDict, defaultdict
 
 import torch
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 import dataset
@@ -28,6 +28,12 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--qp', type=float, default=None)
     parser.add_argument('--max_samples', type=int, default=None)
+    parser.add_argument(
+        '--sample_mode',
+        choices=['sequential', 'uniform', 'video_balanced'],
+        default='sequential',
+        help='How to select --max_samples from the requested split.',
+    )
     return parser.parse_args()
 
 
@@ -168,6 +174,41 @@ def quantiles(x, values):
     return {value: torch.quantile(x, value).item() for value in values}
 
 
+def evenly_spaced(items, count):
+    items = list(items)
+    count = min(int(count), len(items))
+    if count <= 0:
+        return []
+    if count == 1:
+        return [items[len(items) // 2]]
+    return [
+        items[round(idx * (len(items) - 1) / (count - 1))]
+        for idx in range(count)
+    ]
+
+
+def selected_indices(ds, max_samples, mode):
+    total = min(int(max_samples), len(ds))
+    if mode == 'uniform':
+        return evenly_spaced(range(len(ds)), total)
+    if mode != 'video_balanced':
+        return list(range(total))
+
+    names = getattr(ds, 'data_info', {}).get('name_vid')
+    if not names or len(names) != len(ds):
+        return evenly_spaced(range(len(ds)), total)
+
+    groups = OrderedDict()
+    for index, name in enumerate(names):
+        groups.setdefault(name, []).append(index)
+    base_count, remainder = divmod(total, len(groups))
+    result = []
+    for group_index, indices in enumerate(groups.values()):
+        count = base_count + (1 if group_index < remainder else 0)
+        result.extend(evenly_spaced(indices, count))
+    return sorted(result)
+
+
 def main():
     args = parse_args()
     opts = load_opts(args.opt_path)
@@ -187,6 +228,12 @@ def main():
         opts_dict=split_opts,
         radius=opts['network']['radius'],
     )
+    source_sample_count = len(ds)
+    selected_sample_count = source_sample_count
+    if args.max_samples is not None and args.sample_mode != 'sequential':
+        indices = selected_indices(ds, args.max_samples, args.sample_mode)
+        ds = Subset(ds, indices)
+        selected_sample_count = len(indices)
     loader = DataLoader(
         ds,
         batch_size=args.batch_size,
@@ -257,6 +304,12 @@ def main():
             scalar_totals['oracle_mean'] += float(oracle.mean().cpu()) * batch_n
             scalar_totals['pred_max'] += float(pred.amax(dim=(1, 2, 3)).mean().cpu()) * batch_n
             scalar_totals['oracle_max'] += float(oracle.amax(dim=(1, 2, 3)).mean().cpu()) * batch_n
+            scalar_totals['pred_std'] += float(
+                pred.flatten(1).std(dim=1, unbiased=False).mean().cpu()
+            ) * batch_n
+            scalar_totals['oracle_std'] += float(
+                oracle.flatten(1).std(dim=1, unbiased=False).mean().cpu()
+            ) * batch_n
             scalar_totals['soft_iou'] += float(soft_iou.cpu()) * batch_n
             scalar_totals['soft_dice'] += float(soft_dice.cpu()) * batch_n
 
@@ -282,6 +335,10 @@ def main():
     print('\n========== Guidance validation ==========')
     print(f'split: {args.split}')
     print(f'samples: {sample_count}')
+    print(
+        f'sampling: {args.sample_mode} '
+        f'({selected_sample_count}/{source_sample_count})'
+    )
     print(f'stdf_ckpt: {args.stdf_ckpt}')
     print(f'guidance_ckpt: {args.guidance_ckpt}')
 
@@ -291,11 +348,21 @@ def main():
             print(f'{key}: {loss_totals[key] / denom:.6f}')
 
     print('\n-- distribution --')
-    for key in ['pred_mean', 'oracle_mean', 'pred_max', 'oracle_max', 'soft_iou', 'soft_dice']:
+    for key in [
+            'pred_mean', 'oracle_mean', 'pred_max', 'oracle_max',
+            'pred_std', 'oracle_std', 'soft_iou', 'soft_dice']:
         print(f'{key}: {scalar_totals[key] / denom:.6f}')
     for q in [0.90, 0.95, 0.99]:
         print(f'pred_p{int(q * 100)}: {pred_q_totals[q] / denom:.6f}')
         print(f'oracle_p{int(q * 100)}: {oracle_q_totals[q] / denom:.6f}')
+    print(
+        'pred_p99_minus_p90: '
+        f'{(pred_q_totals[0.99] - pred_q_totals[0.90]) / denom:.6f}'
+    )
+    print(
+        'oracle_p99_minus_p90: '
+        f'{(oracle_q_totals[0.99] - oracle_q_totals[0.90]) / denom:.6f}'
+    )
 
     print('\n-- correlations --')
     print(f'pearson_pred_oracle: {float(pearson_from_sums(corr_main).cpu()):.6f}')

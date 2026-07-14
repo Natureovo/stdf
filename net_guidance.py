@@ -28,7 +28,11 @@ def _normalize_per_sample(x, eps=1e-6):
     return ((x - lo) / (hi - lo + eps)).clamp(0, 1)
 
 
-def make_guidance_features(lq, base, rate_cond=None):
+def make_guidance_features(
+        lq,
+        base,
+        rate_cond=None,
+        feature_normalization='sample_minmax'):
     """Build no-reference features for guidance prediction.
 
     The feature set intentionally uses only decoder-available tensors: the
@@ -38,10 +42,20 @@ def make_guidance_features(lq, base, rate_cond=None):
     if lq.shape != base.shape:
         raise ValueError('lq and base should have the same shape.')
     residual = (base - lq).abs()
-    grad_lq = _normalize_per_sample(_sobel_magnitude(lq))
-    grad_base = _normalize_per_sample(_sobel_magnitude(base))
-    hf_lq = _normalize_per_sample(_high_frequency(lq).abs())
-    hf_base = _normalize_per_sample(_high_frequency(base).abs())
+    grad_lq = _sobel_magnitude(lq)
+    grad_base = _sobel_magnitude(base)
+    hf_lq = _high_frequency(lq).abs()
+    hf_base = _high_frequency(base).abs()
+    if feature_normalization == 'sample_minmax':
+        grad_lq = _normalize_per_sample(grad_lq)
+        grad_base = _normalize_per_sample(grad_base)
+        hf_lq = _normalize_per_sample(hf_lq)
+        hf_base = _normalize_per_sample(hf_base)
+    elif feature_normalization != 'raw':
+        raise ValueError(
+            f'Unsupported guidance feature normalization: '
+            f'{feature_normalization}'
+        )
     features = [lq, base, residual, grad_lq, grad_base, hf_lq, hf_base]
     if rate_cond is not None:
         if rate_cond.dim() == 1:
@@ -69,10 +83,16 @@ class ConvBlock(nn.Module):
 class GuidanceNet(nn.Module):
     """Lightweight U-Net for no-GT local detail-loss guidance prediction."""
 
-    def __init__(self, in_nc=1, nf=32, rate_dim=0):
+    def __init__(
+            self,
+            in_nc=1,
+            nf=32,
+            rate_dim=0,
+            feature_normalization='sample_minmax'):
         super(GuidanceNet, self).__init__()
         self.in_nc = in_nc
         self.rate_dim = rate_dim
+        self.feature_normalization = feature_normalization
         input_nc = in_nc * 7 + rate_dim
         self.in_conv = ConvBlock(input_nc, nf)
         self.down1 = nn.Sequential(nn.MaxPool2d(2), ConvBlock(nf, nf * 2))
@@ -88,7 +108,12 @@ class GuidanceNet(nn.Module):
         )
 
     def forward(self, lq, base, rate_cond=None):
-        features = make_guidance_features(lq, base, rate_cond=rate_cond)
+        features = make_guidance_features(
+            lq,
+            base,
+            rate_cond=rate_cond,
+            feature_normalization=self.feature_normalization,
+        )
         enc0 = self.in_conv(features)
         enc1 = self.down1(enc0)
         enc2 = self.down2(enc1)
@@ -159,4 +184,7 @@ def build_guidance_net(opts=None):
         in_nc=opts.get('in_nc', 1),
         nf=opts.get('nf', 32),
         rate_dim=opts.get('rate_dim', 0),
+        feature_normalization=opts.get(
+            'feature_normalization', 'sample_minmax'
+        ),
     )

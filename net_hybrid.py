@@ -106,6 +106,13 @@ class HybridSTDFGRDR(nn.Module):
             highfreq_weight=self.guidance_opts.get('highfreq_weight', 0.40),
             direction_weight=self.guidance_opts.get('direction_weight', 0.15),
             variance_weight=self.guidance_opts.get('variance_weight', 0.10),
+            normalization_mode=self.guidance_opts.get(
+                'normalization_mode', 'sample_minmax'
+            ),
+            gradient_eps=self.guidance_opts.get('gradient_eps', 1e-3),
+            highfreq_eps=self.guidance_opts.get('highfreq_eps', 1e-3),
+            direction_eps=self.guidance_opts.get('direction_eps', 1e-3),
+            variance_eps=self.guidance_opts.get('variance_eps', 1e-5),
         )
         return maps
 
