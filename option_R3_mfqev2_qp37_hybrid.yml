@@ -105,6 +105,7 @@ network:
     in_nc: 1
     nf: 32
     rate_dim: 1
+    feature_normalization: raw
     target_threshold: 0.20
     log_thresholds: [0.15, 0.20, 0.25, 0.30]
     l1_weight: 1.0
@@ -146,6 +147,12 @@ network:
     highfreq_weight: 0.40
     direction_weight: 0.15
     variance_weight: 0.10
+    normalization_mode: local_ratio
+    # One 8-bit code value in normalized [0, 1] intensity space.
+    gradient_eps: 0.0039215686
+    highfreq_eps: 0.0039215686
+    direction_eps: 0.0039215686
+    variance_eps: 0.0000153787
 
 train:
   exp_name: MFQEv2_QP37_hybrid

@@ -127,6 +127,8 @@ def guidance_diagnostics(pred, target, threshold):
     return {
         'pred_max': float(pred.max().cpu()),
         'oracle_max': float(target.max().cpu()),
+        'pred_std': float(pred.std(unbiased=False).cpu()),
+        'oracle_std': float(target.std(unbiased=False).cpu()),
         'pred_pos_ratio': float(pred_mask.float().mean().cpu()),
         'oracle_pos_ratio': float(target_mask.float().mean().cpu()),
         'soft_iou': float(soft_iou.cpu()),
@@ -309,6 +311,8 @@ def main():
                     f"oracle_mean: [{outputs['oracle_guidance'].mean().item():.4f}], "
                     f"pred_max: [{diag['pred_max']:.4f}], "
                     f"oracle_max: [{diag['oracle_max']:.4f}], "
+                    f"pred_std: [{diag['pred_std']:.4f}], "
+                    f"oracle_std: [{diag['oracle_std']:.4f}], "
                     f"soft_iou: [{diag['soft_iou']:.4f}], "
                     f"soft_dice: [{diag['soft_dice']:.4f}], "
                     f"{threshold_msg}"
