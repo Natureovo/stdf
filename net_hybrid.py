@@ -309,6 +309,7 @@ class HybridSTDFGRDR(nn.Module):
             'amplitude_sparsity_loss': loss_dict['amplitude_sparsity_loss'],
             'amplitude_focal_loss': loss_dict['amplitude_focal_loss'],
             'amplitude_cosine_loss': loss_dict['amplitude_cosine_loss'],
+            'amplitude_correlation_loss': loss_dict['amplitude_correlation_loss'],
             'residual_sign_acc': loss_dict['residual_sign_acc'],
             'residual_corr': loss_dict['residual_corr'],
             'pred_residual_abs': loss_dict['pred_residual_abs'],
