@@ -1,10 +1,12 @@
 import argparse
 import json
+import math
 import os
 import os.path as op
 from collections import OrderedDict, defaultdict
 
 import torch
+import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
@@ -80,6 +82,30 @@ def parse_args():
         help=(
             'Weight inside top-ratio support. soft preserves guidance '
             'strength; binary uses unit support before the detail gate.'
+        ),
+    )
+    parser.add_argument(
+        '--oracle_utility_diagnostic',
+        action='store_true',
+        help=(
+            'GT-only diagnostic that ranks spatial blocks by the actual MSE '
+            'reduction produced by predicted and target corrections.'
+        ),
+    )
+    parser.add_argument(
+        '--utility_block_size',
+        type=int,
+        default=16,
+        help='Square block size used by --oracle_utility_diagnostic.',
+    )
+    parser.add_argument(
+        '--utility_top_ratios',
+        type=float,
+        nargs='+',
+        default=[0.05, 0.10, 0.20],
+        help=(
+            'Block-budget ratios evaluated in one validation pass by the '
+            'oracle utility diagnostic.'
         ),
     )
     parser.add_argument('--report_path', default=None)
@@ -296,6 +322,74 @@ def make_effective_mask(
     return support_mask, write_mask, write_mask * detail_gate
 
 
+def block_utility_scores(base, gt, correction, residual_scale, block_size):
+    """Return mean MSE reduction for each spatial block."""
+    candidate = (base + residual_scale * correction).clamp(0, 1)
+    utility = (base - gt).square() - (candidate - gt).square()
+    utility = utility.mean(dim=1, keepdim=True)
+    _, _, height, width = utility.shape
+    pad_h = (-height) % block_size
+    pad_w = (-width) % block_size
+    utility = F.pad(utility, (0, pad_w, 0, pad_h))
+    valid = F.pad(
+        torch.ones_like(base[:, :1]),
+        (0, pad_w, 0, pad_h),
+    )
+    block_area = float(block_size * block_size)
+    utility_sum = F.avg_pool2d(
+        utility,
+        kernel_size=block_size,
+        stride=block_size,
+    ) * block_area
+    valid_count = F.avg_pool2d(
+        valid,
+        kernel_size=block_size,
+        stride=block_size,
+    ) * block_area
+    return utility_sum / valid_count.clamp_min(1.0)
+
+
+def top_block_mask(block_scores, output_size, block_size, top_ratio):
+    """Select an exact top-ratio block budget and expand it to pixels."""
+    batch_size = block_scores.size(0)
+    flat_scores = block_scores.reshape(batch_size, -1)
+    block_count = flat_scores.size(1)
+    selected_count = max(1, int(math.ceil(block_count * top_ratio)))
+    selected_count = min(selected_count, block_count)
+    top_indices = flat_scores.topk(selected_count, dim=1).indices
+    flat_mask = torch.zeros_like(flat_scores)
+    flat_mask.scatter_(1, top_indices, 1.0)
+    block_mask = flat_mask.view_as(block_scores)
+    pixel_mask = F.interpolate(
+        block_mask,
+        scale_factor=block_size,
+        mode='nearest',
+    )
+    height, width = output_size
+    pixel_mask = pixel_mask[..., :height, :width]
+    positive = flat_scores > 0
+    selected_positive = (
+        positive.to(flat_mask.dtype) * flat_mask
+    ).sum(dim=1) / flat_mask.sum(dim=1).clamp_min(1.0)
+    selected_score = (
+        flat_scores * flat_mask
+    ).sum(dim=1) / flat_mask.sum(dim=1).clamp_min(1.0)
+    diagnostics = {
+        'block_count': block_count,
+        'selected_block_count': selected_count,
+        'block_support_ratio': selected_count / float(block_count),
+        'pixel_support_ratio': float(pixel_mask.mean().cpu()),
+        'positive_block_ratio': float(positive.float().mean().cpu()),
+        'selected_positive_ratio': float(selected_positive.mean().cpu()),
+        'selected_utility_mean': float(selected_score.mean().cpu()),
+    }
+    return pixel_mask, diagnostics
+
+
+def utility_ratio_key(ratio):
+    return f'{ratio:.6f}'.rstrip('0').rstrip('.')
+
+
 def distribution_summary(total, total_square, positive_count, count):
     count = max(int(count), 1)
     mean = total / count
@@ -332,6 +426,14 @@ def main():
             raise ValueError('--top_ratio is required for --mask_mode top_ratio.')
         if not 0.0 < args.top_ratio <= 1.0:
             raise ValueError('--top_ratio should be in (0, 1].')
+    if args.oracle_utility_diagnostic:
+        if args.utility_block_size <= 0:
+            raise ValueError('--utility_block_size should be positive.')
+        if not args.utility_top_ratios:
+            raise ValueError('--utility_top_ratios cannot be empty.')
+        if any(not 0.0 < ratio <= 1.0 for ratio in args.utility_top_ratios):
+            raise ValueError('--utility_top_ratios should all be in (0, 1].')
+        args.utility_top_ratios = sorted(set(args.utility_top_ratios))
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -489,8 +591,56 @@ def main():
             oracle_target = (
                 base + args.residual_scale * target_unit_correction
             ).clamp(0, 1)
-
             base_frame_values = frame_values(gt, base, hf_kernel)
+
+            if args.oracle_utility_diagnostic:
+                utility_corrections = OrderedDict([
+                    ('predicted', detail_gate * pred_correction),
+                    ('target', detail_gate * target_correction),
+                ])
+                for utility_source, utility_correction in utility_corrections.items():
+                    block_scores = block_utility_scores(
+                        base,
+                        gt,
+                        utility_correction,
+                        args.residual_scale,
+                        args.utility_block_size,
+                    )
+                    for utility_ratio in args.utility_top_ratios:
+                        ratio_key = utility_ratio_key(utility_ratio)
+                        prefix = f'utility_{utility_source}_{ratio_key}'
+                        utility_mask, utility_diag = top_block_mask(
+                            block_scores,
+                            base.shape[-2:],
+                            args.utility_block_size,
+                            utility_ratio,
+                        )
+                        utility_output = (
+                            base +
+                            args.residual_scale * utility_mask * utility_correction
+                        ).clamp(0, 1)
+                        utility_values = frame_values(
+                            gt,
+                            utility_output,
+                            hf_kernel,
+                        )
+                        add_values(totals, prefix, utility_values)
+                        utility_psnr_delta = (
+                            utility_values['psnr'] - base_frame_values['psnr']
+                        )
+                        totals[f'{prefix}_psnr_delta_sum'] += utility_psnr_delta
+                        totals[f'{prefix}_psnr_delta_square_sum'] += (
+                            utility_psnr_delta ** 2
+                        )
+                        totals[f'{prefix}_positive_psnr_frames'] += int(
+                            utility_psnr_delta > 0.0
+                        )
+                        totals[f'{prefix}_write_abs'] += float(
+                            (utility_output - base).abs().mean().cpu()
+                        )
+                        for key, value in utility_diag.items():
+                            totals[f'{prefix}_{key}'] += float(value)
+
             hybrid_frame_values = frame_values(gt, refined, hf_kernel)
             oracle_frame_values = frame_values(gt, oracle_target, hf_kernel)
             add_values(totals, 'base', base_frame_values)
@@ -599,6 +749,57 @@ def main():
         totals['positive_oracle_psnr_frames'],
         sample_count,
     )
+    utility_report = {
+        'enabled': args.oracle_utility_diagnostic,
+        'uses_gt': args.oracle_utility_diagnostic,
+    }
+    if args.oracle_utility_diagnostic:
+        utility_report.update({
+            'block_size': args.utility_block_size,
+            'top_ratios': args.utility_top_ratios,
+            'candidate_includes_detail_gate': True,
+            'ratios_are_block_budgets': True,
+            'full_frame_diffusion': True,
+            'selection': 'top block-average MSE reduction',
+            'sources': {},
+        })
+        utility_diag_keys = [
+            'block_count',
+            'selected_block_count',
+            'block_support_ratio',
+            'pixel_support_ratio',
+            'positive_block_ratio',
+            'selected_positive_ratio',
+            'selected_utility_mean',
+        ]
+        for utility_source in ['predicted', 'target']:
+            source_report = {}
+            for utility_ratio in args.utility_top_ratios:
+                ratio_key = utility_ratio_key(utility_ratio)
+                prefix = f'utility_{utility_source}_{ratio_key}'
+                values = averaged(totals, prefix, sample_count)
+                source_report[ratio_key] = {
+                    'ratio': utility_ratio,
+                    'metrics': values,
+                    'delta_vs_base': {
+                        key: values[key] - base_values[key]
+                        for key in base_values
+                    },
+                    'frame_psnr_delta_distribution': distribution_summary(
+                        totals[f'{prefix}_psnr_delta_sum'],
+                        totals[f'{prefix}_psnr_delta_square_sum'],
+                        totals[f'{prefix}_positive_psnr_frames'],
+                        sample_count,
+                    ),
+                    'write_abs': (
+                        totals[f'{prefix}_write_abs'] / max(sample_count, 1)
+                    ),
+                    'selection_diagnostics': {
+                        key: totals[f'{prefix}_{key}'] / max(sample_count, 1)
+                        for key in utility_diag_keys
+                    },
+                }
+            utility_report['sources'][utility_source] = source_report
     report = {
         'split': args.split,
         'samples': sample_count,
@@ -650,6 +851,7 @@ def main():
         'write_area': totals['write_area'] / max(sample_count, 1),
         'frame_psnr_delta_distribution': frame_psnr_distribution,
         'oracle_frame_psnr_delta_distribution': oracle_psnr_distribution,
+        'oracle_utility_diagnostic': utility_report,
         'correction_diagnostics': {
             'prior': pair_diagnostics(totals, 'prior'),
             'applied_unit_correction': pair_diagnostics(totals, 'correction'),
@@ -761,6 +963,32 @@ def main():
         f"{frame_psnr_distribution['win_rate']:.4f}/"
         f"{oracle_psnr_distribution['win_rate']:.4f}"
     )
+    if args.oracle_utility_diagnostic:
+        print('\n-- GT-only block utility upper bounds --')
+        print(
+            f'block size: {args.utility_block_size}, '
+            'candidate correction includes the existing detail gate'
+        )
+        for utility_source in ['predicted', 'target']:
+            print(f'{utility_source} correction:')
+            source_report = utility_report['sources'][utility_source]
+            for utility_ratio in args.utility_top_ratios:
+                ratio_key = utility_ratio_key(utility_ratio)
+                ratio_report = source_report[ratio_key]
+                psnr_dist = ratio_report['frame_psnr_delta_distribution']
+                selection = ratio_report['selection_diagnostics']
+                delta = ratio_report['delta_vs_base']
+                print(
+                    f"  top{100.0 * utility_ratio:g}: "
+                    f"PSNR {delta['psnr']:+.6f}, "
+                    f"SSIM {delta['ssim']:+.6f}, "
+                    f"gradient {delta['gradient_mae']:+.8f}, "
+                    f"highfreq {delta['highfreq_mae']:+.8f}, "
+                    f"win {psnr_dist['win_rate']:.4f}, "
+                    f"area {selection['pixel_support_ratio']:.4f}, "
+                    f"positive-blocks {selection['positive_block_ratio']:.4f}, "
+                    f"selected-positive {selection['selected_positive_ratio']:.4f}"
+                )
     correction_diag = report['correction_diagnostics']
     print(
         'prior pearson/cosine, correction pearson/cosine: '
