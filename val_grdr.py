@@ -28,6 +28,16 @@ def parse_args():
         '--guidance_mode',
         choices=['predicted', 'oracle', 'coarse'],
         default='predicted',
+        help='Guidance supplied to the GRDR denoiser.',
+    )
+    parser.add_argument(
+        '--mask_guidance_mode',
+        choices=['same', 'predicted', 'oracle', 'coarse'],
+        default='same',
+        help=(
+            'Guidance used only for spatial support and the detail gate. '
+            'same reuses --guidance_mode and preserves the old behavior.'
+        ),
     )
     parser.add_argument('--sample_steps', type=int, default=5)
     parser.add_argument('--sampler', choices=['ddim', 'ddpm'], default='ddim')
@@ -300,11 +310,23 @@ def distribution_summary(total, total_square, positive_count, count):
 
 def main():
     args = parse_args()
+    condition_guidance_mode = args.guidance_mode
+    mask_guidance_mode = (
+        condition_guidance_mode
+        if args.mask_guidance_mode == 'same'
+        else args.mask_guidance_mode
+    )
+    needs_predicted_guidance = (
+        condition_guidance_mode == 'predicted' or
+        mask_guidance_mode == 'predicted'
+    )
     if args.noise_mode == 'shared' and (
             args.sampler != 'ddim' or args.ddim_eta != 0.0):
         raise ValueError('shared noise requires DDIM with --ddim_eta 0.')
-    if args.guidance_mode == 'predicted' and args.guidance_ckpt is None:
-        raise ValueError('--guidance_ckpt is required for predicted guidance.')
+    if needs_predicted_guidance and args.guidance_ckpt is None:
+        raise ValueError(
+            '--guidance_ckpt is required when either guidance role uses predicted.'
+        )
     if args.mask_mode == 'top_ratio':
         if args.top_ratio is None:
             raise ValueError('--top_ratio is required for --mask_mode top_ratio.')
@@ -321,7 +343,7 @@ def main():
     hf_kernel = int(diffusion_opts.get('target_highfreq_kernel', 5))
     rate_dim = max(
         int(diffusion_opts.get('rate_dim', 0)),
-        int(guidance_opts.get('rate_dim', 0)) if args.guidance_mode == 'predicted' else 0,
+        int(guidance_opts.get('rate_dim', 0)) if needs_predicted_guidance else 0,
     )
 
     split_opts = dict(opts['dataset'][args.split])
@@ -350,7 +372,7 @@ def main():
     model = build_hybrid_stdf_grdr(opts['network'])
     load_stdf_weights(model.enhancer, args.stdf_ckpt)
     load_grdr_weights(model.diffusion, args.grdr_ckpt)
-    if args.guidance_mode == 'predicted':
+    if needs_predicted_guidance:
         load_guidance_weights(model.guidance_net, args.guidance_ckpt)
     model = model.to(device)
     model.eval()
@@ -388,26 +410,34 @@ def main():
             base = model.forward_base(x)
             lq_center = model.center_frame(x)
             oracle_guidance = model.make_guidance(gt, base)['guidance'].clamp(0, 1)
-            if args.guidance_mode == 'oracle':
-                guidance = oracle_guidance
-            elif args.guidance_mode == 'coarse':
-                guidance = model.make_coarse_guidance(lq_center, base).clamp(0, 1)
-            else:
-                guidance = model.predict_guidance(
+            guidance_by_mode = {'oracle': oracle_guidance}
+            requested_guidance_modes = {
+                condition_guidance_mode,
+                mask_guidance_mode,
+            }
+            if 'coarse' in requested_guidance_modes:
+                guidance_by_mode['coarse'] = model.make_coarse_guidance(
+                    lq_center,
+                    base,
+                ).clamp(0, 1)
+            if 'predicted' in requested_guidance_modes:
+                guidance_by_mode['predicted'] = model.predict_guidance(
                     lq_center,
                     base,
                     rate_cond=guidance_rate,
                 ).clamp(0, 1)
+            condition_guidance = guidance_by_mode[condition_guidance_mode]
+            mask_guidance = guidance_by_mode[mask_guidance_mode]
 
             detail_gate = model.diffusion.make_detail_gate(
                 lq_center,
                 base,
-                guidance,
+                mask_guidance,
                 rate_cond=diffusion_rate,
             )
             support_mask, write_mask, effective_mask = make_effective_mask(
                 model.diffusion,
-                guidance,
+                mask_guidance,
                 detail_gate,
                 args.mask_mode,
                 args.top_ratio,
@@ -424,7 +454,7 @@ def main():
             pred_signal = model.diffusion.sample_residual(
                 lq_center,
                 base,
-                guidance,
+                condition_guidance,
                 rate_cond=diffusion_rate,
                 steps=args.sample_steps,
                 sampler=args.sampler,
@@ -472,6 +502,13 @@ def main():
             totals['support_area'] += float(support_mask.mean().cpu())
             totals['write_mask_mean'] += float(write_mask.mean().cpu())
             totals['effective_mask_mean'] += float(effective_mask.mean().cpu())
+            totals['condition_guidance_mean'] += float(
+                condition_guidance.mean().cpu()
+            )
+            totals['mask_guidance_mean'] += float(mask_guidance.mean().cpu())
+            totals['condition_mask_guidance_l1'] += float(
+                (condition_guidance - mask_guidance).abs().mean().cpu()
+            )
 
             frame_psnr_delta = hybrid_frame_values['psnr'] - base_frame_values['psnr']
             oracle_psnr_delta = oracle_frame_values['psnr'] - base_frame_values['psnr']
@@ -569,7 +606,20 @@ def main():
         'sample_mode': args.sample_mode,
         'selected_samples': selected_sample_count,
         'per_video_samples': dict(sorted(video_counts.items())),
-        'guidance_mode': args.guidance_mode,
+        # guidance_mode remains as a backward-compatible alias for the
+        # denoiser-conditioning role.
+        'guidance_mode': condition_guidance_mode,
+        'condition_guidance_mode': condition_guidance_mode,
+        'mask_guidance_mode': mask_guidance_mode,
+        'guidance_diagnostics': {
+            'condition_mean': (
+                totals['condition_guidance_mean'] / max(sample_count, 1)
+            ),
+            'mask_mean': totals['mask_guidance_mean'] / max(sample_count, 1),
+            'condition_mask_l1': (
+                totals['condition_mask_guidance_l1'] / max(sample_count, 1)
+            ),
+        },
         'mask': {
             'mode': args.mask_mode,
             'top_ratio': args.top_ratio,
@@ -658,7 +708,9 @@ def main():
     print(
         f"split: {args.split}, samples: {sample_count}, "
         f"sampling: {args.sample_mode} ({sample_count}/{source_sample_count}), "
-        f"guidance: {args.guidance_mode}, noise: {args.noise_mode}, "
+        f"condition/mask guidance: "
+        f"{condition_guidance_mode}/{mask_guidance_mode}, "
+        f"noise: {args.noise_mode}, "
         f"mask: {args.mask_mode}"
     )
     if video_counts:
@@ -695,6 +747,12 @@ def main():
         f"{report['mask']['support_area']:.6f}/"
         f"{report['mask']['write_mask_mean']:.6f}/"
         f"{report['mask']['effective_mask_mean']:.6f}"
+    )
+    print(
+        'condition/mask guidance mean, L1 gap: '
+        f"{report['guidance_diagnostics']['condition_mean']:.6f}/"
+        f"{report['guidance_diagnostics']['mask_mean']:.6f}/"
+        f"{report['guidance_diagnostics']['condition_mask_l1']:.6f}"
     )
     print(
         'frame PSNR delta mean/std/win-rate, oracle win-rate: '
