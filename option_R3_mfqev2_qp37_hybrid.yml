@@ -109,14 +109,21 @@ network:
     feature_normalization: raw
     target_threshold: 0.20
     log_thresholds: [0.15, 0.20, 0.25, 0.30]
+    log_top_ratios: [0.05, 0.10, 0.20]
     l1_weight: 1.0
-    weighted_l1_weight: 2.0
+    weighted_l1_weight: 1.0
     weighted_l1_beta: 8.0
     weighted_l1_gamma: 2.0
     bce_weight: 0.0
     dice_weight: 0.0
     soft_iou_weight: 0.0
-    tv_weight: 0.002
+    spatial_correlation_weight: 0.5
+    ranking_weight: 0.5
+    ranking_pairs: 2048
+    ranking_margin: 0.05
+    ranking_min_target_gap: 0.05
+    std_weight: 0.25
+    tv_weight: 0.0005
 
   budget_net:
     enabled: true

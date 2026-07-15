@@ -12,6 +12,7 @@ from net_guidance import (
     _normalize_per_sample,
     _sobel_magnitude,
     guidance_prediction_losses,
+    top_ratio_overlap_stats,
 )
 from net_hybrid import build_hybrid_stdf_grdr
 
@@ -214,6 +215,7 @@ def main():
     opts = load_opts(args.opt_path)
     guidance_opts = opts['network'].get('guidance_net', {})
     thresholds = guidance_opts.get('log_thresholds', [0.15, 0.20, 0.25, 0.30])
+    top_ratios = guidance_opts.get('log_top_ratios', [0.05, 0.10, 0.20])
     rate_dim = guidance_opts.get('rate_dim', 0)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -257,6 +259,9 @@ def main():
     threshold_totals = {
         float(t): defaultdict(float) for t in thresholds
     }
+    top_ratio_totals = {
+        float(ratio): defaultdict(float) for ratio in top_ratios
+    }
     pred_q_totals = defaultdict(float)
     oracle_q_totals = defaultdict(float)
     spearman_total = 0.0
@@ -292,6 +297,16 @@ def main():
                 dice_weight=guidance_opts.get('dice_weight', 0.0),
                 soft_iou_weight=guidance_opts.get('soft_iou_weight', 0.0),
                 tv_weight=guidance_opts.get('tv_weight', 0.0),
+                spatial_correlation_weight=guidance_opts.get(
+                    'spatial_correlation_weight', 0.0
+                ),
+                ranking_weight=guidance_opts.get('ranking_weight', 0.0),
+                ranking_pairs=guidance_opts.get('ranking_pairs', 2048),
+                ranking_margin=guidance_opts.get('ranking_margin', 0.05),
+                ranking_min_target_gap=guidance_opts.get(
+                    'ranking_min_target_gap', 0.05
+                ),
+                std_weight=guidance_opts.get('std_weight', 0.0),
             )
 
             batch_n = gt.size(0)
@@ -330,6 +345,13 @@ def main():
             for threshold, stats in threshold_stats(pred, oracle, thresholds).items():
                 for key, value in stats.items():
                     threshold_totals[threshold][key] += float(value.cpu()) * batch_n
+            for ratio, stats in top_ratio_overlap_stats(
+                    pred,
+                    oracle,
+                    top_ratios,
+            ).items():
+                for key, value in stats.items():
+                    top_ratio_totals[ratio][key] += float(value.cpu()) * batch_n
 
     denom = max(sample_count, 1)
     print('\n========== Guidance validation ==========')
@@ -343,7 +365,10 @@ def main():
     print(f'guidance_ckpt: {args.guidance_ckpt}')
 
     print('\n-- losses --')
-    for key in ['loss', 'l1_loss', 'weighted_l1_loss', 'bce_loss', 'tv_loss']:
+    for key in [
+            'loss', 'l1_loss', 'weighted_l1_loss', 'bce_loss',
+            'spatial_correlation_loss', 'ranking_loss',
+            'ranking_valid_ratio', 'std_loss', 'tv_loss']:
         if key in loss_totals:
             print(f'{key}: {loss_totals[key] / denom:.6f}')
 
@@ -370,6 +395,17 @@ def main():
     print(f'pearson_pred_residual: {float(pearson_from_sums(corr_residual).cpu()):.6f}')
     print(f'pearson_pred_gradient: {float(pearson_from_sums(corr_grad).cpu()):.6f}')
     print(f'pearson_pred_highfreq: {float(pearson_from_sums(corr_hf).cpu()):.6f}')
+
+    print('\n-- top-ratio spatial ranking diagnostics --')
+    for ratio in top_ratios:
+        ratio = float(ratio)
+        stats = top_ratio_totals[ratio]
+        print(
+            f'top{int(round(ratio * 100))}: '
+            f'iou={stats["iou"] / denom:.4f}, '
+            f'precision={stats["precision"] / denom:.4f}, '
+            f'recall={stats["recall"] / denom:.4f}'
+        )
 
     print('\n-- threshold diagnostics, not the main objective --')
     for threshold in thresholds:
