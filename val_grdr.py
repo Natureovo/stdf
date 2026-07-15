@@ -48,6 +48,30 @@ def parse_args():
         default='sequential',
         help='Subset strategy used when --max_samples is set.',
     )
+    parser.add_argument(
+        '--mask_mode',
+        choices=['soft', 'top_ratio'],
+        default='soft',
+        help=(
+            'soft reproduces full-frame soft blending; top_ratio restricts '
+            'write-back to the highest-guidance spatial support.'
+        ),
+    )
+    parser.add_argument(
+        '--top_ratio',
+        type=float,
+        default=None,
+        help='Per-frame support ratio required by --mask_mode top_ratio.',
+    )
+    parser.add_argument(
+        '--mask_weight_mode',
+        choices=['soft', 'binary'],
+        default='soft',
+        help=(
+            'Weight inside top-ratio support. soft preserves guidance '
+            'strength; binary uses unit support before the detail gate.'
+        ),
+    )
     parser.add_argument('--report_path', default=None)
     return parser.parse_args()
 
@@ -238,6 +262,42 @@ def optimal_scale_diagnostics(totals, prefix):
     }
 
 
+def make_effective_mask(
+        diffusion,
+        guidance,
+        detail_gate,
+        mask_mode,
+        top_ratio,
+        mask_weight_mode):
+    if mask_mode == 'soft':
+        support_mask = torch.ones_like(guidance)
+        write_mask = guidance
+    else:
+        support_mask = diffusion.make_write_mask(
+            guidance,
+            use_hard_mask=True,
+            mask_mode='top_ratio',
+            top_ratio=top_ratio,
+        )
+        if mask_weight_mode == 'binary':
+            write_mask = support_mask
+        else:
+            write_mask = support_mask * guidance
+    return support_mask, write_mask, write_mask * detail_gate
+
+
+def distribution_summary(total, total_square, positive_count, count):
+    count = max(int(count), 1)
+    mean = total / count
+    variance = max(total_square / count - mean * mean, 0.0)
+    return {
+        'mean': mean,
+        'std': variance ** 0.5,
+        'positive_count': int(positive_count),
+        'win_rate': positive_count / count,
+    }
+
+
 def main():
     args = parse_args()
     if args.noise_mode == 'shared' and (
@@ -245,6 +305,11 @@ def main():
         raise ValueError('shared noise requires DDIM with --ddim_eta 0.')
     if args.guidance_mode == 'predicted' and args.guidance_ckpt is None:
         raise ValueError('--guidance_ckpt is required for predicted guidance.')
+    if args.mask_mode == 'top_ratio':
+        if args.top_ratio is None:
+            raise ValueError('--top_ratio is required for --mask_mode top_ratio.')
+        if not 0.0 < args.top_ratio <= 1.0:
+            raise ValueError('--top_ratio should be in (0, 1].')
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -292,6 +357,7 @@ def main():
 
     totals = defaultdict(float)
     qp_totals = defaultdict(lambda: defaultdict(float))
+    video_metric_totals = defaultdict(lambda: defaultdict(float))
     previous = {}
     shared_noises = {}
     temporal_count = 0
@@ -339,7 +405,14 @@ def main():
                 guidance,
                 rate_cond=diffusion_rate,
             )
-            effective_mask = guidance * detail_gate
+            support_mask, write_mask, effective_mask = make_effective_mask(
+                model.diffusion,
+                guidance,
+                detail_gate,
+                args.mask_mode,
+                args.top_ratio,
+                args.mask_weight_mode,
+            )
             name = data['name_vid'][0]
             initial_noise = None
             if args.noise_mode == 'shared':
@@ -387,12 +460,33 @@ def main():
                 base + args.residual_scale * target_unit_correction
             ).clamp(0, 1)
 
-            add_values(totals, 'base', frame_values(gt, base, hf_kernel))
-            add_values(totals, 'hybrid', frame_values(gt, refined, hf_kernel))
-            add_values(totals, 'oracle_target', frame_values(gt, oracle_target, hf_kernel))
+            base_frame_values = frame_values(gt, base, hf_kernel)
+            hybrid_frame_values = frame_values(gt, refined, hf_kernel)
+            oracle_frame_values = frame_values(gt, oracle_target, hf_kernel)
+            add_values(totals, 'base', base_frame_values)
+            add_values(totals, 'hybrid', hybrid_frame_values)
+            add_values(totals, 'oracle_target', oracle_frame_values)
             totals['write_abs'] += float((refined - base).abs().mean().cpu())
             totals['oracle_write_abs'] += float((oracle_target - base).abs().mean().cpu())
             totals['write_area'] += float(effective_mask.mean().cpu())
+            totals['support_area'] += float(support_mask.mean().cpu())
+            totals['write_mask_mean'] += float(write_mask.mean().cpu())
+            totals['effective_mask_mean'] += float(effective_mask.mean().cpu())
+
+            frame_psnr_delta = hybrid_frame_values['psnr'] - base_frame_values['psnr']
+            oracle_psnr_delta = oracle_frame_values['psnr'] - base_frame_values['psnr']
+            totals['frame_psnr_delta_sum'] += frame_psnr_delta
+            totals['frame_psnr_delta_square_sum'] += frame_psnr_delta ** 2
+            totals['positive_psnr_frames'] += int(frame_psnr_delta > 0.0)
+            totals['oracle_frame_psnr_delta_sum'] += oracle_psnr_delta
+            totals['oracle_frame_psnr_delta_square_sum'] += oracle_psnr_delta ** 2
+            totals['positive_oracle_psnr_frames'] += int(oracle_psnr_delta > 0.0)
+
+            video_values = video_metric_totals[name]
+            video_values['count'] += 1
+            video_values['base_psnr'] += base_frame_values['psnr']
+            video_values['hybrid_psnr'] += hybrid_frame_values['psnr']
+            video_values['oracle_psnr'] += oracle_frame_values['psnr']
             update_pair_sums(
                 totals,
                 'prior',
@@ -456,6 +550,18 @@ def main():
     base_values = averaged(totals, 'base', sample_count)
     hybrid_values = averaged(totals, 'hybrid', sample_count)
     oracle_values = averaged(totals, 'oracle_target', sample_count)
+    frame_psnr_distribution = distribution_summary(
+        totals['frame_psnr_delta_sum'],
+        totals['frame_psnr_delta_square_sum'],
+        totals['positive_psnr_frames'],
+        sample_count,
+    )
+    oracle_psnr_distribution = distribution_summary(
+        totals['oracle_frame_psnr_delta_sum'],
+        totals['oracle_frame_psnr_delta_square_sum'],
+        totals['positive_oracle_psnr_frames'],
+        sample_count,
+    )
     report = {
         'split': args.split,
         'samples': sample_count,
@@ -464,6 +570,17 @@ def main():
         'selected_samples': selected_sample_count,
         'per_video_samples': dict(sorted(video_counts.items())),
         'guidance_mode': args.guidance_mode,
+        'mask': {
+            'mode': args.mask_mode,
+            'top_ratio': args.top_ratio,
+            'weight_mode': args.mask_weight_mode,
+            'support_area': totals['support_area'] / max(sample_count, 1),
+            'write_mask_mean': totals['write_mask_mean'] / max(sample_count, 1),
+            'effective_mask_mean': (
+                totals['effective_mask_mean'] / max(sample_count, 1)
+            ),
+            'full_frame_diffusion': True,
+        },
         'sample_steps': args.sample_steps,
         'sampler': args.sampler,
         'noise_mode': args.noise_mode,
@@ -479,7 +596,10 @@ def main():
         },
         'write_abs': totals['write_abs'] / max(sample_count, 1),
         'oracle_write_abs': totals['oracle_write_abs'] / max(sample_count, 1),
+        # Backward-compatible alias for the old soft-mask mean.
         'write_area': totals['write_area'] / max(sample_count, 1),
+        'frame_psnr_delta_distribution': frame_psnr_distribution,
+        'oracle_frame_psnr_delta_distribution': oracle_psnr_distribution,
         'correction_diagnostics': {
             'prior': pair_diagnostics(totals, 'prior'),
             'applied_unit_correction': pair_diagnostics(totals, 'correction'),
@@ -508,6 +628,7 @@ def main():
             ),
         },
         'per_qp': {},
+        'per_video': {},
     }
     for qp_key, values in sorted(qp_totals.items()):
         count = max(int(values['count']), 1)
@@ -519,12 +640,26 @@ def main():
             'hybrid_psnr': hybrid_psnr,
             'delta': hybrid_psnr - base_psnr,
         }
+    for name, values in sorted(video_metric_totals.items()):
+        count = max(int(values['count']), 1)
+        base_psnr = values['base_psnr'] / count
+        hybrid_psnr = values['hybrid_psnr'] / count
+        oracle_psnr = values['oracle_psnr'] / count
+        report['per_video'][name] = {
+            'count': count,
+            'base_psnr': base_psnr,
+            'hybrid_psnr': hybrid_psnr,
+            'oracle_psnr': oracle_psnr,
+            'delta_hybrid_vs_base': hybrid_psnr - base_psnr,
+            'delta_oracle_vs_base': oracle_psnr - base_psnr,
+        }
 
     print('\n========== GRDR validation ==========')
     print(
         f"split: {args.split}, samples: {sample_count}, "
         f"sampling: {args.sample_mode} ({sample_count}/{source_sample_count}), "
-        f"guidance: {args.guidance_mode}, noise: {args.noise_mode}"
+        f"guidance: {args.guidance_mode}, noise: {args.noise_mode}, "
+        f"mask: {args.mask_mode}"
     )
     if video_counts:
         counts = list(video_counts.values())
@@ -552,9 +687,21 @@ def main():
     )
     print(f"temporal_error hybrid-base: {report['temporal_error']['delta']:.8f}")
     print(
-        'write_abs pred/oracle, area: '
-        f"{report['write_abs']:.8f}/{report['oracle_write_abs']:.8f}/"
-        f"{report['write_area']:.6f}"
+        'write_abs pred/oracle: '
+        f"{report['write_abs']:.8f}/{report['oracle_write_abs']:.8f}"
+    )
+    print(
+        'mask support/write/effective mean: '
+        f"{report['mask']['support_area']:.6f}/"
+        f"{report['mask']['write_mask_mean']:.6f}/"
+        f"{report['mask']['effective_mask_mean']:.6f}"
+    )
+    print(
+        'frame PSNR delta mean/std/win-rate, oracle win-rate: '
+        f"{frame_psnr_distribution['mean']:.6f}/"
+        f"{frame_psnr_distribution['std']:.6f}/"
+        f"{frame_psnr_distribution['win_rate']:.4f}/"
+        f"{oracle_psnr_distribution['win_rate']:.4f}"
     )
     correction_diag = report['correction_diagnostics']
     print(
