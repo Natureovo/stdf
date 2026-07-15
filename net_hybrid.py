@@ -184,6 +184,16 @@ class HybridSTDFGRDR(nn.Module):
             dice_weight=self.guidance_net_opts.get('dice_weight', 0.0),
             soft_iou_weight=self.guidance_net_opts.get('soft_iou_weight', 0.0),
             tv_weight=self.guidance_net_opts.get('tv_weight', 0.05),
+            spatial_correlation_weight=self.guidance_net_opts.get(
+                'spatial_correlation_weight', 0.0
+            ),
+            ranking_weight=self.guidance_net_opts.get('ranking_weight', 0.0),
+            ranking_pairs=self.guidance_net_opts.get('ranking_pairs', 2048),
+            ranking_margin=self.guidance_net_opts.get('ranking_margin', 0.05),
+            ranking_min_target_gap=self.guidance_net_opts.get(
+                'ranking_min_target_gap', 0.05
+            ),
+            std_weight=self.guidance_net_opts.get('std_weight', 0.0),
         )
         return {
             'loss': loss_dict['loss'],
@@ -192,6 +202,12 @@ class HybridSTDFGRDR(nn.Module):
             'guidance_bce_loss': loss_dict['bce_loss'],
             'guidance_dice_loss': loss_dict['dice_loss'],
             'guidance_soft_iou_loss': loss_dict['soft_iou_loss'],
+            'guidance_spatial_correlation_loss': loss_dict[
+                'spatial_correlation_loss'
+            ],
+            'guidance_ranking_loss': loss_dict['ranking_loss'],
+            'guidance_ranking_valid_ratio': loss_dict['ranking_valid_ratio'],
+            'guidance_std_loss': loss_dict['std_loss'],
             'guidance_tv_loss': loss_dict['tv_loss'],
             'base': base,
             'lq': lq,

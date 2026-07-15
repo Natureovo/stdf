@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 import dataset
 import utils
+from net_guidance import top_ratio_overlap_stats
 from net_hybrid import build_hybrid_stdf_grdr
 
 
@@ -23,6 +24,14 @@ def parse_args():
         '--stdf_ckpt',
         required=True,
         help='Path to a trained STDF checkpoint, e.g. exp/.../ckp_290000.pt.',
+    )
+    parser.add_argument(
+        '--guidance_init_ckpt',
+        default=None,
+        help=(
+            'Optional GuidanceNet checkpoint used only to initialize weights. '
+            'The optimizer and iteration count start from zero.'
+        ),
     )
     parser.add_argument('--local_rank', type=int, default=0)
     parser.add_argument('--num_iter', type=int, default=None)
@@ -76,6 +85,22 @@ def load_stdf_weights(enhancer, ckp_path):
             k = k[7:]
         clean_state[k] = v
     enhancer.load_state_dict(clean_state, strict=True)
+
+
+def load_guidance_weights(guidance_net, ckp_path):
+    checkpoint = torch.load(ckp_path, map_location='cpu')
+    if 'guidance_state_dict' in checkpoint:
+        state_dict = checkpoint['guidance_state_dict']
+    else:
+        state_dict = checkpoint.get('state_dict', checkpoint)
+        guidance_state = OrderedDict()
+        for key, value in state_dict.items():
+            if key.startswith('module.'):
+                key = key[7:]
+            if key.startswith('guidance_net.'):
+                guidance_state[key[len('guidance_net.'):]] = value
+        state_dict = guidance_state or state_dict
+    guidance_net.load_state_dict(state_dict, strict=True)
 
 
 def count_trainable_params(model):
@@ -156,6 +181,17 @@ def format_threshold_metrics(pred, target, thresholds):
     return ', '.join(parts)
 
 
+def format_top_ratio_metrics(pred, target, ratios):
+    parts = []
+    for ratio, stats in top_ratio_overlap_stats(pred, target, ratios).items():
+        parts.append(
+            f"top{int(round(ratio * 100))}: "
+            f"[iou={float(stats['iou'].cpu()):.4f}, "
+            f"precision={float(stats['precision'].cpu()):.4f}]"
+        )
+    return ', '.join(parts)
+
+
 def main():
     args = parse_args()
     opts_dict = load_opts(args)
@@ -170,6 +206,10 @@ def main():
         'log_thresholds',
         [0.15, guidance_threshold, 0.25, 0.30],
     )
+    log_top_ratios = guidance_opts.get(
+        'log_top_ratios',
+        [0.05, 0.10, 0.20],
+    )
     rate_dim = guidance_opts.get('rate_dim', 0)
 
     if rank == 0:
@@ -180,6 +220,7 @@ def main():
             f"{'<' * 10} Guidance Training {'>' * 10}\n"
             f"Timestamp: [{utils.get_timestr()}]\n"
             f"STDF checkpoint: [{args.stdf_ckpt}]\n"
+            f"Guidance initialization: [{args.guidance_init_ckpt}]\n"
             f"\n{'<' * 10} Options {'>' * 10}\n"
             f"{utils.dict2str(opts_dict)}"
         )
@@ -219,6 +260,8 @@ def main():
 
     model = build_hybrid_stdf_grdr(opts_dict['network'])
     load_stdf_weights(model.enhancer, args.stdf_ckpt)
+    if args.guidance_init_ckpt is not None:
+        load_guidance_weights(model.guidance_net, args.guidance_init_ckpt)
     for param in model.parameters():
         param.requires_grad = False
     model.unfreeze_guidance_net()
@@ -297,6 +340,11 @@ def main():
                     outputs['oracle_guidance'],
                     log_thresholds,
                 )
+                top_ratio_msg = format_top_ratio_metrics(
+                    outputs['pred_guidance'],
+                    outputs['oracle_guidance'],
+                    log_top_ratios,
+                )
                 msg = (
                     f"iter: [{num_iter_accum}]/{num_iter}, "
                     f"epoch: [{current_epoch}]/{num_epoch - 1}, "
@@ -306,6 +354,12 @@ def main():
                     f"bce: [{outputs['guidance_bce_loss'].item():.4f}], "
                     f"dice: [{outputs['guidance_dice_loss'].item():.4f}], "
                     f"soft_iou_loss: [{outputs['guidance_soft_iou_loss'].item():.4f}], "
+                    f"spatial_corr_loss: "
+                    f"[{outputs['guidance_spatial_correlation_loss'].item():.4f}], "
+                    f"ranking_loss: [{outputs['guidance_ranking_loss'].item():.4f}], "
+                    f"ranking_valid: "
+                    f"[{outputs['guidance_ranking_valid_ratio'].item():.4f}], "
+                    f"std_loss: [{outputs['guidance_std_loss'].item():.4f}], "
                     f"tv: [{outputs['guidance_tv_loss'].item():.4f}], "
                     f"pred_mean: [{outputs['pred_guidance'].mean().item():.4f}], "
                     f"oracle_mean: [{outputs['oracle_guidance'].mean().item():.4f}], "
@@ -315,7 +369,7 @@ def main():
                     f"oracle_std: [{diag['oracle_std']:.4f}], "
                     f"soft_iou: [{diag['soft_iou']:.4f}], "
                     f"soft_dice: [{diag['soft_dice']:.4f}], "
-                    f"{threshold_msg}"
+                    f"{threshold_msg}, {top_ratio_msg}"
                 )
                 print(msg)
                 log_fp.write(msg + '\n')
@@ -331,6 +385,7 @@ def main():
                 state = {
                     'num_iter_accum': num_iter_accum,
                     'stdf_ckpt': args.stdf_ckpt,
+                    'guidance_init_ckpt': args.guidance_init_ckpt,
                     'state_dict': model.state_dict(),
                     'guidance_state_dict': model.guidance_net.state_dict(),
                     'optimizer': optimizer.state_dict(),

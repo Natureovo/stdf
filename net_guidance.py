@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,6 +28,91 @@ def _normalize_per_sample(x, eps=1e-6):
     lo = flat.min(dim=1)[0].view(b, 1, 1, 1)
     hi = flat.max(dim=1)[0].view(b, 1, 1, 1)
     return ((x - lo) / (hi - lo + eps)).clamp(0, 1)
+
+
+def _spatial_correlation_loss(pred, target, eps=1e-6):
+    pred_flat = pred.flatten(1)
+    target_flat = target.flatten(1)
+    pred_centered = pred_flat - pred_flat.mean(dim=1, keepdim=True)
+    target_centered = target_flat - target_flat.mean(dim=1, keepdim=True)
+    numerator = (pred_centered * target_centered).sum(dim=1)
+    denominator = torch.sqrt(
+        pred_centered.square().sum(dim=1) *
+        target_centered.square().sum(dim=1) +
+        eps
+    )
+    correlation = (numerator / denominator).clamp(-1, 1)
+    return 1.0 - correlation.mean()
+
+
+def _pairwise_ranking_loss(
+        pred,
+        target,
+        num_pairs=2048,
+        margin=0.05,
+        min_target_gap=0.05):
+    pred_flat = pred.flatten(1)
+    target_flat = target.flatten(1)
+    total = pred_flat.size(1)
+    pair_count = min(max(int(num_pairs), 1), total)
+    pair_ids = torch.arange(pair_count, device=pred.device, dtype=torch.long)
+    index_a = (pair_ids * 104729) % total
+    index_b = (pair_ids * 130363 + total // 2 + 1) % total
+
+    pred_delta = pred_flat[:, index_a] - pred_flat[:, index_b]
+    target_delta = target_flat[:, index_a] - target_flat[:, index_b]
+    target_gap = target_delta.abs()
+    valid = target_gap >= float(min_target_gap)
+    if not bool(valid.any()):
+        return pred.sum() * 0.0, pred.new_tensor(0.0)
+
+    signed_pred_gap = target_delta.sign() * pred_delta
+    pair_loss = F.relu(float(margin) - signed_pred_gap)
+    pair_weight = target_gap.detach()
+    weighted_valid = pair_weight * valid.float()
+    loss = (pair_loss * weighted_valid).sum() / (
+        weighted_valid.sum() + 1e-6
+    )
+    return loss, valid.float().mean()
+
+
+def _response_std_loss(pred, target):
+    pred_std = pred.flatten(1).std(dim=1, unbiased=False)
+    target_std = target.flatten(1).std(dim=1, unbiased=False)
+    return F.l1_loss(pred_std, target_std)
+
+
+def _exact_top_ratio_mask(x, ratio):
+    ratio = float(ratio)
+    if not 0.0 < ratio <= 1.0:
+        raise ValueError('Top ratio should be in (0, 1].')
+    flat = x.detach().flatten(1)
+    count = flat.size(1)
+    top_count = max(1, min(count, int(math.ceil(ratio * count))))
+    indices = flat.topk(top_count, dim=1, largest=True).indices
+    mask = torch.zeros_like(flat, dtype=torch.bool)
+    mask.scatter_(1, indices, True)
+    return mask
+
+
+def top_ratio_overlap_stats(pred, target, ratios=(0.05, 0.10, 0.20)):
+    stats = {}
+    for ratio in ratios:
+        ratio = float(ratio)
+        pred_mask = _exact_top_ratio_mask(pred, ratio)
+        target_mask = _exact_top_ratio_mask(target, ratio)
+        inter = (pred_mask & target_mask).float().sum(dim=1)
+        pred_count = pred_mask.float().sum(dim=1)
+        target_count = target_mask.float().sum(dim=1)
+        union = (pred_mask | target_mask).float().sum(dim=1)
+        precision = inter / (pred_count + 1e-6)
+        recall = inter / (target_count + 1e-6)
+        stats[ratio] = {
+            'precision': precision.mean(),
+            'recall': recall.mean(),
+            'iou': (inter / (union + 1e-6)).mean(),
+        }
+    return stats
 
 
 def make_guidance_features(
@@ -136,7 +223,13 @@ def guidance_prediction_losses(
         bce_weight=0.5,
         dice_weight=0.0,
         soft_iou_weight=0.0,
-        tv_weight=0.05):
+        tv_weight=0.05,
+        spatial_correlation_weight=0.0,
+        ranking_weight=0.0,
+        ranking_pairs=2048,
+        ranking_margin=0.05,
+        ranking_min_target_gap=0.05,
+        std_weight=0.0):
     target = target.detach().clamp(0, 1)
     pred = pred.clamp(1e-6, 1 - 1e-6)
     l1_loss = F.l1_loss(pred, target)
@@ -155,6 +248,15 @@ def guidance_prediction_losses(
     dice_loss = 1.0 - dice_score.mean()
     soft_iou_score = (inter + 1e-6) / (pred_sum + target_sum - inter + 1e-6)
     soft_iou_loss = 1.0 - soft_iou_score.mean()
+    spatial_correlation_loss = _spatial_correlation_loss(pred, target)
+    ranking_loss, ranking_valid_ratio = _pairwise_ranking_loss(
+        pred,
+        target,
+        num_pairs=ranking_pairs,
+        margin=ranking_margin,
+        min_target_gap=ranking_min_target_gap,
+    )
+    std_loss = _response_std_loss(pred, target)
     tv_loss = (
         (pred[:, :, :, 1:] - pred[:, :, :, :-1]).abs().mean() +
         (pred[:, :, 1:, :] - pred[:, :, :-1, :]).abs().mean()
@@ -165,6 +267,9 @@ def guidance_prediction_losses(
         bce_weight * bce_loss +
         dice_weight * dice_loss +
         soft_iou_weight * soft_iou_loss +
+        spatial_correlation_weight * spatial_correlation_loss +
+        ranking_weight * ranking_loss +
+        std_weight * std_loss +
         tv_weight * tv_loss
     )
     return {
@@ -174,6 +279,10 @@ def guidance_prediction_losses(
         'bce_loss': bce_loss,
         'dice_loss': dice_loss,
         'soft_iou_loss': soft_iou_loss,
+        'spatial_correlation_loss': spatial_correlation_loss,
+        'ranking_loss': ranking_loss,
+        'ranking_valid_ratio': ranking_valid_ratio,
+        'std_loss': std_loss,
         'tv_loss': tv_loss,
     }
 
