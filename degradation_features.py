@@ -44,6 +44,82 @@ def local_variance(x, kernel_size=5):
     return (mean_sq - mean * mean).clamp_min(0)
 
 
+def _mean_normalize_map(x, clip=5.0, eps=1e-6):
+    scale = x.mean(dim=(2, 3), keepdim=True).clamp_min(eps)
+    return (x / scale / float(clip)).clamp(0, 1)
+
+
+def boundary_anomaly_map(x, neighborhood=8):
+    """Detect unusually strong local discontinuities without a fixed grid."""
+    response = gradient_magnitude(x)
+    kernel_size = max(3, int(neighborhood) | 1)
+    pad = kernel_size // 2
+    padded = F.pad(response, (pad, pad, pad, pad), mode='reflect')
+    local_mean = F.avg_pool2d(padded, kernel_size=kernel_size, stride=1)
+    return F.relu(response - local_mean) / (local_mean + 1e-6)
+
+
+def ringing_response(x):
+    """Return a grid-free band-pass cue for ringing-like oscillations."""
+    fine = high_frequency_magnitude(x, kernel_size=3)
+    coarse = high_frequency_magnitude(x, kernel_size=7)
+    return F.relu(fine - coarse)
+
+
+def make_utility_features(
+        lq,
+        base,
+        guidance,
+        detail_gate,
+        rate_cond=None,
+        use_artifact_features=True):
+    """Build pre-diffusion, no-GT features for block utility prediction."""
+    if lq.shape != base.shape:
+        raise ValueError('lq and base should have the same shape.')
+    lq = _to_gray(lq)
+    base = _to_gray(base)
+    guidance = _to_gray(guidance).clamp(0, 1)
+    detail_gate = _to_gray(detail_gate).clamp(0, 1)
+    if guidance.shape != lq.shape or detail_gate.shape != lq.shape:
+        raise ValueError('guidance and detail_gate should match lq spatially.')
+
+    residual = _mean_normalize_map((base - lq).abs())
+    grad_lq = _mean_normalize_map(gradient_magnitude(lq))
+    grad_base = _mean_normalize_map(gradient_magnitude(base))
+    hf_lq = _mean_normalize_map(high_frequency_magnitude(lq, kernel_size=5))
+    hf_base = _mean_normalize_map(high_frequency_magnitude(base, kernel_size=5))
+    var_lq = _mean_normalize_map(local_variance(lq, kernel_size=5))
+    var_base = _mean_normalize_map(local_variance(base, kernel_size=5))
+
+    batch_size, _, height, width = lq.shape
+    qp = normalized_qp_from_rate_cond(rate_cond, batch_size, lq.device)
+    qp_map = qp[:, :, None, None].expand(-1, -1, height, width)
+    features = [
+        lq,
+        base,
+        residual,
+        grad_lq,
+        grad_base,
+        hf_lq,
+        hf_base,
+        var_lq,
+        var_base,
+        guidance,
+        detail_gate,
+        qp_map,
+    ]
+    if use_artifact_features:
+        for source in (lq, base):
+            for scale in (8, 16, 32):
+                features.append(
+                    _mean_normalize_map(
+                        boundary_anomaly_map(source, neighborhood=scale)
+                    )
+                )
+            features.append(_mean_normalize_map(ringing_response(source)))
+    return torch.cat(features, dim=1)
+
+
 def blockiness_score(x, block_size=8):
     x = _to_gray(x)
     h, w = x.shape[-2:]
@@ -110,4 +186,3 @@ def summarize_budget_features(lq, base, guidance=None, rate_cond=None):
     else:
         feature_parts.append(lq.new_zeros((b, 3)))
     return torch.cat(feature_parts, dim=1)
-

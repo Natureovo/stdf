@@ -1,12 +1,10 @@
 import argparse
 import json
-import math
 import os
 import os.path as op
 from collections import OrderedDict, defaultdict
 
 import torch
-import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
@@ -15,6 +13,12 @@ import dataset
 import utils
 from net_grdr import gradient_magnitude, high_frequency
 from net_hybrid import build_hybrid_stdf_grdr
+from net_utility_mask import (
+    block_utility_scores,
+    top_block_mask,
+    utility_ratio_key,
+    utility_top_ratio_overlap_stats,
+)
 
 
 def parse_args():
@@ -25,6 +29,7 @@ def parse_args():
     parser.add_argument('--stdf_ckpt', required=True)
     parser.add_argument('--grdr_ckpt', required=True)
     parser.add_argument('--guidance_ckpt', default=None)
+    parser.add_argument('--utility_ckpt', default=None)
     parser.add_argument('--split', choices=['train', 'val', 'test'], default='val')
     parser.add_argument(
         '--guidance_mode',
@@ -62,11 +67,12 @@ def parse_args():
     )
     parser.add_argument(
         '--mask_mode',
-        choices=['soft', 'top_ratio'],
+        choices=['soft', 'top_ratio', 'utility_predicted'],
         default='soft',
         help=(
             'soft reproduces full-frame soft blending; top_ratio restricts '
-            'write-back to the highest-guidance spatial support.'
+            'write-back to the highest-guidance spatial support; '
+            'utility_predicted uses a no-GT block utility checkpoint.'
         ),
     )
     parser.add_argument(
@@ -113,7 +119,7 @@ def parse_args():
 
 
 def load_opts(path):
-    with open(path, 'r') as fp:
+    with open(path, 'r', encoding='utf-8') as fp:
         return yaml.load(fp, Loader=yaml.FullLoader)
 
 
@@ -155,6 +161,21 @@ def load_grdr_weights(diffusion, path):
         if key.startswith('diffusion.'):
             diffusion_state[key[len('diffusion.'):]] = value
     diffusion.load_state_dict(diffusion_state or state_dict, strict=True)
+
+
+def load_utility_weights(utility_net, path):
+    state_dict, checkpoint = load_state_dict(path)
+    if 'utility_state_dict' in checkpoint:
+        utility_net.load_state_dict(
+            checkpoint['utility_state_dict'],
+            strict=True,
+        )
+        return
+    utility_state = OrderedDict()
+    for key, value in state_dict.items():
+        if key.startswith('utility_mask_net.'):
+            utility_state[key[len('utility_mask_net.'):]] = value
+    utility_net.load_state_dict(utility_state or state_dict, strict=True)
 
 
 def make_rate_cond(batch_size, device, rate_dim, qp):
@@ -322,74 +343,6 @@ def make_effective_mask(
     return support_mask, write_mask, write_mask * detail_gate
 
 
-def block_utility_scores(base, gt, correction, residual_scale, block_size):
-    """Return mean MSE reduction for each spatial block."""
-    candidate = (base + residual_scale * correction).clamp(0, 1)
-    utility = (base - gt).square() - (candidate - gt).square()
-    utility = utility.mean(dim=1, keepdim=True)
-    _, _, height, width = utility.shape
-    pad_h = (-height) % block_size
-    pad_w = (-width) % block_size
-    utility = F.pad(utility, (0, pad_w, 0, pad_h))
-    valid = F.pad(
-        torch.ones_like(base[:, :1]),
-        (0, pad_w, 0, pad_h),
-    )
-    block_area = float(block_size * block_size)
-    utility_sum = F.avg_pool2d(
-        utility,
-        kernel_size=block_size,
-        stride=block_size,
-    ) * block_area
-    valid_count = F.avg_pool2d(
-        valid,
-        kernel_size=block_size,
-        stride=block_size,
-    ) * block_area
-    return utility_sum / valid_count.clamp_min(1.0)
-
-
-def top_block_mask(block_scores, output_size, block_size, top_ratio):
-    """Select an exact top-ratio block budget and expand it to pixels."""
-    batch_size = block_scores.size(0)
-    flat_scores = block_scores.reshape(batch_size, -1)
-    block_count = flat_scores.size(1)
-    selected_count = max(1, int(math.ceil(block_count * top_ratio)))
-    selected_count = min(selected_count, block_count)
-    top_indices = flat_scores.topk(selected_count, dim=1).indices
-    flat_mask = torch.zeros_like(flat_scores)
-    flat_mask.scatter_(1, top_indices, 1.0)
-    block_mask = flat_mask.view_as(block_scores)
-    pixel_mask = F.interpolate(
-        block_mask,
-        scale_factor=block_size,
-        mode='nearest',
-    )
-    height, width = output_size
-    pixel_mask = pixel_mask[..., :height, :width]
-    positive = flat_scores > 0
-    selected_positive = (
-        positive.to(flat_mask.dtype) * flat_mask
-    ).sum(dim=1) / flat_mask.sum(dim=1).clamp_min(1.0)
-    selected_score = (
-        flat_scores * flat_mask
-    ).sum(dim=1) / flat_mask.sum(dim=1).clamp_min(1.0)
-    diagnostics = {
-        'block_count': block_count,
-        'selected_block_count': selected_count,
-        'block_support_ratio': selected_count / float(block_count),
-        'pixel_support_ratio': float(pixel_mask.mean().cpu()),
-        'positive_block_ratio': float(positive.float().mean().cpu()),
-        'selected_positive_ratio': float(selected_positive.mean().cpu()),
-        'selected_utility_mean': float(selected_score.mean().cpu()),
-    }
-    return pixel_mask, diagnostics
-
-
-def utility_ratio_key(ratio):
-    return f'{ratio:.6f}'.rstrip('0').rstrip('.')
-
-
 def distribution_summary(total, total_square, positive_count, count):
     count = max(int(count), 1)
     mean = total / count
@@ -421,11 +374,27 @@ def main():
         raise ValueError(
             '--guidance_ckpt is required when either guidance role uses predicted.'
         )
-    if args.mask_mode == 'top_ratio':
+    if args.mask_mode in ('top_ratio', 'utility_predicted'):
         if args.top_ratio is None:
-            raise ValueError('--top_ratio is required for --mask_mode top_ratio.')
+            raise ValueError(
+                '--top_ratio is required for top-ratio and utility masks.'
+            )
         if not 0.0 < args.top_ratio <= 1.0:
             raise ValueError('--top_ratio should be in (0, 1].')
+    if args.mask_mode == 'utility_predicted':
+        if args.utility_ckpt is None:
+            raise ValueError(
+                '--utility_ckpt is required for --mask_mode utility_predicted.'
+            )
+        if mask_guidance_mode != 'predicted':
+            raise ValueError(
+                'utility_predicted requires predicted mask guidance so the '
+                'main path remains GT-free.'
+            )
+        if args.mask_weight_mode != 'binary':
+            raise ValueError(
+                'utility_predicted currently requires --mask_weight_mode binary.'
+            )
     if args.oracle_utility_diagnostic:
         if args.utility_block_size <= 0:
             raise ValueError('--utility_block_size should be positive.')
@@ -442,10 +411,12 @@ def main():
     opts = load_opts(args.opt_path)
     diffusion_opts = opts['network'].get('diffusion', {})
     guidance_opts = opts['network'].get('guidance_net', {})
+    utility_opts = opts['network'].get('utility_mask', {})
     hf_kernel = int(diffusion_opts.get('target_highfreq_kernel', 5))
     rate_dim = max(
         int(diffusion_opts.get('rate_dim', 0)),
         int(guidance_opts.get('rate_dim', 0)) if needs_predicted_guidance else 0,
+        1 if args.mask_mode == 'utility_predicted' else 0,
     )
 
     split_opts = dict(opts['dataset'][args.split])
@@ -476,6 +447,11 @@ def main():
     load_grdr_weights(model.diffusion, args.grdr_ckpt)
     if needs_predicted_guidance:
         load_guidance_weights(model.guidance_net, args.guidance_ckpt)
+    if args.mask_mode == 'utility_predicted':
+        load_utility_weights(model.utility_mask_net, args.utility_ckpt)
+        configured_block_size = int(utility_opts.get('block_size', 16))
+        if configured_block_size != model.utility_mask_net.block_size:
+            raise ValueError('Utility block size does not match the built model.')
     model = model.to(device)
     model.eval()
 
@@ -537,14 +513,33 @@ def main():
                 mask_guidance,
                 rate_cond=diffusion_rate,
             )
-            support_mask, write_mask, effective_mask = make_effective_mask(
-                model.diffusion,
-                mask_guidance,
-                detail_gate,
-                args.mask_mode,
-                args.top_ratio,
-                args.mask_weight_mode,
-            )
+            pred_utility_score = None
+            utility_mask_diag = None
+            if args.mask_mode == 'utility_predicted':
+                pred_utility_score = model.predict_utility_scores(
+                    lq_center,
+                    base,
+                    mask_guidance,
+                    detail_gate,
+                    rate_cond=rate_cond,
+                )
+                support_mask, utility_mask_diag = top_block_mask(
+                    pred_utility_score,
+                    base.shape[-2:],
+                    model.utility_mask_net.block_size,
+                    args.top_ratio,
+                )
+                write_mask = support_mask
+                effective_mask = write_mask * detail_gate
+            else:
+                support_mask, write_mask, effective_mask = make_effective_mask(
+                    model.diffusion,
+                    mask_guidance,
+                    detail_gate,
+                    args.mask_mode,
+                    args.top_ratio,
+                    args.mask_weight_mode,
+                )
             name = data['name_vid'][0]
             initial_noise = None
             if args.noise_mode == 'shared':
@@ -576,6 +571,35 @@ def main():
                 lq_center,
                 base,
             )
+            if pred_utility_score is not None:
+                actual_utility = block_utility_scores(
+                    base,
+                    gt,
+                    detail_gate * pred_correction,
+                    args.residual_scale,
+                    model.utility_mask_net.block_size,
+                )
+                overlap = utility_top_ratio_overlap_stats(
+                    pred_utility_score,
+                    actual_utility,
+                    [args.top_ratio],
+                )[float(args.top_ratio)]
+                totals['utility_score_mean'] += float(
+                    pred_utility_score.mean().cpu()
+                )
+                totals['utility_score_std'] += float(
+                    pred_utility_score.std(unbiased=False).cpu()
+                )
+                totals['actual_utility_positive_ratio'] += float(
+                    (actual_utility > 0).float().mean().cpu()
+                )
+                totals['utility_top_precision'] += float(
+                    overlap['precision'].cpu()
+                )
+                totals['utility_top_recall'] += float(overlap['recall'].cpu())
+                totals['utility_top_iou'] += float(overlap['iou'].cpu())
+                for key, value in utility_mask_diag.items():
+                    totals[f'utility_mask_{key}'] += float(value)
             pred_unit_correction = effective_mask * pred_correction
             refined = (
                 base + args.residual_scale * pred_unit_correction
@@ -800,6 +824,41 @@ def main():
                     },
                 }
             utility_report['sources'][utility_source] = source_report
+    predicted_utility_report = {
+        'enabled': args.mask_mode == 'utility_predicted',
+    }
+    if args.mask_mode == 'utility_predicted':
+        count = max(sample_count, 1)
+        predicted_utility_report.update({
+            'checkpoint': args.utility_ckpt,
+            'block_size': model.utility_mask_net.block_size,
+            'top_ratio': args.top_ratio,
+            'use_artifact_features': model.utility_mask_net.use_artifact_features,
+            'selection_uses_gt': False,
+            'score_mean': totals['utility_score_mean'] / count,
+            'score_std': totals['utility_score_std'] / count,
+            'selection_diagnostics': {
+                key: totals[f'utility_mask_{key}'] / count
+                for key in [
+                    'block_count',
+                    'selected_block_count',
+                    'block_support_ratio',
+                    'pixel_support_ratio',
+                    'positive_block_ratio',
+                    'selected_positive_ratio',
+                    'selected_utility_mean',
+                ]
+            },
+            'gt_diagnostics': {
+                'uses_gt': True,
+                'actual_positive_ratio': (
+                    totals['actual_utility_positive_ratio'] / count
+                ),
+                'top_precision': totals['utility_top_precision'] / count,
+                'top_recall': totals['utility_top_recall'] / count,
+                'top_iou': totals['utility_top_iou'] / count,
+            },
+        })
     report = {
         'split': args.split,
         'samples': sample_count,
@@ -852,6 +911,7 @@ def main():
         'frame_psnr_delta_distribution': frame_psnr_distribution,
         'oracle_frame_psnr_delta_distribution': oracle_psnr_distribution,
         'oracle_utility_diagnostic': utility_report,
+        'predicted_utility_mask': predicted_utility_report,
         'correction_diagnostics': {
             'prior': pair_diagnostics(totals, 'prior'),
             'applied_unit_correction': pair_diagnostics(totals, 'correction'),
@@ -963,6 +1023,29 @@ def main():
         f"{frame_psnr_distribution['win_rate']:.4f}/"
         f"{oracle_psnr_distribution['win_rate']:.4f}"
     )
+    if args.mask_mode == 'utility_predicted':
+        utility_pred = report['predicted_utility_mask']
+        selection = utility_pred['selection_diagnostics']
+        gt_diag = utility_pred['gt_diagnostics']
+        print('\n-- Predicted utility mask --')
+        print(
+            f"block/top ratio/artifact features: "
+            f"{utility_pred['block_size']}/{utility_pred['top_ratio']:.4f}/"
+            f"{utility_pred['use_artifact_features']}"
+        )
+        print(
+            'score mean/std, block/pixel area: '
+            f"{utility_pred['score_mean']:.6f}/"
+            f"{utility_pred['score_std']:.6f}, "
+            f"{selection['block_support_ratio']:.4f}/"
+            f"{selection['pixel_support_ratio']:.4f}"
+        )
+        print(
+            'GT diagnostic positive ratio, top precision/IoU: '
+            f"{gt_diag['actual_positive_ratio']:.4f}/"
+            f"{gt_diag['top_precision']:.4f}/"
+            f"{gt_diag['top_iou']:.4f}"
+        )
     if args.oracle_utility_diagnostic:
         print('\n-- GT-only block utility upper bounds --')
         print(
