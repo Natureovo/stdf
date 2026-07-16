@@ -223,6 +223,7 @@ class TemporalDetailPriorNet(nn.Module):
             use_guidance_input=True,
             use_aligned_features=False,
             aligned_feature_channels=64,
+            use_global_modulation=True,
             prediction_mode='carrier_amplitude',
             amplitude_prediction_scale=1,
             amplitude_clip=0.05,
@@ -239,6 +240,7 @@ class TemporalDetailPriorNet(nn.Module):
         self.use_guidance_input = bool(use_guidance_input)
         self.use_aligned_features = bool(use_aligned_features)
         self.aligned_feature_channels = int(aligned_feature_channels)
+        self.use_global_modulation = bool(use_global_modulation)
         self.prediction_mode = str(prediction_mode)
         if self.prediction_mode not in ('carrier_amplitude', 'free_residual'):
             raise ValueError(
@@ -448,10 +450,15 @@ class TemporalDetailPriorNet(nn.Module):
             enc2 = enc2 + injection2
             aligned_injections.append(injection2)
         mid = self.mid(enc2)
-        scale, shift = torch.chunk(self.global_modulation(enc2), 2, dim=1)
-        scale = scale[:, :, None, None]
-        shift = shift[:, :, None, None]
-        mid = mid * (1.0 + 0.1 * torch.tanh(scale)) + 0.1 * shift
+        if self.use_global_modulation:
+            scale, shift = torch.chunk(
+                self.global_modulation(enc2),
+                2,
+                dim=1,
+            )
+            scale = scale[:, :, None, None]
+            shift = shift[:, :, None, None]
+            mid = mid * (1.0 + 0.1 * torch.tanh(scale)) + 0.1 * shift
         if self.use_full_decoder:
             up1 = F.interpolate(
                 mid,
@@ -938,6 +945,7 @@ def build_temporal_detail_prior(
             'aligned_feature_channels',
             aligned_feature_channels,
         ),
+        use_global_modulation=opts.get('use_global_modulation', True),
         prediction_mode=opts.get(
             'prediction_mode',
             'carrier_amplitude',

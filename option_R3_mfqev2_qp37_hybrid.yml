@@ -183,6 +183,7 @@ network:
     # three prior scales.
     use_aligned_features: true
     aligned_feature_channels: 64
+    use_global_modulation: true
     # Decisive baseline: remove the carrier parameterization and predict a
     # bounded full-resolution residual through the complete U-Net decoder.
     prediction_mode: free_residual

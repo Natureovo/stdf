@@ -9,7 +9,10 @@ from tqdm import tqdm
 
 import dataset
 from net_hybrid import build_hybrid_stdf_grdr
-from net_temporal_detail_prior import temporal_detail_prior_losses
+from net_temporal_detail_prior import (
+    make_carrier_direction,
+    temporal_detail_prior_losses,
+)
 from train_temporal_detail_prior import flatten_temporal_lq, make_rate_cond
 
 
@@ -31,6 +34,25 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--qp', type=float, default=None)
     parser.add_argument('--max_samples', type=int, default=None)
+    parser.add_argument(
+        '--inference_mode',
+        choices=['full', 'tile'],
+        default='full',
+        help='Run the prior on the full frame or overlapping spatial tiles.',
+    )
+    parser.add_argument('--tile_size', type=int, default=128)
+    parser.add_argument('--tile_overlap', type=int, default=32)
+    parser.add_argument(
+        '--disable_global_modulation',
+        action='store_true',
+        help='Bypass whole-input pooled modulation without changing weights.',
+    )
+    parser.add_argument(
+        '--train_crop_size',
+        type=int,
+        default=None,
+        help='Deterministic center crop used only with --split train.',
+    )
     parser.add_argument(
         '--amplitude_prediction_scale',
         type=int,
@@ -158,6 +180,8 @@ def selected_indices(ds, max_samples, mode):
     if mode == 'uniform':
         return evenly_spaced(range(len(ds)), total)
     names = getattr(ds, 'data_info', {}).get('name_vid')
+    if not names and hasattr(ds, 'keys'):
+        names = [str(key).split('/')[0] for key in ds.keys]
     if not names or len(names) != len(ds):
         return evenly_spaced(range(len(ds)), total)
     groups = OrderedDict()
@@ -189,6 +213,144 @@ def batch_frame_indices(batch, batch_size):
     return [int(values)]
 
 
+def tile_starts(length, tile_size, overlap):
+    tile_size = min(int(tile_size), int(length))
+    overlap = int(overlap)
+    if tile_size <= 0:
+        raise ValueError('--tile_size should be positive.')
+    if overlap < 0:
+        raise ValueError('--tile_overlap should be non-negative.')
+    if tile_size == length:
+        return [0], tile_size
+    if overlap >= tile_size:
+        raise ValueError('--tile_overlap should be smaller than tile_size.')
+    stride = tile_size - overlap
+    starts = list(range(0, length - tile_size + 1, stride))
+    last = length - tile_size
+    if starts[-1] != last:
+        starts.append(last)
+    return starts, tile_size
+
+
+def tile_blend_window(height, width, reference):
+    def axis_window(length):
+        if length == 1:
+            return reference.new_ones(1)
+        return torch.hann_window(
+            length,
+            periodic=False,
+            device=reference.device,
+            dtype=reference.dtype,
+        ).clamp_min(1e-3)
+
+    return (
+        axis_window(height)[:, None] * axis_window(width)[None, :]
+    )[None, None]
+
+
+def predict_temporal_prior_tiled(
+        model,
+        temporal_lq,
+        base,
+        guidance,
+        rate_cond,
+        aligned_features,
+        tile_size,
+        tile_overlap):
+    """Blend prior predictions while keeping the STDF base fixed."""
+    if base.size(0) != 1:
+        raise ValueError('Tile inference currently requires --batch_size 1.')
+    prior = model.temporal_detail_prior
+    if prior.amplitude_prediction_scale != 1:
+        raise ValueError('Tile inference requires amplitude_prediction_scale=1.')
+    y_starts, tile_height = tile_starts(
+        base.size(-2),
+        tile_size,
+        tile_overlap,
+    )
+    x_starts, tile_width = tile_starts(
+        base.size(-1),
+        tile_size,
+        tile_overlap,
+    )
+    if len(y_starts) == 1 and len(x_starts) == 1:
+        return model.predict_temporal_detail_prior(
+            temporal_lq,
+            base,
+            guidance=guidance,
+            rate_cond=rate_cond,
+            aligned_features=aligned_features,
+            return_aux=True,
+        )
+    signal_sum = torch.zeros_like(base)
+    weight_sum = torch.zeros_like(base)
+    injection_sum = base.new_zeros(())
+    area_sum = 0
+    for top in y_starts:
+        for left in x_starts:
+            bottom = top + tile_height
+            right = left + tile_width
+            tile_aligned = (
+                aligned_features[..., top:bottom, left:right]
+                if aligned_features is not None else None
+            )
+            tile_signal, tile_aux = model.predict_temporal_detail_prior(
+                temporal_lq[..., top:bottom, left:right],
+                base[..., top:bottom, left:right],
+                guidance=guidance[..., top:bottom, left:right],
+                rate_cond=rate_cond,
+                aligned_features=tile_aligned,
+                return_aux=True,
+            )
+            window = tile_blend_window(
+                tile_signal.size(-2),
+                tile_signal.size(-1),
+                tile_signal,
+            )
+            signal_sum[..., top:bottom, left:right] += tile_signal * window
+            weight_sum[..., top:bottom, left:right] += window
+            tile_area = tile_signal.size(-2) * tile_signal.size(-1)
+            injection_sum += tile_aux['aligned_injection_abs'] * tile_area
+            area_sum += tile_area
+    signal = signal_sum / weight_sum.clamp_min(1e-8)
+    center = prior.center_frame(temporal_lq)
+    carrier, direction, carrier_rms = make_carrier_direction(
+        center,
+        base,
+        source=prior.carrier_source,
+        kernel_size=prior.carrier_kernel,
+        norm_window=prior.carrier_norm_window,
+        norm_clip=prior.carrier_norm_clip,
+        eps=prior.ridge_eps,
+    )
+    if prior.prediction_mode == 'free_residual':
+        correction = signal
+    else:
+        correction = signal * direction
+        if prior.correction_clip > 0:
+            correction = correction.clamp(
+                -prior.correction_clip,
+                prior.correction_clip,
+            )
+    aux = {
+        'prediction_mode': prior.prediction_mode,
+        'amplitude': signal,
+        'amplitude_native': signal,
+        'amplitude_prediction_scale': base.new_ones(()),
+        'correction': correction,
+        'carrier': carrier,
+        'direction': direction,
+        'carrier_rms': carrier_rms,
+        'center': center,
+        'aligned_feature_abs': (
+            aligned_features.abs().mean()
+            if aligned_features is not None else base.new_zeros(())
+        ),
+        'aligned_injection_abs': injection_sum / max(area_sum, 1),
+    }
+    return signal, aux
+
+
 def main():
     args = parse_args()
     opts = load_opts(args.opt_path)
@@ -204,6 +366,10 @@ def main():
         opts['network']['temporal_detail_prior'][
             'supervision_mode'
         ] = args.supervision_mode
+    if args.disable_global_modulation:
+        opts['network']['temporal_detail_prior'][
+            'use_global_modulation'
+        ] = False
     prior_opts = opts['network'].get('temporal_detail_prior', {})
     supervision_mode = prior_opts.get('supervision_mode', 'analytic')
     prediction_mode = prior_opts.get('prediction_mode', 'carrier_amplitude')
@@ -221,7 +387,15 @@ def main():
     split_opts = dict(opts['dataset'][args.split])
     split_opts['use_flip'] = False
     split_opts['use_rot'] = False
-    split_opts.pop('gt_size', None)
+    if args.split == 'train':
+        split_opts['random_reverse'] = False
+        split_opts['crop_mode'] = 'center'
+        if args.train_crop_size is not None:
+            split_opts['gt_size'] = args.train_crop_size
+        if 'gt_size' not in split_opts:
+            raise ValueError('The train split requires gt_size for center crops.')
+    else:
+        split_opts.pop('gt_size', None)
     ds_cls = getattr(dataset, split_opts['type'])
     source_ds = ds_cls(
         opts_dict=split_opts,
@@ -253,6 +427,8 @@ def main():
         load_guidance_weights(model.guidance_net, args.guidance_ckpt)
     model = model.to(device)
     model.eval()
+    if args.inference_mode == 'tile' and args.batch_size != 1:
+        raise ValueError('Use --batch_size 1 with --inference_mode tile.')
 
     totals = defaultdict(float)
     sample_count = 0
@@ -327,14 +503,26 @@ def main():
                     base,
                     rate_cond=rate_cond,
                 )
-            amplitude, aux = model.predict_temporal_detail_prior(
-                temporal_lq,
-                base,
-                guidance=guidance,
-                rate_cond=rate_cond,
-                aligned_features=aligned_features,
-                return_aux=True,
-            )
+            if args.inference_mode == 'tile':
+                amplitude, aux = predict_temporal_prior_tiled(
+                    model,
+                    temporal_lq,
+                    base,
+                    guidance,
+                    rate_cond,
+                    aligned_features,
+                    tile_size=args.tile_size,
+                    tile_overlap=args.tile_overlap,
+                )
+            else:
+                amplitude, aux = model.predict_temporal_detail_prior(
+                    temporal_lq,
+                    base,
+                    guidance=guidance,
+                    rate_cond=rate_cond,
+                    aligned_features=aligned_features,
+                    return_aux=True,
+                )
             metrics = temporal_detail_prior_losses(
                 amplitude,
                 aux,
@@ -420,6 +608,17 @@ def main():
         'samples': sample_count,
         'source_samples': source_count,
         'sample_mode': args.sample_mode,
+        'inference_mode': args.inference_mode,
+        'tile_size': args.tile_size if args.inference_mode == 'tile' else None,
+        'tile_overlap': (
+            args.tile_overlap if args.inference_mode == 'tile' else None
+        ),
+        'global_modulation': bool(
+            model.temporal_detail_prior.use_global_modulation
+        ),
+        'train_crop_size': (
+            split_opts.get('gt_size') if args.split == 'train' else None
+        ),
         'temporal_pairs': temporal_pairs,
         'temporal_base_error': (
             temporal_base_error / max(temporal_pairs, 1)
@@ -438,6 +637,13 @@ def main():
         f"split/sampling: {args.split}/{args.sample_mode}, "
         f"samples: {sample_count}/{source_count}, guidance: {args.guidance_mode}, "
         f"supervision/prediction: {supervision_mode}/{prediction_mode}"
+    )
+    print(
+        f"inference/global modulation: {args.inference_mode}/"
+        f"{model.temporal_detail_prior.use_global_modulation}, "
+        f"tile size/overlap: "
+        f"{result['tile_size']}/{result['tile_overlap']}, "
+        f"train crop: {result['train_crop_size']}"
     )
     print(
         'PSNR base/prior/diagnostic/delta/diagnostic-delta: '

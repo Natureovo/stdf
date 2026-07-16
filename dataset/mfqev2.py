@@ -44,6 +44,25 @@ def _keep_video(video_id, opts_dict):
     return video_id not in exclude_ids
 
 
+def _paired_center_crop(img_gt, img_lqs, crop_size, gt_path):
+    """Deterministic counterpart of paired_random_crop for diagnostics."""
+    crop_size = int(crop_size)
+    height, width = img_gt.shape[:2]
+    if crop_size > height or crop_size > width:
+        raise ValueError(
+            f'Crop size {crop_size} exceeds image size '
+            f'{height}x{width} for {gt_path}.'
+        )
+    top = (height - crop_size) // 2
+    left = (width - crop_size) // 2
+    img_gt = img_gt[top:top + crop_size, left:left + crop_size, ...]
+    img_lqs = [
+        image[top:top + crop_size, left:left + crop_size, ...]
+        for image in img_lqs
+    ]
+    return img_gt, img_lqs
+
+
 class MFQEv2Dataset(data.Dataset):
     """MFQEv2 dataset.
 
@@ -138,9 +157,18 @@ class MFQEv2Dataset(data.Dataset):
         # data augmentation
         # ==========
         
-        # randomly crop
-        img_gt, img_lqs = paired_random_crop(
-            img_gt, img_lqs, gt_size, img_gt_path
+        crop_mode = self.opts_dict.get('crop_mode', 'random')
+        if crop_mode == 'random':
+            img_gt, img_lqs = paired_random_crop(
+                img_gt, img_lqs, gt_size, img_gt_path
+                )
+        elif crop_mode == 'center':
+            img_gt, img_lqs = _paired_center_crop(
+                img_gt, img_lqs, gt_size, img_gt_path
+                )
+        else:
+            raise ValueError(
+                f'Unsupported MFQEv2 training crop mode: {crop_mode}'
             )
 
         # flip, rotate
