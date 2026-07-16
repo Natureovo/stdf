@@ -832,6 +832,7 @@ class HybridSTDFGRDR(nn.Module):
             aux,
             base.detach() if freeze_base else base,
             gt,
+            supervision_mode=opts.get('supervision_mode', 'analytic'),
             guidance=guidance,
             apply_guidance_gate=opts.get('apply_guidance_gate', False),
             guidance_floor=opts.get('guidance_floor', 0.0),
@@ -843,6 +844,13 @@ class HybridSTDFGRDR(nn.Module):
             gradient_weight=opts.get('gradient_weight', 0.1),
             degrade_weight=opts.get('degrade_weight', 0.0),
             tv_weight=opts.get('tv_weight', 0.001),
+            relative_reconstruction_weight=opts.get(
+                'relative_reconstruction_weight', 1.0
+            ),
+            relative_highfreq_weight=opts.get(
+                'relative_highfreq_weight', 0.1
+            ),
+            relative_eps=opts.get('relative_eps', 1e-6),
             carrier_source=opts.get('carrier_source', 'base'),
             carrier_kernel=opts.get('carrier_kernel', 5),
             carrier_norm_window=opts.get('carrier_norm_window', 9),

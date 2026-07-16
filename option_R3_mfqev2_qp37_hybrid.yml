@@ -195,16 +195,24 @@ network:
     correction_clip: 0.05
     ridge_eps: !!float 1e-3
     target_safe_scale: true
+    # Main experiment: analytic amplitude remains diagnostic only. Gradients
+    # come from the final reconstruction and high-frequency fidelity.
+    supervision_mode: target_free
     apply_guidance_gate: false
     guidance_floor: 0.0
     correction_scale: 1.0
+    # Used only when supervision_mode is analytic.
     amplitude_weight: 1.0
     correction_weight: 2.0
     reconstruction_weight: 1.0
     highfreq_weight: 0.5
     gradient_weight: 0.1
     degrade_weight: 0.0
-    tv_weight: 0.001
+    # Target-free objective, normalized per sample by frozen STDF error.
+    relative_reconstruction_weight: 1.0
+    relative_highfreq_weight: 0.1
+    relative_eps: !!float 1e-6
+    tv_weight: 0.01
 
   detail_guidance:
     gradient_weight: 0.35

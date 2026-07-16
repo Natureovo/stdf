@@ -530,6 +530,15 @@ def _psnr_per_sample(pred, target):
     return -10.0 * torch.log10(mse)
 
 
+def _relative_mse_loss(pred, target, reference, eps=1e-6):
+    """Normalize each sample by its frozen reference error."""
+    pred_error = (pred - target).square().flatten(1).mean(dim=1)
+    reference_error = (
+        (reference - target).square().flatten(1).mean(dim=1).detach()
+    )
+    return (pred_error / (reference_error + float(eps))).mean()
+
+
 def _project_target_to_native_amplitude(
         target,
         base,
@@ -587,6 +596,7 @@ def temporal_detail_prior_losses(
         aux,
         base,
         gt,
+        supervision_mode='analytic',
         guidance=None,
         apply_guidance_gate=False,
         guidance_floor=0.0,
@@ -598,6 +608,9 @@ def temporal_detail_prior_losses(
         gradient_weight=0.1,
         degrade_weight=0.0,
         tv_weight=0.001,
+        relative_reconstruction_weight=1.0,
+        relative_highfreq_weight=0.1,
+        relative_eps=1e-6,
         carrier_source='base',
         carrier_kernel=5,
         carrier_norm_window=9,
@@ -607,6 +620,12 @@ def temporal_detail_prior_losses(
         carrier_norm_clip=3.0,
         ridge_eps=1e-3,
         target_safe_scale=True):
+    if supervision_mode not in ('analytic', 'target_free'):
+        raise ValueError(
+            f'Unsupported temporal prior supervision_mode: '
+            f'{supervision_mode}'
+        )
+    analytic_supervision = supervision_mode == 'analytic'
     center = aux['center']
     amplitude_native = aux.get('amplitude_native', amplitude)
     uses_coarse_amplitude = (
@@ -642,6 +661,16 @@ def temporal_detail_prior_losses(
     target_amplitude_native = target['amplitude_native']
     target_correction = target['correction']
     pred_correction = aux['correction']
+    teacher_amplitude_native = (
+        amplitude_native
+        if analytic_supervision else
+        amplitude_native.detach()
+    )
+    teacher_pred_correction = (
+        pred_correction
+        if analytic_supervision else
+        pred_correction.detach()
+    )
 
     carrier_weight_native = F.adaptive_avg_pool2d(
         target['carrier_rms'],
@@ -659,11 +688,11 @@ def temporal_detail_prior_losses(
     ) * target_weight_native
     amplitude_loss = (
         _charbonnier(
-            amplitude_native - target_amplitude_native
+            teacher_amplitude_native - target_amplitude_native
         ) * amp_weight_map
     ).sum() / (amp_weight_map.sum() + 1e-6)
     correction_loss = _charbonnier(
-        pred_correction - target_correction
+        teacher_pred_correction - target_correction
     ).mean()
 
     if apply_guidance_gate:
@@ -676,17 +705,21 @@ def temporal_detail_prior_losses(
     target_applied_correction = float(correction_scale) * gate * target_correction
     refined = (base + applied_correction).clamp(0, 1)
     target_refined = (base + target_applied_correction).clamp(0, 1)
-    reconstruction_loss = _charbonnier(refined - gt).mean()
 
     refined_hf = high_frequency(refined, carrier_kernel)
     gt_hf = high_frequency(gt, carrier_kernel)
     base_hf = high_frequency(base, carrier_kernel)
-    highfreq_loss = _charbonnier(refined_hf - gt_hf).mean()
+    analytic_refined = refined if analytic_supervision else refined.detach()
+    analytic_refined_hf = (
+        refined_hf if analytic_supervision else refined_hf.detach()
+    )
+    reconstruction_loss = _charbonnier(analytic_refined - gt).mean()
+    highfreq_loss = _charbonnier(analytic_refined_hf - gt_hf).mean()
     gradient_loss = _charbonnier(
-        sobel_magnitude(refined) - sobel_magnitude(gt)
+        sobel_magnitude(analytic_refined) - sobel_magnitude(gt)
     ).mean()
     degrade_loss = F.relu(
-        (refined - gt).abs() - (base - gt).abs().detach()
+        (analytic_refined - gt).abs() - (base - gt).abs().detach()
     ).mean()
     amplitude_tv = (
         (
@@ -698,15 +731,35 @@ def temporal_detail_prior_losses(
             amplitude_native[:, :, :-1, :]
         ).abs().mean()
     )
-    total = (
-        float(amplitude_weight) * amplitude_loss +
-        float(correction_weight) * correction_loss +
-        float(reconstruction_weight) * reconstruction_loss +
-        float(highfreq_weight) * highfreq_loss +
-        float(gradient_weight) * gradient_loss +
-        float(degrade_weight) * degrade_loss +
-        float(tv_weight) * amplitude_tv
+    relative_reconstruction_loss = _relative_mse_loss(
+        refined,
+        gt,
+        base,
+        eps=relative_eps,
     )
+    relative_highfreq_loss = _relative_mse_loss(
+        refined_hf,
+        gt_hf,
+        base_hf,
+        eps=relative_eps,
+    )
+    if analytic_supervision:
+        total = (
+            float(amplitude_weight) * amplitude_loss +
+            float(correction_weight) * correction_loss +
+            float(reconstruction_weight) * reconstruction_loss +
+            float(highfreq_weight) * highfreq_loss +
+            float(gradient_weight) * gradient_loss +
+            float(degrade_weight) * degrade_loss +
+            float(tv_weight) * amplitude_tv
+        )
+    elif supervision_mode == 'target_free':
+        total = (
+            float(relative_reconstruction_weight) *
+            relative_reconstruction_loss +
+            float(relative_highfreq_weight) * relative_highfreq_loss +
+            float(tv_weight) * amplitude_tv
+        )
 
     with torch.no_grad():
         base_psnr = _psnr_per_sample(base, gt)
@@ -726,6 +779,8 @@ def temporal_detail_prior_losses(
         'gradient_loss': gradient_loss,
         'degrade_loss': degrade_loss,
         'amplitude_tv_loss': amplitude_tv,
+        'relative_reconstruction_loss': relative_reconstruction_loss,
+        'relative_highfreq_loss': relative_highfreq_loss,
         'refined': refined,
         'target_refined': target_refined,
         'target_amplitude': target_amplitude,
@@ -734,21 +789,29 @@ def temporal_detail_prior_losses(
         'applied_correction': applied_correction,
         'target_applied_correction': target_applied_correction,
         'gate': gate,
-        'amplitude_corr': _vector_correlation(amplitude, target_amplitude),
-        'amplitude_cosine': _vector_cosine(amplitude, target_amplitude),
+        'amplitude_corr': _vector_correlation(
+            amplitude.detach(), target_amplitude
+        ),
+        'amplitude_cosine': _vector_cosine(
+            amplitude.detach(), target_amplitude
+        ),
         'native_amplitude_corr': _vector_correlation(
-            amplitude_native,
+            amplitude_native.detach(),
             target_amplitude_native,
         ),
         'native_amplitude_cosine': _vector_cosine(
-            amplitude_native,
+            amplitude_native.detach(),
             target_amplitude_native,
         ),
-        'correction_corr': _vector_correlation(pred_correction, target_correction),
-        'correction_cosine': _vector_cosine(pred_correction, target_correction),
-        'pred_amplitude_abs': amplitude.abs().mean(),
+        'correction_corr': _vector_correlation(
+            pred_correction.detach(), target_correction
+        ),
+        'correction_cosine': _vector_cosine(
+            pred_correction.detach(), target_correction
+        ),
+        'pred_amplitude_abs': amplitude.detach().abs().mean(),
         'target_amplitude_abs': target_amplitude.abs().mean(),
-        'pred_correction_abs': pred_correction.abs().mean(),
+        'pred_correction_abs': pred_correction.detach().abs().mean(),
         'target_correction_abs': target_correction.abs().mean(),
         'target_positive_ratio': (target_amplitude > 1e-4).float().mean(),
         'target_negative_ratio': (target_amplitude < -1e-4).float().mean(),

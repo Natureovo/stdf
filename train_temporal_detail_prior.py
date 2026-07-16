@@ -40,6 +40,12 @@ def parse_args():
         help='Override native amplitude resolution; 4 predicts at 1/4 scale.',
     )
     parser.add_argument(
+        '--supervision_mode',
+        choices=['analytic', 'target_free'],
+        default=None,
+        help='Use target_free to optimize only final reconstruction quality.',
+    )
+    parser.add_argument(
         '--overfit_batches',
         type=int,
         default=0,
@@ -65,6 +71,10 @@ def load_opts(args):
         opts['network']['temporal_detail_prior'][
             'amplitude_prediction_scale'
         ] = args.amplitude_prediction_scale
+    if args.supervision_mode is not None:
+        opts['network']['temporal_detail_prior'][
+            'supervision_mode'
+        ] = args.supervision_mode
     base_name = args.exp_name or opts['train'].get('exp_name') or 'temporal_detail_prior'
     opts['train']['exp_name'] = '{}_temporal_prior_{}'.format(
         base_name,
@@ -157,6 +167,7 @@ def main():
     interval_print = int(opts['train']['interval_print'])
     interval_save = int(opts['train']['interval_val'])
     prior_opts = opts['network'].get('temporal_detail_prior', {})
+    supervision_mode = prior_opts.get('supervision_mode', 'analytic')
     guidance_opts = opts['network'].get('guidance_net', {})
     rate_dim = max(
         int(prior_opts.get('rate_dim', 0)),
@@ -178,6 +189,7 @@ def main():
         f"Timestamp: [{utils.get_timestr()}]\n"
         f"STDF checkpoint: [{args.stdf_ckpt}]\n"
         f"Guidance mode/checkpoint: [{args.guidance_mode}/{args.guidance_ckpt}]\n"
+        f"Supervision mode: [{supervision_mode}]\n"
         f"Overfit batches: [{args.overfit_batches}]\n"
         f"\n{'<' * 10} Options {'>' * 10}\n"
         f"{utils.dict2str(opts)}"
@@ -305,6 +317,10 @@ def main():
                 f"{scalar(outputs['reconstruction_loss']):.6f}], "
                 f"hf/grad: [{scalar(outputs['highfreq_loss']):.6f}/"
                 f"{scalar(outputs['gradient_loss']):.6f}], "
+                f"relative rec/hf, tv: "
+                f"[{scalar(outputs['relative_reconstruction_loss']):.6f}/"
+                f"{scalar(outputs['relative_highfreq_loss']):.6f}/"
+                f"{scalar(outputs['amplitude_tv_loss']):.6f}], "
                 f"amp corr/cos: [{scalar(outputs['amplitude_corr']):.4f}/"
                 f"{scalar(outputs['amplitude_cosine']):.4f}], "
                 f"native amp corr/cos: "
@@ -348,6 +364,7 @@ def main():
                     'guidance_mode': args.guidance_mode,
                     'guidance_ckpt': args.guidance_ckpt,
                     'overfit_batches': args.overfit_batches,
+                    'supervision_mode': supervision_mode,
                     'amplitude_prediction_scale': (
                         model.temporal_detail_prior.amplitude_prediction_scale
                     ),

@@ -39,6 +39,12 @@ def parse_args():
         help='Override native amplitude resolution for checkpoint compatibility.',
     )
     parser.add_argument(
+        '--supervision_mode',
+        choices=['analytic', 'target_free'],
+        default=None,
+        help='Override loss reporting mode; image metrics are unchanged.',
+    )
+    parser.add_argument(
         '--sample_mode',
         choices=['sequential', 'uniform', 'video_balanced'],
         default='video_balanced',
@@ -171,7 +177,12 @@ def main():
         opts['network']['temporal_detail_prior'][
             'amplitude_prediction_scale'
         ] = args.amplitude_prediction_scale
+    if args.supervision_mode is not None:
+        opts['network']['temporal_detail_prior'][
+            'supervision_mode'
+        ] = args.supervision_mode
     prior_opts = opts['network'].get('temporal_detail_prior', {})
+    supervision_mode = prior_opts.get('supervision_mode', 'analytic')
     guidance_opts = opts['network'].get('guidance_net', {})
     rate_dim = max(
         int(prior_opts.get('rate_dim', 0)),
@@ -253,6 +264,9 @@ def main():
         'base_hf_mae',
         'refined_hf_mae',
         'target_hf_mae',
+        'relative_reconstruction_loss',
+        'relative_highfreq_loss',
+        'amplitude_tv_loss',
     ]
 
     with torch.no_grad():
@@ -301,6 +315,7 @@ def main():
                 aux,
                 base,
                 gt,
+                supervision_mode=supervision_mode,
                 guidance=guidance,
                 apply_guidance_gate=prior_opts.get(
                     'apply_guidance_gate', False
@@ -316,6 +331,13 @@ def main():
                 gradient_weight=prior_opts.get('gradient_weight', 0.1),
                 degrade_weight=prior_opts.get('degrade_weight', 0.0),
                 tv_weight=prior_opts.get('tv_weight', 0.001),
+                relative_reconstruction_weight=prior_opts.get(
+                    'relative_reconstruction_weight', 1.0
+                ),
+                relative_highfreq_weight=prior_opts.get(
+                    'relative_highfreq_weight', 0.1
+                ),
+                relative_eps=prior_opts.get('relative_eps', 1e-6),
                 carrier_source=prior_opts.get('carrier_source', 'base'),
                 carrier_kernel=prior_opts.get('carrier_kernel', 5),
                 carrier_norm_window=prior_opts.get(
@@ -368,6 +390,7 @@ def main():
     result.update({
         'split': args.split,
         'guidance_mode': args.guidance_mode,
+        'supervision_mode': supervision_mode,
         'samples': sample_count,
         'source_samples': source_count,
         'sample_mode': args.sample_mode,
@@ -387,7 +410,8 @@ def main():
     print('\n========== Temporal detail prior validation ==========')
     print(
         f"split/sampling: {args.split}/{args.sample_mode}, "
-        f"samples: {sample_count}/{source_count}, guidance: {args.guidance_mode}"
+        f"samples: {sample_count}/{source_count}, guidance: {args.guidance_mode}, "
+        f"supervision: {supervision_mode}"
     )
     print(
         'PSNR base/prior/target/delta/target-delta: '
@@ -409,6 +433,12 @@ def main():
         f"{result['native_amplitude_corr']:.6f}/"
         f"{result['native_amplitude_cosine']:.6f}, "
         f"1/{result['amplitude_prediction_scale']:.0f}"
+    )
+    print(
+        'relative reconstruction/high-frequency loss, amplitude TV: '
+        f"{result['relative_reconstruction_loss']:.6f}/"
+        f"{result['relative_highfreq_loss']:.6f}/"
+        f"{result['amplitude_tv_loss']:.6f}"
     )
     print(
         'abs amplitude pred/target, correction pred/target: '
