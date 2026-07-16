@@ -516,21 +516,11 @@ def main():
             pred_utility_score = None
             utility_mask_diag = None
             if args.mask_mode == 'utility_predicted':
-                pred_utility_score = model.predict_utility_scores(
-                    lq_center,
-                    base,
-                    mask_guidance,
-                    detail_gate,
-                    rate_cond=rate_cond,
-                )
-                support_mask, utility_mask_diag = top_block_mask(
-                    pred_utility_score,
-                    base.shape[-2:],
-                    model.utility_mask_net.block_size,
-                    args.top_ratio,
-                )
+                # The post-correction utility gate is evaluated after GRDR has
+                # produced the candidate it is expected to judge.
+                support_mask = torch.ones_like(mask_guidance)
                 write_mask = support_mask
-                effective_mask = write_mask * detail_gate
+                effective_mask = detail_gate
             else:
                 support_mask, write_mask, effective_mask = make_effective_mask(
                     model.diffusion,
@@ -571,11 +561,37 @@ def main():
                 lq_center,
                 base,
             )
-            if pred_utility_score is not None:
+            if args.mask_mode == 'utility_predicted':
+                gated_candidate = detail_gate * pred_correction
+                if model.diffusion.is_carrier_guided():
+                    utility_carrier = model.diffusion.make_carrier_direction(
+                        lq_center,
+                        base,
+                    )
+                else:
+                    utility_carrier = gated_candidate
+                pred_utility_score = model.predict_utility_scores(
+                    lq_center,
+                    base,
+                    mask_guidance,
+                    detail_gate,
+                    rate_cond=rate_cond,
+                    correction=gated_candidate,
+                    carrier=utility_carrier,
+                )
+                support_mask, utility_mask_diag = top_block_mask(
+                    pred_utility_score,
+                    base.shape[-2:],
+                    model.utility_mask_net.block_size,
+                    args.top_ratio,
+                    positive_only=model.utility_mask_net.positive_only,
+                )
+                write_mask = support_mask
+                effective_mask = write_mask * detail_gate
                 actual_utility = block_utility_scores(
                     base,
                     gt,
-                    detail_gate * pred_correction,
+                    gated_candidate,
                     args.residual_scale,
                     model.utility_mask_net.block_size,
                 )
@@ -595,6 +611,9 @@ def main():
                 )
                 totals['utility_score_std'] += float(
                     pred_utility_score.std(unbiased=False).cpu()
+                )
+                totals['utility_predicted_positive_ratio'] += float(
+                    (pred_utility_score > 0).float().mean().cpu()
                 )
                 totals['actual_utility_positive_ratio'] += float(
                     (actual_utility > 0).float().mean().cpu()
@@ -840,9 +859,14 @@ def main():
             'block_size': model.utility_mask_net.block_size,
             'top_ratio': args.top_ratio,
             'use_artifact_features': model.utility_mask_net.use_artifact_features,
+            'input_mode': model.utility_mask_net.input_mode,
+            'positive_only': model.utility_mask_net.positive_only,
             'selection_uses_gt': False,
             'score_mean': totals['utility_score_mean'] / count,
             'score_std': totals['utility_score_std'] / count,
+            'predicted_positive_ratio': (
+                totals['utility_predicted_positive_ratio'] / count
+            ),
             'selection_diagnostics': {
                 key: totals[f'utility_mask_{key}'] / count
                 for key in [
@@ -1039,14 +1063,16 @@ def main():
         gt_diag = utility_pred['gt_diagnostics']
         print('\n-- Predicted utility mask --')
         print(
-            f"block/top ratio/artifact features: "
+            f"block/top ratio/artifact/input/positive-only: "
             f"{utility_pred['block_size']}/{utility_pred['top_ratio']:.4f}/"
-            f"{utility_pred['use_artifact_features']}"
+            f"{utility_pred['use_artifact_features']}/"
+            f"{utility_pred['input_mode']}/{utility_pred['positive_only']}"
         )
         print(
-            'score mean/std, block/pixel area: '
+            'score mean/std/positive, block/pixel area: '
             f"{utility_pred['score_mean']:.6f}/"
-            f"{utility_pred['score_std']:.6f}, "
+            f"{utility_pred['score_std']:.6f}/"
+            f"{utility_pred['predicted_positive_ratio']:.4f}, "
             f"{selection['block_support_ratio']:.4f}/"
             f"{selection['pixel_support_ratio']:.4f}"
         )

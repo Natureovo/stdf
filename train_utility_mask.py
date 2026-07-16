@@ -41,7 +41,7 @@ def parse_args():
     parser.add_argument(
         '--target_samples',
         type=int,
-        default=2,
+        default=4,
         help='Number of frozen-GRDR utility samples averaged per crop.',
     )
     parser.add_argument('--qp', type=float, default=None)
@@ -216,6 +216,9 @@ def main():
         f"[{args.sampler}/{args.sample_steps}/"
         f"{args.target_noise_mode}/{args.target_samples}]\n"
         f"Teacher residual scale: [{args.residual_scale}]\n"
+        f"Utility input/uncertainty sigma: "
+        f"[{utility_opts.get('input_mode', 'pre_diffusion')}/"
+        f"{utility_opts.get('uncertainty_sigma', 0.0)}]\n"
         f"\n{'<' * 10} Options {'>' * 10}\n"
         f"{utils.dict2str(opts)}"
     )
@@ -347,6 +350,9 @@ def main():
                     f"pos_acc: [{outputs['utility_positive_accuracy'].item():.4f}], "
                     f"pred_pos: [{outputs['pred_positive_ratio'].item():.4f}], "
                     f"target_pos: [{outputs['target_positive_ratio'].item():.4f}], "
+                    f"reliable: [{outputs['utility_reliable_ratio'].item():.4f}], "
+                    f"reliable_pos: "
+                    f"[{outputs['utility_reliable_positive_ratio'].item():.4f}], "
                     f"pred_mean/std: "
                     f"[{outputs['pred_utility_score'].mean().item():.4f}/"
                     f"{outputs['pred_utility_score'].std(unbiased=False).item():.4f}], "

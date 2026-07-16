@@ -56,9 +56,16 @@ def _exact_top_mask(scores, ratio):
     return mask
 
 
-def top_block_mask(block_scores, output_size, block_size, top_ratio):
+def top_block_mask(
+        block_scores,
+        output_size,
+        block_size,
+        top_ratio,
+        positive_only=False):
     """Select top-scoring blocks and expand the support to image pixels."""
     flat_mask = _exact_top_mask(block_scores, top_ratio)
+    if positive_only:
+        flat_mask = flat_mask & (block_scores.detach().flatten(1) > 0)
     block_mask = flat_mask.view_as(block_scores).to(block_scores.dtype)
     pixel_mask = F.interpolate(
         block_mask,
@@ -106,25 +113,46 @@ def utility_top_ratio_overlap_stats(pred, target, ratios=(0.05, 0.10, 0.20)):
 
 
 def _spatial_correlation_loss(pred, target, eps=1e-6):
+    return _masked_spatial_correlation_loss(pred, target, None, eps=eps)
+
+
+def _masked_spatial_correlation_loss(pred, target, valid_mask=None, eps=1e-6):
     pred = pred.flatten(1)
     target = target.flatten(1)
-    pred = pred - pred.mean(dim=1, keepdim=True)
-    target = target - target.mean(dim=1, keepdim=True)
+    if valid_mask is None:
+        valid = torch.ones_like(target)
+    else:
+        valid = valid_mask.to(target.dtype).flatten(1)
+    raw_valid_count = valid.sum(dim=1, keepdim=True)
+    valid_count = raw_valid_count.clamp_min(1.0)
+    pred_mean = (pred * valid).sum(dim=1, keepdim=True) / valid_count
+    target_mean = (target * valid).sum(dim=1, keepdim=True) / valid_count
+    pred = (pred - pred_mean) * valid
+    target = (target - target_mean) * valid
     numerator = (pred * target).sum(dim=1)
     denominator = torch.sqrt(
         pred.square().sum(dim=1) * target.square().sum(dim=1) + eps
     )
-    return 1.0 - (numerator / denominator).clamp(-1, 1).mean()
+    correlation = (numerator / denominator).clamp(-1, 1)
+    valid_sample = (raw_valid_count.squeeze(1) >= 2).to(correlation.dtype)
+    if not bool(valid_sample.any()):
+        return pred.sum() * 0.0
+    return 1.0 - (
+        correlation * valid_sample
+    ).sum() / valid_sample.sum().clamp_min(1.0)
 
 
 def _pairwise_ranking_loss(
         pred,
         target,
+        valid_mask=None,
         num_pairs=256,
         margin=0.05,
         min_target_gap=0.05):
     pred = pred.flatten(1)
     target = target.flatten(1)
+    if valid_mask is not None:
+        valid_mask = valid_mask.bool().flatten(1)
     total = pred.size(1)
     pair_count = min(max(int(num_pairs), 1), total * 4)
     pair_ids = torch.arange(pair_count, device=pred.device, dtype=torch.long)
@@ -134,6 +162,8 @@ def _pairwise_ranking_loss(
     target_delta = target[:, index_a] - target[:, index_b]
     target_gap = target_delta.abs()
     valid = target_gap >= float(min_target_gap)
+    if valid_mask is not None:
+        valid = valid & valid_mask[:, index_a] & valid_mask[:, index_b]
     if not bool(valid.any()):
         return pred.sum() * 0.0, pred.new_tensor(0.0)
     pair_loss = F.relu(float(margin) - target_delta.sign() * pred_delta)
@@ -169,19 +199,27 @@ class UtilityConvBlock(nn.Module):
 
 
 class UtilityMaskNet(nn.Module):
-    """Predict pre-diffusion block utility from decoder-available cues."""
+    """Predict block utility from decoder-available restoration cues."""
 
     def __init__(
             self,
             nf=32,
             block_size=16,
-            use_artifact_features=True):
+            use_artifact_features=True,
+            input_mode='pre_diffusion',
+            positive_only=False):
         super(UtilityMaskNet, self).__init__()
         if block_size <= 0:
             raise ValueError('Utility block_size should be positive.')
         self.block_size = int(block_size)
         self.use_artifact_features = bool(use_artifact_features)
+        if input_mode not in ('pre_diffusion', 'post_correction'):
+            raise ValueError(f'Unsupported utility input_mode: {input_mode}')
+        self.input_mode = input_mode
+        self.positive_only = bool(positive_only)
         input_nc = 20 if self.use_artifact_features else 12
+        if self.input_mode == 'post_correction':
+            input_nc += 6
         self.block_encoder = nn.Sequential(
             nn.Conv2d(input_nc * 2, nf, 1),
             nn.ReLU(inplace=True),
@@ -190,7 +228,23 @@ class UtilityMaskNet(nn.Module):
             nn.Conv2d(nf, 1, 1),
         )
 
-    def forward(self, lq, base, guidance, detail_gate, rate_cond=None):
+    def forward(
+            self,
+            lq,
+            base,
+            guidance,
+            detail_gate,
+            rate_cond=None,
+            correction=None,
+            carrier=None):
+        if self.input_mode == 'post_correction':
+            if correction is None or carrier is None:
+                raise ValueError(
+                    'post_correction utility requires correction and carrier.'
+                )
+        else:
+            correction = None
+            carrier = None
         features = make_utility_features(
             lq,
             base,
@@ -198,6 +252,8 @@ class UtilityMaskNet(nn.Module):
             detail_gate,
             rate_cond=rate_cond,
             use_artifact_features=self.use_artifact_features,
+            correction=correction,
+            carrier=carrier,
         )
         height, width = features.shape[-2:]
         pad_h = (-height) % self.block_size
@@ -221,16 +277,34 @@ class UtilityMaskNet(nn.Module):
         return self.block_encoder(torch.cat([average, maximum], dim=1))
 
 
-def _balanced_binary_loss(logits, target, eps=1e-6):
+def _balanced_binary_loss(logits, target, valid_mask=None, eps=1e-6):
     target = target.to(logits.dtype)
+    valid = (
+        torch.ones_like(target)
+        if valid_mask is None else
+        valid_mask.to(logits.dtype)
+    )
     reduce_dims = tuple(range(1, target.dim()))
-    positive_ratio = target.mean(dim=reduce_dims, keepdim=True)
-    positive_weight = 0.5 / positive_ratio.clamp_min(eps)
-    negative_weight = 0.5 / (1.0 - positive_ratio).clamp_min(eps)
+    valid_count = valid.sum(dim=reduce_dims, keepdim=True)
+    positive_count = (target * valid).sum(dim=reduce_dims, keepdim=True)
+    negative_count = ((1.0 - target) * valid).sum(
+        dim=reduce_dims,
+        keepdim=True,
+    )
+    class_count = (
+        (positive_count > 0).to(logits.dtype) +
+        (negative_count > 0).to(logits.dtype)
+    ).clamp_min(1.0)
+    positive_weight = valid_count / (
+        class_count * positive_count.clamp_min(eps)
+    )
+    negative_weight = valid_count / (
+        class_count * negative_count.clamp_min(eps)
+    )
     weights = (
         target * positive_weight +
         (1.0 - target) * negative_weight
-    )
+    ) * valid
     loss = F.binary_cross_entropy_with_logits(
         logits,
         target,
@@ -239,13 +313,17 @@ def _balanced_binary_loss(logits, target, eps=1e-6):
     return (loss * weights).sum() / weights.sum().clamp_min(eps)
 
 
-def _topk_selection_loss(pred, target, ratios):
+def _topk_selection_loss(pred, target, ratios, valid_mask=None):
     centered_pred = pred - pred.mean(dim=(2, 3), keepdim=True)
     losses = []
     for ratio in ratios:
         top_target = _exact_top_mask(target, ratio).view_as(target)
         losses.append(
-            _balanced_binary_loss(centered_pred, top_target.float())
+            _balanced_binary_loss(
+                centered_pred,
+                top_target.float(),
+                valid_mask=valid_mask,
+            )
         )
     if not losses:
         return pred.sum() * 0.0
@@ -264,34 +342,55 @@ def utility_prediction_losses(
         topk_ratios=(0.05, 0.10, 0.20),
         ranking_pairs=256,
         ranking_margin=0.05,
-        ranking_min_target_gap=0.05):
+        ranking_min_target_gap=0.05,
+        target_uncertainty=None,
+        uncertainty_sigma=0.0):
     target_utility = target_utility.detach()
+    if target_uncertainty is None or float(uncertainty_sigma) <= 0:
+        reliable_mask = torch.ones_like(target_utility, dtype=torch.bool)
+    else:
+        target_uncertainty = target_uncertainty.detach().clamp_min(0)
+        reliable_mask = target_utility.abs() > (
+            float(uncertainty_sigma) * target_uncertainty
+        )
     target_normalized = normalize_utility_target(
         target_utility,
         clip=target_clip,
     )
     pred_normalized = torch.tanh(pred_score)
-    regression_loss = F.smooth_l1_loss(pred_normalized, target_normalized)
+    regression_error = F.smooth_l1_loss(
+        pred_normalized,
+        target_normalized,
+        reduction='none',
+    )
+    reliable_weight = reliable_mask.to(regression_error.dtype)
+    regression_loss = (
+        regression_error * reliable_weight
+    ).sum() / reliable_weight.sum().clamp_min(1.0)
     positive_target = (target_utility > 0).float()
     positive_loss = _balanced_binary_loss(
         pred_score,
         positive_target,
+        valid_mask=reliable_mask,
     )
     ranking_loss, ranking_valid_ratio = _pairwise_ranking_loss(
         pred_score,
         target_normalized,
+        valid_mask=reliable_mask,
         num_pairs=ranking_pairs,
         margin=ranking_margin,
         min_target_gap=ranking_min_target_gap,
     )
-    correlation_loss = _spatial_correlation_loss(
+    correlation_loss = _masked_spatial_correlation_loss(
         pred_score,
         target_normalized,
+        valid_mask=reliable_mask,
     )
     topk_loss = _topk_selection_loss(
         pred_score,
         target_normalized,
         topk_ratios,
+        valid_mask=reliable_mask,
     )
     loss = (
         float(regression_weight) * regression_loss +
@@ -301,9 +400,10 @@ def utility_prediction_losses(
         float(topk_weight) * topk_loss
     )
     pred_positive = pred_score >= 0
-    positive_accuracy = (
+    positive_correct = (
         pred_positive == positive_target.bool()
-    ).float().mean()
+    ).float() * reliable_weight
+    positive_accuracy = positive_correct.sum() / reliable_weight.sum().clamp_min(1.0)
     return {
         'loss': loss,
         'regression_loss': regression_loss,
@@ -315,6 +415,10 @@ def utility_prediction_losses(
         'positive_accuracy': positive_accuracy,
         'target_positive_ratio': positive_target.mean(),
         'pred_positive_ratio': pred_positive.float().mean(),
+        'reliable_ratio': reliable_weight.mean(),
+        'reliable_positive_ratio': (
+            positive_target * reliable_weight
+        ).sum() / reliable_weight.sum().clamp_min(1.0),
         'target_normalized': target_normalized,
     }
 
@@ -325,4 +429,6 @@ def build_utility_mask_net(opts=None):
         nf=opts.get('nf', 32),
         block_size=opts.get('block_size', 16),
         use_artifact_features=opts.get('use_artifact_features', True),
+        input_mode=opts.get('input_mode', 'pre_diffusion'),
+        positive_only=opts.get('positive_only', False),
     )

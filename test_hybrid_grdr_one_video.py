@@ -325,6 +325,8 @@ def build_opts(args):
             'nf': args.utility_nf,
             'block_size': args.utility_block_size,
             'use_artifact_features': not args.utility_disable_artifact_features,
+            'input_mode': args.utility_input_mode,
+            'positive_only': not args.utility_allow_negative,
         },
         'budget_net': {
             'in_dim': 18,
@@ -506,6 +508,16 @@ def parse_args():
     )
     parser.add_argument('--utility_nf', type=int, default=32)
     parser.add_argument('--utility_block_size', type=int, default=16)
+    parser.add_argument(
+        '--utility_input_mode',
+        choices=['pre_diffusion', 'post_correction'],
+        default='post_correction',
+    )
+    parser.add_argument(
+        '--utility_allow_negative',
+        action='store_true',
+        help='Allow top-ratio write-back even when predicted utility is negative.',
+    )
     parser.add_argument(
         '--utility_disable_artifact_features',
         action='store_true',
@@ -845,19 +857,8 @@ def main():
                     guidance.clamp(0, 1),
                     rate_cond=diffusion_rate_cond,
                 )
-                pred_utility_score = model.predict_utility_scores(
-                    lq_center,
-                    base,
-                    guidance.clamp(0, 1),
-                    detail_gate,
-                    rate_cond=rate_cond,
-                )
-                write_mask, _ = top_block_mask(
-                    pred_utility_score,
-                    base.shape[-2:],
-                    model.utility_mask_net.block_size,
-                    top_ratio,
-                )
+                # Defer utility scoring until the candidate correction exists.
+                write_mask = torch.ones_like(guidance)
             elif args.soft_guidance:
                 write_mask = guidance.clamp(0, 1)
             else:
@@ -963,10 +964,35 @@ def main():
                         lq_center,
                         base,
                     )
+                    gated_candidate = detail_gate * pred_correction
+                    if model.diffusion.is_carrier_guided():
+                        utility_carrier = model.diffusion.make_carrier_direction(
+                            lq_center,
+                            base,
+                        )
+                    else:
+                        utility_carrier = gated_candidate
+                    pred_utility_score = model.predict_utility_scores(
+                        lq_center,
+                        base,
+                        guidance.clamp(0, 1),
+                        detail_gate,
+                        rate_cond=rate_cond,
+                        correction=gated_candidate,
+                        carrier=utility_carrier,
+                    )
+                    write_mask, _ = top_block_mask(
+                        pred_utility_score,
+                        base.shape[-2:],
+                        model.utility_mask_net.block_size,
+                        top_ratio,
+                        positive_only=model.utility_mask_net.positive_only,
+                    )
+                    effective_write_mask = write_mask * detail_gate
                     actual_utility = block_utility_scores(
                         base,
                         gt,
-                        detail_gate * pred_correction,
+                        gated_candidate,
                         args.residual_scale,
                         model.utility_mask_net.block_size,
                     )
@@ -1147,6 +1173,8 @@ def main():
         'top_ratio': args.top_ratio,
         'utility_block_size': args.utility_block_size,
         'utility_artifact_features': not args.utility_disable_artifact_features,
+        'utility_input_mode': args.utility_input_mode,
+        'utility_positive_only': not args.utility_allow_negative,
         'budget_mode': args.budget_mode,
         'diffusion_control_enabled': args.diffusion_control_enabled,
         'diffusion_control_main_input': args.diffusion_control_main_input,

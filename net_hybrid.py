@@ -149,13 +149,17 @@ class HybridSTDFGRDR(nn.Module):
             base,
             guidance,
             detail_gate,
-            rate_cond=None):
+            rate_cond=None,
+            correction=None,
+            carrier=None):
         return self.utility_mask_net(
             lq,
             base,
             guidance,
             detail_gate,
             rate_cond=rate_cond,
+            correction=correction,
+            carrier=carrier,
         )
 
     def predict_direct_residual(
@@ -378,22 +382,41 @@ class HybridSTDFGRDR(nn.Module):
                     )
                 )
             utility_stack = torch.stack(utility_samples, dim=0)
-            target_utility = utility_stack.mean(dim=0)
-            teacher_utility_std = utility_stack.std(
+            sample_count = utility_stack.size(0)
+            utility_std_per_crop = utility_stack.std(
                 dim=0,
                 unbiased=False,
-            ).mean()
-            gated_correction = torch.stack(
-                correction_samples,
-                dim=0,
-            ).mean(dim=0)
+            )
+            teacher_utility_std = utility_std_per_crop.mean()
+            target_utility = torch.cat(utility_samples, dim=0)
+            teacher_utility_std_map = utility_std_per_crop.repeat(
+                sample_count,
+                1,
+                1,
+                1,
+            )
+            gated_correction = torch.cat(correction_samples, dim=0)
+            if self.diffusion.is_carrier_guided():
+                utility_carrier = self.diffusion.make_carrier_direction(lq, base)
+            else:
+                utility_carrier = correction_samples[0]
+            utility_carrier = utility_carrier.repeat(sample_count, 1, 1, 1)
+            utility_lq = lq.repeat(sample_count, 1, 1, 1)
+            utility_base = base.repeat(sample_count, 1, 1, 1)
+            utility_guidance = guidance.repeat(sample_count, 1, 1, 1)
+            utility_detail_gate = detail_gate.repeat(sample_count, 1, 1, 1)
+            utility_rate_cond = (
+                None if rate_cond is None else rate_cond.repeat(sample_count, 1)
+            )
 
         pred_score = self.predict_utility_scores(
-            lq.detach(),
-            base.detach(),
-            guidance.detach(),
-            detail_gate.detach(),
-            rate_cond=rate_cond,
+            utility_lq.detach(),
+            utility_base.detach(),
+            utility_guidance.detach(),
+            utility_detail_gate.detach(),
+            rate_cond=utility_rate_cond,
+            correction=gated_correction.detach(),
+            carrier=utility_carrier.detach(),
         )
         if pred_score.shape != target_utility.shape:
             raise ValueError(
@@ -422,6 +445,10 @@ class HybridSTDFGRDR(nn.Module):
             ranking_min_target_gap=self.utility_mask_opts.get(
                 'ranking_min_target_gap', 0.05
             ),
+            target_uncertainty=teacher_utility_std_map,
+            uncertainty_sigma=self.utility_mask_opts.get(
+                'uncertainty_sigma', 0.0
+            ),
         )
         return {
             'loss': loss_dict['loss'],
@@ -434,10 +461,15 @@ class HybridSTDFGRDR(nn.Module):
             'utility_positive_accuracy': loss_dict['positive_accuracy'],
             'target_positive_ratio': loss_dict['target_positive_ratio'],
             'pred_positive_ratio': loss_dict['pred_positive_ratio'],
+            'utility_reliable_ratio': loss_dict['reliable_ratio'],
+            'utility_reliable_positive_ratio': loss_dict[
+                'reliable_positive_ratio'
+            ],
             'target_normalized': loss_dict['target_normalized'],
             'pred_utility_score': pred_score,
             'target_utility': target_utility,
             'teacher_utility_std': teacher_utility_std,
+            'teacher_utility_std_map': teacher_utility_std_map,
             'gated_correction': gated_correction,
             'guidance': guidance,
             'detail_gate': detail_gate,

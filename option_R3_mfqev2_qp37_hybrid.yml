@@ -130,9 +130,12 @@ network:
     nf: 32
     block_size: 16
     use_artifact_features: true
+    input_mode: post_correction
+    positive_only: true
+    uncertainty_sigma: 1.0
     target_clip: 5.0
     regression_weight: 1.0
-    positive_weight: 0.25
+    positive_weight: 1.0
     ranking_weight: 1.0
     correlation_weight: 0.25
     topk_weight: 1.0

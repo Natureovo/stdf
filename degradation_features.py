@@ -49,6 +49,11 @@ def _mean_normalize_map(x, clip=5.0, eps=1e-6):
     return (x / scale / float(clip)).clamp(0, 1)
 
 
+def _signed_mean_normalize_map(x, clip=5.0, eps=1e-6):
+    scale = x.abs().mean(dim=(2, 3), keepdim=True).clamp_min(eps)
+    return (x / scale / float(clip)).clamp(-1, 1)
+
+
 def boundary_anomaly_map(x, neighborhood=8):
     """Detect unusually strong local discontinuities without a fixed grid."""
     response = gradient_magnitude(x)
@@ -72,8 +77,10 @@ def make_utility_features(
         guidance,
         detail_gate,
         rate_cond=None,
-        use_artifact_features=True):
-    """Build pre-diffusion, no-GT features for block utility prediction."""
+        use_artifact_features=True,
+        correction=None,
+        carrier=None):
+    """Build no-GT features for pre-selection or post-correction utility."""
     if lq.shape != base.shape:
         raise ValueError('lq and base should have the same shape.')
     lq = _to_gray(lq)
@@ -117,6 +124,21 @@ def make_utility_features(
                     )
                 )
             features.append(_mean_normalize_map(ringing_response(source)))
+    if correction is not None or carrier is not None:
+        if correction is None or carrier is None:
+            raise ValueError('correction and carrier should be provided together.')
+        correction = _to_gray(correction)
+        carrier = _to_gray(carrier)
+        if correction.shape != lq.shape or carrier.shape != lq.shape:
+            raise ValueError('correction and carrier should match lq spatially.')
+        features.extend([
+            _signed_mean_normalize_map(correction),
+            _mean_normalize_map(correction.abs()),
+            _signed_mean_normalize_map(carrier),
+            _mean_normalize_map(carrier.abs()),
+            _mean_normalize_map((correction * carrier).abs()),
+            _signed_mean_normalize_map(correction * (base - lq)),
+        ])
     return torch.cat(features, dim=1)
 
 
