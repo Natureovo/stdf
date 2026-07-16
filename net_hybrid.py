@@ -856,6 +856,10 @@ class HybridSTDFGRDR(nn.Module):
             carrier_norm_window=opts.get('carrier_norm_window', 9),
             target_window=opts.get('target_window', 9),
             amplitude_clip=opts.get('amplitude_clip', 0.05),
+            wavelet_coefficient_clip=opts.get(
+                'wavelet_coefficient_clip',
+                0.05,
+            ),
             correction_clip=opts.get('correction_clip', 0.05),
             carrier_norm_clip=opts.get('carrier_norm_clip', 3.0),
             ridge_eps=opts.get('ridge_eps', 1e-3),

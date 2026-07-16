@@ -56,19 +56,23 @@ def parse_args():
     parser.add_argument(
         '--amplitude_prediction_scale',
         type=int,
-        choices=[1, 4],
+        choices=[1, 2, 4],
         default=None,
         help='Override native amplitude resolution for checkpoint compatibility.',
     )
     parser.add_argument(
         '--prediction_mode',
-        choices=['carrier_amplitude', 'free_residual'],
+        choices=[
+            'carrier_amplitude',
+            'free_residual',
+            'wavelet_subband',
+        ],
         default=None,
         help='Override prediction parameterization for checkpoint compatibility.',
     )
     parser.add_argument(
         '--supervision_mode',
-        choices=['analytic', 'target_free'],
+        choices=['analytic', 'target_free', 'wavelet'],
         default=None,
         help='Override loss reporting mode; image metrics are unchanged.',
     )
@@ -131,11 +135,12 @@ def load_prior_weights(prior_net, path):
         prior_state = prior_state or state
     checkpoint_mode = checkpoint.get('prediction_mode')
     if checkpoint_mode is None:
-        checkpoint_mode = (
-            'free_residual'
-            if any(key.startswith('residual_out.') for key in prior_state) else
-            'carrier_amplitude'
-        )
+        if any(key.startswith('wavelet_out.') for key in prior_state):
+            checkpoint_mode = 'wavelet_subband'
+        elif any(key.startswith('residual_out.') for key in prior_state):
+            checkpoint_mode = 'free_residual'
+        else:
+            checkpoint_mode = 'carrier_amplitude'
     if checkpoint_mode != prior_net.prediction_mode:
         raise ValueError(
             f'Checkpoint prediction mode is {checkpoint_mode}, but the model '
@@ -144,7 +149,9 @@ def load_prior_weights(prior_net, path):
         )
     checkpoint_scale = checkpoint.get('amplitude_prediction_scale')
     if checkpoint_scale is None:
-        if any(key.startswith('coarse_out.') for key in prior_state):
+        if any(key.startswith('wavelet_out.') for key in prior_state):
+            checkpoint_scale = 2
+        elif any(key.startswith('coarse_out.') for key in prior_state):
             checkpoint_scale = 4
         elif any(key.startswith('out.') for key in prior_state):
             checkpoint_scale = 1
@@ -468,6 +475,16 @@ def main():
         'relative_highfreq_loss',
         'amplitude_tv_loss',
         'free_residual_mode',
+        'wavelet_subband_mode',
+        'wavelet_subband_loss',
+        'wavelet_lh_corr',
+        'wavelet_hl_corr',
+        'wavelet_hh_corr',
+        'wavelet_lh_mae',
+        'wavelet_hl_mae',
+        'wavelet_hh_mae',
+        'wavelet_ll_leakage',
+        'target_wavelet_ll_leakage',
     ]
 
     with torch.no_grad():
@@ -558,6 +575,9 @@ def main():
                 ),
                 target_window=prior_opts.get('target_window', 9),
                 amplitude_clip=prior_opts.get('amplitude_clip', 0.05),
+                wavelet_coefficient_clip=prior_opts.get(
+                    'wavelet_coefficient_clip', 0.05
+                ),
                 correction_clip=prior_opts.get('correction_clip', 0.05),
                 carrier_norm_clip=prior_opts.get('carrier_norm_clip', 3.0),
                 ridge_eps=prior_opts.get('ridge_eps', 1e-3),
@@ -646,13 +666,13 @@ def main():
         f"train crop: {result['train_crop_size']}"
     )
     print(
-        'PSNR base/prior/diagnostic/delta/diagnostic-delta: '
+        'PSNR base/prior/target/delta/target-delta: '
         f"{result['base_psnr']:.6f}/{result['refined_psnr']:.6f}/"
         f"{result['target_psnr']:.6f}/{result['psnr_delta']:+.6f}/"
         f"{result['target_psnr_delta']:+.6f}"
     )
     print(
-        'frame win-rate prior/diagnostic: '
+        'frame win-rate prior/target: '
         f"{result['frame_win_rate']:.4f}/{result['target_frame_win_rate']:.4f}"
     )
     print(
@@ -673,23 +693,41 @@ def main():
         f"{result['amplitude_tv_loss']:.6f}"
     )
     print(
-        'abs signal pred/diagnostic, correction pred/diagnostic: '
+        'abs signal pred/target, correction pred/target: '
         f"{result['pred_amplitude_abs']:.8f}/{result['target_amplitude_abs']:.8f}, "
         f"{result['pred_correction_abs']:.8f}/{result['target_correction_abs']:.8f}"
     )
     print(
-        'diagnostic target positive/negative: '
+        'target positive/negative: '
         f"{result['target_positive_ratio']:.4f}/"
         f"{result['target_negative_ratio']:.4f}"
     )
-    print(f"diagnostic target scale: {result['target_safe_scale']:.6f}")
+    print(f"target scale: {result['target_safe_scale']:.6f}")
+    if prediction_mode == 'wavelet_subband':
+        print(
+            'wavelet LH/HL/HH correlation: '
+            f"{result['wavelet_lh_corr']:.6f}/"
+            f"{result['wavelet_hl_corr']:.6f}/"
+            f"{result['wavelet_hh_corr']:.6f}"
+        )
+        print(
+            'wavelet LH/HL/HH MAE: '
+            f"{result['wavelet_lh_mae']:.8f}/"
+            f"{result['wavelet_hl_mae']:.8f}/"
+            f"{result['wavelet_hh_mae']:.8f}"
+        )
+        print(
+            'wavelet LL leakage pred/target: '
+            f"{result['wavelet_ll_leakage']:.8e}/"
+            f"{result['target_wavelet_ll_leakage']:.8e}"
+        )
     print(
         'aligned feature/injection abs: '
         f"{result['aligned_feature_abs']:.8f}/"
         f"{result['aligned_injection_abs']:.8f}"
     )
     print(
-        'HF MAE base/prior/diagnostic, prior-base: '
+        'HF MAE base/prior/target, prior-base: '
         f"{result['base_hf_mae']:.8f}/{result['refined_hf_mae']:.8f}/"
         f"{result['target_hf_mae']:.8f}/"
         f"{result['refined_hf_mae'] - result['base_hf_mae']:+.8f}"

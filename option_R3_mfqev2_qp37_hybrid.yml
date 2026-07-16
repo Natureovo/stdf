@@ -184,37 +184,38 @@ network:
     use_aligned_features: true
     aligned_feature_channels: 64
     use_global_modulation: true
-    # Decisive baseline: remove the carrier parameterization and predict a
-    # bounded full-resolution residual through the complete U-Net decoder.
-    prediction_mode: free_residual
-    amplitude_prediction_scale: 1
+    # Structured-frequency baseline: predict one-level Haar LH/HL/HH
+    # corrections while preserving the STDF low-frequency (LL) band.
+    prediction_mode: wavelet_subband
+    amplitude_prediction_scale: 2
     carrier_source: base
     carrier_kernel: 5
     carrier_norm_window: 9
     carrier_norm_clip: 3.0
     target_window: 9
     amplitude_clip: 0.05
+    wavelet_coefficient_clip: 0.05
     correction_clip: 0.05
     ridge_eps: !!float 1e-3
     target_safe_scale: true
-    # Main experiment: the GT-only bounded target remains diagnostic. Gradients
-    # come only from final reconstruction and high-frequency fidelity.
-    supervision_mode: target_free
+    # GT is used only during training to supervise missing detail coefficients;
+    # inference requires LQ frames, STDF features, and QP only.
+    supervision_mode: wavelet
     apply_guidance_gate: false
     guidance_floor: 0.0
     correction_scale: 1.0
-    # Used only when supervision_mode is analytic.
+    # Wavelet coefficient, reconstructed correction, and image-space losses.
     amplitude_weight: 1.0
-    correction_weight: 2.0
+    correction_weight: 1.0
     reconstruction_weight: 1.0
     highfreq_weight: 0.5
     gradient_weight: 0.1
     degrade_weight: 0.0
-    # Target-free objective, normalized per sample by frozen STDF error.
+    # Used only by the retained target-free pixel-residual ablation.
     relative_reconstruction_weight: 1.0
     relative_highfreq_weight: 0.1
     relative_eps: !!float 1e-6
-    tv_weight: 0.001
+    tv_weight: 0.0005
 
   detail_guidance:
     gradient_weight: 0.35

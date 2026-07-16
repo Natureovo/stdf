@@ -28,6 +28,70 @@ def high_frequency(x, kernel_size=5):
     return x - local_average(x, kernel_size)
 
 
+def haar_dwt2(x):
+    """Orthonormal one-level Haar transform with reversible odd-size padding."""
+    height, width = x.shape[-2:]
+    pad_bottom = height % 2
+    pad_right = width % 2
+    if pad_bottom or pad_right:
+        x = F.pad(x, (0, pad_right, 0, pad_bottom), mode='replicate')
+    top_left = x[..., 0::2, 0::2]
+    top_right = x[..., 0::2, 1::2]
+    bottom_left = x[..., 1::2, 0::2]
+    bottom_right = x[..., 1::2, 1::2]
+    lowpass = (
+        top_left + top_right + bottom_left + bottom_right
+    ) * 0.5
+    low_high = (
+        -top_left - top_right + bottom_left + bottom_right
+    ) * 0.5
+    high_low = (
+        -top_left + top_right - bottom_left + bottom_right
+    ) * 0.5
+    high_high = (
+        top_left - top_right - bottom_left + bottom_right
+    ) * 0.5
+    details = torch.cat([low_high, high_low, high_high], dim=1)
+    return lowpass, details, (height, width)
+
+
+def haar_iwt2(lowpass, details, output_size=None):
+    """Inverse one-level Haar transform from LL and concatenated LH/HL/HH."""
+    channels = lowpass.size(1)
+    if details.size(1) != channels * 3:
+        raise ValueError(
+            f'Expected {channels * 3} detail channels, got '
+            f'{details.size(1)}.'
+        )
+    low_high, high_low, high_high = torch.chunk(details, 3, dim=1)
+    top_left = (
+        lowpass - low_high - high_low + high_high
+    ) * 0.5
+    top_right = (
+        lowpass - low_high + high_low - high_high
+    ) * 0.5
+    bottom_left = (
+        lowpass + low_high - high_low - high_high
+    ) * 0.5
+    bottom_right = (
+        lowpass + low_high + high_low + high_high
+    ) * 0.5
+    output = lowpass.new_empty(
+        lowpass.size(0),
+        channels,
+        lowpass.size(-2) * 2,
+        lowpass.size(-1) * 2,
+    )
+    output[..., 0::2, 0::2] = top_left
+    output[..., 0::2, 1::2] = top_right
+    output[..., 1::2, 0::2] = bottom_left
+    output[..., 1::2, 1::2] = bottom_right
+    if output_size is not None:
+        height, width = output_size
+        output = output[..., :height, :width]
+    return output
+
+
 def sobel_magnitude(x):
     channels = x.size(1)
     kx = x.new_tensor(
@@ -208,10 +272,11 @@ class TemporalDetailPriorNet(nn.Module):
 
     The seven LQ frames are mixed as channels at full resolution. Optional
     frozen STDF deformable-fusion features inject aligned temporal evidence at
-    all three encoder scales. The head predicts either a local carrier
-    amplitude or a bounded free residual. Temporal statistics expose
-    disagreement and motion evidence without a memory-heavy 3D volume, while
-    global pooled bottleneck modulation supplies whole-frame context.
+    all three encoder scales. The head predicts a local carrier amplitude, a
+    bounded free residual, or Haar detail-subband corrections. Temporal
+    statistics expose disagreement and motion evidence without a memory-heavy
+    3D volume, while global pooled bottleneck modulation supplies whole-frame
+    context.
     """
 
     def __init__(
@@ -227,6 +292,7 @@ class TemporalDetailPriorNet(nn.Module):
             prediction_mode='carrier_amplitude',
             amplitude_prediction_scale=1,
             amplitude_clip=0.05,
+            wavelet_coefficient_clip=0.05,
             correction_clip=0.05,
             carrier_source='base',
             carrier_kernel=5,
@@ -242,15 +308,19 @@ class TemporalDetailPriorNet(nn.Module):
         self.aligned_feature_channels = int(aligned_feature_channels)
         self.use_global_modulation = bool(use_global_modulation)
         self.prediction_mode = str(prediction_mode)
-        if self.prediction_mode not in ('carrier_amplitude', 'free_residual'):
+        if self.prediction_mode not in (
+                'carrier_amplitude',
+                'free_residual',
+                'wavelet_subband'):
             raise ValueError(
-                'prediction_mode should be carrier_amplitude or '
-                f'free_residual, got {self.prediction_mode}.'
+                'prediction_mode should be carrier_amplitude, free_residual, '
+                'or wavelet_subband, got '
+                f'{self.prediction_mode}.'
             )
         self.amplitude_prediction_scale = int(amplitude_prediction_scale)
-        if self.amplitude_prediction_scale not in (1, 4):
+        if self.amplitude_prediction_scale not in (1, 2, 4):
             raise ValueError(
-                'amplitude_prediction_scale should be 1 or 4, got '
+                'amplitude_prediction_scale should be 1, 2, or 4, got '
                 f'{self.amplitude_prediction_scale}.'
             )
         if (
@@ -260,7 +330,21 @@ class TemporalDetailPriorNet(nn.Module):
                 'free_residual requires amplitude_prediction_scale=1 because '
                 'it predicts a full-resolution correction.'
             )
+        if (
+                self.prediction_mode == 'wavelet_subband' and
+                self.amplitude_prediction_scale != 2):
+            raise ValueError(
+                'wavelet_subband requires amplitude_prediction_scale=2 '
+                'because Haar detail coefficients are half resolution.'
+            )
+        if (
+                self.prediction_mode == 'carrier_amplitude' and
+                self.amplitude_prediction_scale not in (1, 4)):
+            raise ValueError(
+                'carrier_amplitude supports scales 1 and 4 only.'
+            )
         self.amplitude_clip = float(amplitude_clip)
+        self.wavelet_coefficient_clip = float(wavelet_coefficient_clip)
         self.correction_clip = float(correction_clip)
         self.carrier_source = carrier_source
         self.carrier_kernel = int(carrier_kernel)
@@ -294,7 +378,13 @@ class TemporalDetailPriorNet(nn.Module):
             self.prediction_mode == 'free_residual' or
             self.amplitude_prediction_scale == 1
         )
-        if self.use_full_decoder:
+        if self.prediction_mode == 'wavelet_subband':
+            self.up1 = FusionBlock(nf * 4 + nf * 2, nf * 2)
+            self.wavelet_out = nn.Sequential(
+                ResidualBlock(nf * 2),
+                nn.Conv2d(nf * 2, self.in_nc * 3, 3, padding=1),
+            )
+        elif self.use_full_decoder:
             self.up1 = FusionBlock(nf * 4 + nf * 2, nf * 2)
             self.up2 = FusionBlock(nf * 2 + nf, nf)
             if self.prediction_mode == 'free_residual':
@@ -328,7 +418,9 @@ class TemporalDetailPriorNet(nn.Module):
             self.aligned_scales = nn.Parameter(torch.ones(3))
         nn.init.zeros_(self.global_modulation[-1].weight)
         nn.init.zeros_(self.global_modulation[-1].bias)
-        if self.prediction_mode == 'free_residual':
+        if self.prediction_mode == 'wavelet_subband':
+            output_head = self.wavelet_out
+        elif self.prediction_mode == 'free_residual':
             output_head = self.residual_out
         elif self.amplitude_prediction_scale == 1:
             output_head = self.out
@@ -459,7 +551,19 @@ class TemporalDetailPriorNet(nn.Module):
             scale = scale[:, :, None, None]
             shift = shift[:, :, None, None]
             mid = mid * (1.0 + 0.1 * torch.tanh(scale)) + 0.1 * shift
-        if self.use_full_decoder:
+        if self.prediction_mode == 'wavelet_subband':
+            up1 = F.interpolate(
+                mid,
+                size=enc1.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+            up1 = self.up1(torch.cat([up1, enc1], dim=1))
+            signal_native = (
+                torch.tanh(self.wavelet_out(up1)) *
+                self.wavelet_coefficient_clip
+            )
+        elif self.use_full_decoder:
             up1 = F.interpolate(
                 mid,
                 size=enc1.shape[-2:],
@@ -486,7 +590,9 @@ class TemporalDetailPriorNet(nn.Module):
             signal_native = (
                 torch.tanh(self.coarse_out(mid)) * self.amplitude_clip
             )
-        if signal_native.shape[-2:] == base.shape[-2:]:
+        if self.prediction_mode == 'wavelet_subband':
+            signal = signal_native
+        elif signal_native.shape[-2:] == base.shape[-2:]:
             signal = signal_native
         else:
             signal = F.interpolate(
@@ -504,7 +610,32 @@ class TemporalDetailPriorNet(nn.Module):
             norm_clip=self.carrier_norm_clip,
             eps=self.ridge_eps,
         )
-        if self.prediction_mode == 'free_residual':
+        if self.prediction_mode == 'wavelet_subband':
+            lowpass = base.new_zeros(
+                base.size(0),
+                self.in_nc,
+                signal.size(-2),
+                signal.size(-1),
+            )
+            correction = haar_iwt2(
+                lowpass,
+                signal,
+                output_size=base.shape[-2:],
+            )
+            if self.correction_clip > 0:
+                spatial_dims = tuple(range(1, correction.dim()))
+                correction_max = correction.abs().amax(
+                    dim=spatial_dims,
+                    keepdim=True,
+                )
+                safety_scale = (
+                    self.correction_clip / (correction_max + 1e-8)
+                ).clamp(max=1.0)
+                signal = signal * safety_scale
+                signal_native = signal_native * safety_scale
+                correction = correction * safety_scale
+            output_scale = 2
+        elif self.prediction_mode == 'free_residual':
             correction = signal
             output_scale = 1
         else:
@@ -659,6 +790,76 @@ def _make_free_residual_target(base, gt, correction_clip):
     }
 
 
+@torch.no_grad()
+def _make_wavelet_subband_target(
+        base,
+        gt,
+        coefficient_clip,
+        correction_clip,
+        ridge_eps,
+        safe_global_scale):
+    """Supervised Haar detail correction while preserving the STDF LL band."""
+    _, base_details, _ = haar_dwt2(base)
+    _, gt_details, _ = haar_dwt2(gt)
+    details = gt_details - base_details
+    if coefficient_clip is not None and float(coefficient_clip) > 0:
+        details = details.clamp(
+            -float(coefficient_clip),
+            float(coefficient_clip),
+        )
+    lowpass = base.new_zeros(
+        base.size(0),
+        base.size(1),
+        details.size(-2),
+        details.size(-1),
+    )
+    correction = haar_iwt2(
+        lowpass,
+        details,
+        output_size=base.shape[-2:],
+    )
+    if correction_clip is not None and float(correction_clip) > 0:
+        spatial_dims = tuple(range(1, correction.dim()))
+        correction_max = correction.abs().amax(
+            dim=spatial_dims,
+            keepdim=True,
+        )
+        limit_scale = (
+            float(correction_clip) / (correction_max + 1e-8)
+        ).clamp(max=1.0)
+        details = details * limit_scale
+        correction = correction * limit_scale
+    if safe_global_scale:
+        residual = gt - base
+        spatial_dims = tuple(range(1, correction.dim()))
+        numerator = (correction * residual).sum(
+            dim=spatial_dims,
+            keepdim=True,
+        )
+        denominator = correction.square().sum(
+            dim=spatial_dims,
+            keepdim=True,
+        ) + float(ridge_eps)
+        target_scale = (numerator / denominator).clamp(0.0, 1.0)
+        details = details * target_scale
+        correction = correction * target_scale
+    else:
+        target_scale = base.new_ones(
+            (base.size(0),) + (1,) * (base.dim() - 1)
+        )
+    ones = torch.ones_like(base)
+    return {
+        'amplitude_native': details,
+        'amplitude': details,
+        'correction': correction,
+        'refined': (base + correction).clamp(0, 1),
+        'carrier': ones,
+        'direction': ones,
+        'carrier_rms': ones,
+        'target_scale': target_scale,
+    }
+
+
 def temporal_detail_prior_losses(
         amplitude,
         aux,
@@ -684,30 +885,54 @@ def temporal_detail_prior_losses(
         carrier_norm_window=9,
         target_window=9,
         amplitude_clip=0.05,
+        wavelet_coefficient_clip=0.05,
         correction_clip=0.05,
         carrier_norm_clip=3.0,
         ridge_eps=1e-3,
         target_safe_scale=True):
-    if supervision_mode not in ('analytic', 'target_free'):
+    if supervision_mode not in ('analytic', 'target_free', 'wavelet'):
         raise ValueError(
             f'Unsupported temporal prior supervision_mode: '
             f'{supervision_mode}'
         )
     analytic_supervision = supervision_mode == 'analytic'
+    wavelet_supervision = supervision_mode == 'wavelet'
+    supervised_signal = analytic_supervision or wavelet_supervision
     prediction_mode = aux.get('prediction_mode', 'carrier_amplitude')
-    if prediction_mode not in ('carrier_amplitude', 'free_residual'):
+    if prediction_mode not in (
+            'carrier_amplitude',
+            'free_residual',
+            'wavelet_subband'):
         raise ValueError(f'Unsupported prediction_mode: {prediction_mode}')
     if prediction_mode == 'free_residual' and analytic_supervision:
         raise ValueError(
             'free_residual should use target_free supervision; its bounded '
             'GT residual is diagnostic only.'
         )
+    if prediction_mode == 'wavelet_subband' and not wavelet_supervision:
+        raise ValueError(
+            'wavelet_subband requires supervision_mode=wavelet.'
+        )
+    if wavelet_supervision and prediction_mode != 'wavelet_subband':
+        raise ValueError(
+            'supervision_mode=wavelet requires prediction_mode='
+            'wavelet_subband.'
+        )
     center = aux['center']
     amplitude_native = aux.get('amplitude_native', amplitude)
     uses_coarse_amplitude = (
         amplitude_native.shape[-2:] != amplitude.shape[-2:]
     )
-    if prediction_mode == 'free_residual':
+    if prediction_mode == 'wavelet_subband':
+        target = _make_wavelet_subband_target(
+            base.detach(),
+            gt,
+            coefficient_clip=wavelet_coefficient_clip,
+            correction_clip=correction_clip,
+            ridge_eps=ridge_eps,
+            safe_global_scale=target_safe_scale,
+        )
+    elif prediction_mode == 'free_residual':
         target = _make_free_residual_target(
             base.detach(),
             gt,
@@ -748,24 +973,29 @@ def temporal_detail_prior_losses(
     pred_correction = aux['correction']
     teacher_amplitude_native = (
         amplitude_native
-        if analytic_supervision else
+        if supervised_signal else
         amplitude_native.detach()
     )
     teacher_pred_correction = (
         pred_correction
-        if analytic_supervision else
+        if supervised_signal else
         pred_correction.detach()
     )
 
-    carrier_weight_native = F.adaptive_avg_pool2d(
-        target['carrier_rms'],
-        amplitude_native.shape[-2:],
-    )
-    carrier_weight_native = carrier_weight_native / (
-        carrier_weight_native.mean(dim=(2, 3), keepdim=True) + 1e-6
-    )
+    if prediction_mode == 'wavelet_subband':
+        carrier_weight_native = torch.ones_like(target_amplitude_native)
+        target_clip = wavelet_coefficient_clip
+    else:
+        carrier_weight_native = F.adaptive_avg_pool2d(
+            target['carrier_rms'],
+            amplitude_native.shape[-2:],
+        )
+        carrier_weight_native = carrier_weight_native / (
+            carrier_weight_native.mean(dim=(2, 3), keepdim=True) + 1e-6
+        )
+        target_clip = amplitude_clip
     target_weight_native = 1.0 + target_amplitude_native.abs() / max(
-        float(amplitude_clip),
+        float(target_clip),
         1e-6,
     )
     amp_weight_map = (
@@ -794,9 +1024,9 @@ def temporal_detail_prior_losses(
     refined_hf = high_frequency(refined, carrier_kernel)
     gt_hf = high_frequency(gt, carrier_kernel)
     base_hf = high_frequency(base, carrier_kernel)
-    analytic_refined = refined if analytic_supervision else refined.detach()
+    analytic_refined = refined if supervised_signal else refined.detach()
     analytic_refined_hf = (
-        refined_hf if analytic_supervision else refined_hf.detach()
+        refined_hf if supervised_signal else refined_hf.detach()
     )
     reconstruction_loss = _charbonnier(analytic_refined - gt).mean()
     highfreq_loss = _charbonnier(analytic_refined_hf - gt_hf).mean()
@@ -828,7 +1058,7 @@ def temporal_detail_prior_losses(
         base_hf,
         eps=relative_eps,
     )
-    if analytic_supervision:
+    if supervised_signal:
         total = (
             float(amplitude_weight) * amplitude_loss +
             float(correction_weight) * correction_loss +
@@ -855,11 +1085,43 @@ def temporal_detail_prior_losses(
         target_hf_mae = (
             high_frequency(target_refined, carrier_kernel) - gt_hf
         ).abs().mean()
+        if prediction_mode == 'wavelet_subband':
+            pred_bands = torch.chunk(amplitude.detach(), 3, dim=1)
+            target_bands = torch.chunk(target_amplitude, 3, dim=1)
+            band_correlations = [
+                _vector_correlation(pred_band, target_band)
+                for pred_band, target_band in zip(pred_bands, target_bands)
+            ]
+            band_maes = [
+                (pred_band - target_band).abs().mean()
+                for pred_band, target_band in zip(pred_bands, target_bands)
+            ]
+            correction_ll, _, _ = haar_dwt2(pred_correction.detach())
+            target_correction_ll, _, _ = haar_dwt2(target_correction)
+            ll_leakage = correction_ll.abs().mean()
+            target_ll_leakage = target_correction_ll.abs().mean()
+        else:
+            band_correlations = [base.new_zeros(()) for _ in range(3)]
+            band_maes = [base.new_zeros(()) for _ in range(3)]
+            ll_leakage = base.new_zeros(())
+            target_ll_leakage = base.new_zeros(())
     return {
         'loss': total,
         'free_residual_mode': base.new_tensor(
             float(prediction_mode == 'free_residual')
         ),
+        'wavelet_subband_mode': base.new_tensor(
+            float(prediction_mode == 'wavelet_subband')
+        ),
+        'wavelet_subband_loss': amplitude_loss,
+        'wavelet_lh_corr': band_correlations[0],
+        'wavelet_hl_corr': band_correlations[1],
+        'wavelet_hh_corr': band_correlations[2],
+        'wavelet_lh_mae': band_maes[0],
+        'wavelet_hl_mae': band_maes[1],
+        'wavelet_hh_mae': band_maes[2],
+        'wavelet_ll_leakage': ll_leakage,
+        'target_wavelet_ll_leakage': target_ll_leakage,
         'amplitude_loss': amplitude_loss,
         'correction_loss': correction_loss,
         'reconstruction_loss': reconstruction_loss,
@@ -955,6 +1217,10 @@ def build_temporal_detail_prior(
             1,
         ),
         amplitude_clip=opts.get('amplitude_clip', 0.05),
+        wavelet_coefficient_clip=opts.get(
+            'wavelet_coefficient_clip',
+            0.05,
+        ),
         correction_clip=opts.get('correction_clip', 0.05),
         carrier_source=opts.get('carrier_source', 'base'),
         carrier_kernel=opts.get('carrier_kernel', 5),

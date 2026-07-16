@@ -35,21 +35,25 @@ def parse_args():
     parser.add_argument(
         '--amplitude_prediction_scale',
         type=int,
-        choices=[1, 4],
+        choices=[1, 2, 4],
         default=None,
-        help='Override native amplitude resolution; 4 predicts at 1/4 scale.',
+        help='Override native signal scale; wavelet subbands use scale 2.',
     )
     parser.add_argument(
         '--prediction_mode',
-        choices=['carrier_amplitude', 'free_residual'],
+        choices=[
+            'carrier_amplitude',
+            'free_residual',
+            'wavelet_subband',
+        ],
         default=None,
-        help='Predict carrier amplitude or a free full-resolution residual.',
+        help='Select carrier, pixel-residual, or Haar-subband prediction.',
     )
     parser.add_argument(
         '--supervision_mode',
-        choices=['analytic', 'target_free'],
+        choices=['analytic', 'target_free', 'wavelet'],
         default=None,
-        help='Use target_free to optimize only final reconstruction quality.',
+        help='Use wavelet for supervised LH/HL/HH coefficient correction.',
     )
     parser.add_argument(
         '--overfit_batches',
@@ -324,7 +328,7 @@ def main():
             message = (
                 f"iter: [{iteration}]/{num_iter}, epoch: [{current_epoch}], "
                 f"loss: [{scalar(outputs['loss']):.6f}], "
-                f"diagnostic signal/corr/rec: "
+                f"target signal/corr/rec: "
                 f"[{scalar(outputs['amplitude_loss']):.6f}/"
                 f"{scalar(outputs['correction_loss']):.6f}/"
                 f"{scalar(outputs['reconstruction_loss']):.6f}], "
@@ -341,28 +345,35 @@ def main():
                 f"{scalar(outputs['native_amplitude_cosine']):.4f}], "
                 f"corr corr/cos: [{scalar(outputs['correction_corr']):.4f}/"
                 f"{scalar(outputs['correction_cosine']):.4f}], "
-                f"signal abs pred/diagnostic: "
+                f"signal abs pred/target: "
                 f"[{scalar(outputs['pred_amplitude_abs']):.6f}/"
                 f"{scalar(outputs['target_amplitude_abs']):.6f}], "
-                f"corr abs pred/diagnostic: "
+                f"corr abs pred/target: "
                 f"[{scalar(outputs['pred_correction_abs']):.6f}/"
                 f"{scalar(outputs['target_correction_abs']):.6f}], "
-                f"diagnostic target +/-: "
+                f"target +/-: "
                 f"[{scalar(outputs['target_positive_ratio']):.4f}/"
                 f"{scalar(outputs['target_negative_ratio']):.4f}], "
-                f"diagnostic scale: [{scalar(outputs['target_safe_scale']):.4f}], "
+                f"target scale: [{scalar(outputs['target_safe_scale']):.4f}], "
+                f"wavelet corr LH/HL/HH: "
+                f"[{scalar(outputs['wavelet_lh_corr']):.4f}/"
+                f"{scalar(outputs['wavelet_hl_corr']):.4f}/"
+                f"{scalar(outputs['wavelet_hh_corr']):.4f}], "
+                f"wavelet LL leak pred/target: "
+                f"[{scalar(outputs['wavelet_ll_leakage']):.8f}/"
+                f"{scalar(outputs['target_wavelet_ll_leakage']):.8f}], "
                 f"aligned feature/injection: "
                 f"[{scalar(outputs['aligned_feature_abs']):.6f}/"
                 f"{scalar(outputs['aligned_injection_abs']):.6f}], "
-                f"PSNR base/prior/diagnostic/delta: "
+                f"PSNR base/prior/target/delta: "
                 f"[{scalar(outputs['base_psnr']):.4f}/"
                 f"{scalar(outputs['refined_psnr']):.4f}/"
                 f"{scalar(outputs['target_psnr']):.4f}/"
                 f"{scalar(outputs['psnr_delta']):+.4f}], "
-                f"diagnostic delta: "
+                f"target delta: "
                 f"[{scalar(outputs['target_psnr_delta']):+.4f}], "
                 f"win: [{scalar(outputs['frame_win_rate']):.4f}], "
-                f"HF base/prior/diagnostic: "
+                f"HF base/prior/target: "
                 f"[{scalar(outputs['base_hf_mae']):.6f}/"
                 f"{scalar(outputs['refined_hf_mae']):.6f}/"
                 f"{scalar(outputs['target_hf_mae']):.6f}]"
