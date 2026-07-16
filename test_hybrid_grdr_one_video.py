@@ -301,6 +301,11 @@ def build_opts(args):
             'loss_type': 'l1',
             'target_mode': args.diffusion_target_mode,
             'target_highfreq_kernel': args.diffusion_target_highfreq_kernel,
+            'wavelet_coefficient_clip': args.diffusion_wavelet_coefficient_clip,
+            'wavelet_condition_scale': args.diffusion_wavelet_condition_scale,
+            'wavelet_condition_include_lowpass': bool(
+                args.diffusion_wavelet_condition_include_lowpass
+            ),
             'carrier_source': args.diffusion_carrier_source,
             'carrier_gain_clip': args.diffusion_carrier_gain_clip,
             'carrier_norm_clip': args.diffusion_carrier_norm_clip,
@@ -470,9 +475,24 @@ def parse_args():
     parser.add_argument(
         '--diffusion_target_mode',
         default='pixel_residual',
-        choices=['pixel_residual', 'highfreq_residual', 'highfreq_gt', 'carrier_gain', 'carrier_amp'],
+        choices=[
+            'pixel_residual',
+            'highfreq_residual',
+            'highfreq_gt',
+            'carrier_gain',
+            'carrier_amp',
+            'wavelet_subband',
+        ],
     )
     parser.add_argument('--diffusion_target_highfreq_kernel', type=int, default=5)
+    parser.add_argument('--diffusion_wavelet_coefficient_clip', type=float, default=0.05)
+    parser.add_argument('--diffusion_wavelet_condition_scale', type=float, default=0.10)
+    parser.add_argument(
+        '--diffusion_wavelet_condition_include_lowpass',
+        type=int,
+        choices=[0, 1],
+        default=1,
+    )
     parser.add_argument(
         '--diffusion_carrier_source',
         default='base',
@@ -577,8 +597,11 @@ def parse_args():
     parser.add_argument(
         '--guidance_mode',
         default='oracle',
-        choices=['oracle', 'coarse', 'predicted'],
-        help='oracle uses GT and is only an upper bound; predicted is the main no-GT path.'
+        choices=['none', 'oracle', 'coarse', 'predicted'],
+        help=(
+            'none runs full-frame refinement; oracle is only an upper bound; '
+            'predicted is the local no-GT path.'
+        )
     )
     parser.add_argument(
         '--refine_mode',
@@ -826,7 +849,9 @@ def main():
                     guidance_rate_cond = rate_cond[:, :args.guidance_rate_dim]
 
             oracle_guidance = model.make_guidance(gt, base)['guidance']
-            if args.guidance_mode == 'oracle':
+            if args.guidance_mode == 'none':
+                guidance = torch.ones_like(base)
+            elif args.guidance_mode == 'oracle':
                 guidance = oracle_guidance
             elif args.guidance_mode == 'coarse':
                 guidance = model.make_coarse_guidance(lq_center, base)
@@ -923,8 +948,11 @@ def main():
                 if args.diffusion_noise_mode == 'shared':
                     if (
                             shared_diffusion_noise is None or
-                            shared_diffusion_noise.shape != base.shape):
-                        shared_diffusion_noise = torch.randn_like(base)
+                            tuple(shared_diffusion_noise.shape) !=
+                            model.diffusion.signal_shape(base)):
+                        shared_diffusion_noise = (
+                            model.diffusion.make_initial_noise(base)
+                        )
                     initial_noise = shared_diffusion_noise
                 if detail_gate is None:
                     detail_gate = model.diffusion.make_detail_gate(
@@ -951,7 +979,9 @@ def main():
                         posinf=0.0,
                         neginf=0.0,
                     )
-                    if (
+                    if model.diffusion.is_wavelet_subband():
+                        pred_signal = pred_signal.clamp(-1.0, 1.0)
+                    elif (
                             not model.diffusion.is_carrier_guided() and
                             args.residual_clip is not None and
                             args.residual_clip > 0):

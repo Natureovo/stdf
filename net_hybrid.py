@@ -532,7 +532,9 @@ class HybridSTDFGRDR(nn.Module):
             base = self.forward_base(x)
         lq = self.center_frame(x)
         guidance_maps = self.make_guidance(gt, base.detach())
-        if guidance_mode == 'oracle':
+        if guidance_mode == 'none':
+            guidance = torch.ones_like(base)
+        elif guidance_mode == 'oracle':
             guidance = guidance_maps['guidance']
         elif guidance_mode == 'coarse':
             guidance = self.make_coarse_guidance(lq, base.detach())
@@ -575,6 +577,15 @@ class HybridSTDFGRDR(nn.Module):
             'effective_write_area': loss_dict['effective_write_area'],
             'base_hf_mag_mae': loss_dict['base_hf_mag_mae'],
             'pred_hf_mag_mae': loss_dict['pred_hf_mag_mae'],
+            'base_psnr': loss_dict['base_psnr'],
+            'pred_psnr': loss_dict['pred_psnr'],
+            'target_psnr': loss_dict['target_psnr'],
+            'pred_psnr_delta': loss_dict['pred_psnr_delta'],
+            'target_psnr_delta': loss_dict['target_psnr_delta'],
+            'wavelet_lh_corr': loss_dict['wavelet_lh_corr'],
+            'wavelet_hl_corr': loss_dict['wavelet_hl_corr'],
+            'wavelet_hh_corr': loss_dict['wavelet_hh_corr'],
+            'wavelet_ll_leakage': loss_dict['wavelet_ll_leakage'],
             'pred_hybrid': loss_dict['pred_hybrid'],
             'write_mask': loss_dict['write_mask'],
             'raw_write_mask': loss_dict['raw_write_mask'],

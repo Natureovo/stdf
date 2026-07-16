@@ -33,13 +33,13 @@ def parse_args():
     parser.add_argument('--split', choices=['train', 'val', 'test'], default='val')
     parser.add_argument(
         '--guidance_mode',
-        choices=['predicted', 'oracle', 'coarse'],
+        choices=['none', 'predicted', 'oracle', 'coarse'],
         default='predicted',
         help='Guidance supplied to the GRDR denoiser.',
     )
     parser.add_argument(
         '--mask_guidance_mode',
-        choices=['same', 'predicted', 'oracle', 'coarse'],
+        choices=['same', 'none', 'predicted', 'oracle', 'coarse'],
         default='same',
         help=(
             'Guidance used only for spatial support and the detail gate. '
@@ -488,7 +488,10 @@ def main():
             base = model.forward_base(x)
             lq_center = model.center_frame(x)
             oracle_guidance = model.make_guidance(gt, base)['guidance'].clamp(0, 1)
-            guidance_by_mode = {'oracle': oracle_guidance}
+            guidance_by_mode = {
+                'none': torch.ones_like(base),
+                'oracle': oracle_guidance,
+            }
             requested_guidance_modes = {
                 condition_guidance_mode,
                 mask_guidance_mode,
@@ -535,8 +538,11 @@ def main():
             if args.noise_mode == 'shared':
                 if (
                         name not in shared_noises or
-                        shared_noises[name].shape != base.shape):
-                    shared_noises[name] = torch.randn_like(base)
+                        tuple(shared_noises[name].shape) !=
+                        model.diffusion.signal_shape(base)):
+                    shared_noises[name] = model.diffusion.make_initial_noise(
+                        base
+                    )
                 initial_noise = shared_noises[name]
             pred_signal = model.diffusion.sample_residual(
                 lq_center,
@@ -554,7 +560,9 @@ def main():
                 posinf=0.0,
                 neginf=0.0,
             )
-            if not model.diffusion.is_carrier_guided():
+            if model.diffusion.is_wavelet_subband():
+                pred_signal = pred_signal.clamp(-1.0, 1.0)
+            elif not model.diffusion.is_carrier_guided():
                 pred_signal = pred_signal.clamp(-0.1, 0.1)
             pred_correction, pred_prior = model.diffusion.signal_to_correction(
                 pred_signal,
@@ -905,6 +913,12 @@ def main():
         'guidance_mode': condition_guidance_mode,
         'condition_guidance_mode': condition_guidance_mode,
         'mask_guidance_mode': mask_guidance_mode,
+        'diffusion_target_mode': model.diffusion.target_mode,
+        'wavelet_coefficient_clip': model.diffusion.wavelet_coefficient_clip,
+        'wavelet_condition_scale': model.diffusion.wavelet_condition_scale,
+        'wavelet_condition_include_lowpass': (
+            model.diffusion.wavelet_condition_include_lowpass
+        ),
         'guidance_diagnostics': {
             'condition_mean': (
                 totals['condition_guidance_mean'] / max(sample_count, 1)
@@ -1006,6 +1020,7 @@ def main():
         f"sampling: {args.sample_mode} ({sample_count}/{source_sample_count}), "
         f"condition/mask guidance: "
         f"{condition_guidance_mode}/{mask_guidance_mode}, "
+        f"target: {model.diffusion.target_mode}, "
         f"noise: {args.noise_mode}, "
         f"mask: {args.mask_mode}"
     )

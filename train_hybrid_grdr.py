@@ -26,9 +26,12 @@ def parse_args():
     )
     parser.add_argument(
         '--guidance_mode',
-        choices=['oracle', 'predicted', 'coarse'],
+        choices=['none', 'oracle', 'predicted', 'coarse'],
         default='oracle',
-        help='Guidance source for GRDR training. oracle is upper bound only.',
+        help=(
+            'none trains full-frame diffusion before local masking; oracle '
+            'is an upper-bound condition only.'
+        ),
     )
     parser.add_argument(
         '--guidance_ckpt',
@@ -389,6 +392,15 @@ def main():
                 effective_write_area = float(outputs['effective_write_area'].detach().cpu())
                 base_hf_mag_mae = float(outputs['base_hf_mag_mae'].detach().cpu())
                 pred_hf_mag_mae = float(outputs['pred_hf_mag_mae'].detach().cpu())
+                base_psnr = float(outputs['base_psnr'].detach().cpu())
+                pred_psnr = float(outputs['pred_psnr'].detach().cpu())
+                target_psnr = float(outputs['target_psnr'].detach().cpu())
+                pred_psnr_delta = float(outputs['pred_psnr_delta'].detach().cpu())
+                target_psnr_delta = float(outputs['target_psnr_delta'].detach().cpu())
+                wavelet_lh_corr = float(outputs['wavelet_lh_corr'].detach().cpu())
+                wavelet_hl_corr = float(outputs['wavelet_hl_corr'].detach().cpu())
+                wavelet_hh_corr = float(outputs['wavelet_hh_corr'].detach().cpu())
+                wavelet_ll_leakage = float(outputs['wavelet_ll_leakage'].detach().cpu())
                 msg = (
                     f"iter: [{num_iter_accum}]/{num_iter}, "
                     f"epoch: [{current_epoch}]/{num_epoch - 1}, "
@@ -417,6 +429,13 @@ def main():
                     f"gate_mean: [{detail_gate_mean:.4f}], "
                     f"eff_area: [{effective_write_area:.4f}], "
                     f"hf_mag_mae: [{base_hf_mag_mae:.6f}/{pred_hf_mag_mae:.6f}], "
+                    f"PSNR base/pred/target delta: "
+                    f"[{base_psnr:.4f}/{pred_psnr:.4f}/{target_psnr:.4f} "
+                    f"{pred_psnr_delta:+.4f}/{target_psnr_delta:+.4f}], "
+                    f"wavelet corr LH/HL/HH: "
+                    f"[{wavelet_lh_corr:.4f}/{wavelet_hl_corr:.4f}/"
+                    f"{wavelet_hh_corr:.4f}], "
+                    f"wavelet LL leak: [{wavelet_ll_leakage:.8f}], "
                     f"guidance_mean: [{guidance_mean:.4f}], "
                     f"write_area: [{write_area:.4f}], "
                     f"base_mean: [{base_mean:.4f}]"
@@ -438,6 +457,17 @@ def main():
                     'stdf_ckpt': args.stdf_ckpt,
                     'guidance_mode': args.guidance_mode,
                     'guidance_ckpt': args.guidance_ckpt,
+                    'diffusion_target_mode': diffusion_opts.get(
+                        'target_mode',
+                        'pixel_residual',
+                    ),
+                    'wavelet_coefficient_clip': diffusion_opts.get(
+                        'wavelet_coefficient_clip',
+                    ),
+                    'wavelet_condition_include_lowpass': diffusion_opts.get(
+                        'wavelet_condition_include_lowpass',
+                        True,
+                    ),
                     'resumed_from': args.resume_ckpt,
                     'state_dict': model.state_dict(),
                     'diffusion_state_dict': model.diffusion.state_dict(),

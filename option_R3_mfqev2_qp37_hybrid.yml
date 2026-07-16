@@ -53,7 +53,8 @@ network:
     enabled: false
     type: GRDR
     freeze_stdf: true
-    in_nc: 1
+    # Diffuse normalized one-level Haar LH/HL/HH corrections.
+    in_nc: 3
     nf: 48
     cond_dim: 128
     rate_dim: 1
@@ -63,42 +64,47 @@ network:
     control_hf_kernel: 5
     num_steps: 1000
     sample_steps: 20
-    loss_type: l1
-    loss_bg_weight: 0.05
+    loss_type: l2
+    loss_bg_weight: 1.0
     rec_weight: 1.0
-    target_mode: carrier_amp
+    target_mode: wavelet_subband
     target_highfreq_kernel: 5
+    wavelet_coefficient_clip: 0.05
+    wavelet_condition_scale: 0.10
+    wavelet_condition_include_lowpass: true
     carrier_source: base
     carrier_gain_clip: 0.08
     carrier_norm_clip: 3.0
     carrier_eps: !!float 1e-4
     carrier_amp_normalize: true
-    detail_gate_mode: multi_cue
+    # Stage 1 isolates diffusion learnability. Local predicted guidance is
+    # introduced only after the full-frame wavelet model is validated.
+    detail_gate_mode: none
     detail_gate_temperature: 8.0
     detail_gate_hf_weight: 1.0
     detail_gate_diff_weight: 0.5
     detail_gate_guidance_weight: 0.5
     detail_gate_qp_weight: 0.25
-    detail_gate_min: 0.05
+    detail_gate_min: 0.0
     train_guidance_threshold: 0.3
-    train_residual_scale: 0.2
+    train_residual_scale: 1.0
     train_residual_clip: 0.05
-    residual_weight: 0.5
-    residual_bg_weight: 0.02
-    residual_sign_weight: 0.0
-    highfreq_magnitude_weight: 1.0
-    highfreq_under_weight: 0.5
+    residual_weight: 1.0
+    residual_bg_weight: 0.0
+    residual_sign_weight: 0.1
+    highfreq_magnitude_weight: 0.5
+    highfreq_under_weight: 0.0
     highfreq_under_ratio: 0.9
-    degrade_weight: 0.5
-    amplitude_over_weight: 1.0
-    amplitude_mean_weight: 1.0
-    amplitude_sparsity_weight: 0.05
+    degrade_weight: 0.1
+    amplitude_over_weight: 0.0
+    amplitude_mean_weight: 0.0
+    amplitude_sparsity_weight: 0.0
     amplitude_sparsity_gamma: 2.0
-    amplitude_focal_weight: 1.0
+    amplitude_focal_weight: 0.0
     amplitude_focal_beta: 4.0
     amplitude_focal_gamma: 2.0
     amplitude_cosine_weight: 0.0
-    amplitude_correlation_weight: 0.1
+    amplitude_correlation_weight: 0.0
     train_use_hard_mask: false
 
   guidance_net:
