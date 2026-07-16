@@ -335,37 +335,58 @@ class HybridSTDFGRDR(nn.Module):
                 guidance,
                 rate_cond=rate_cond,
             )
-            pred_signal = self.diffusion.sample_residual(
-                lq,
-                base,
-                guidance,
-                rate_cond=rate_cond,
-                steps=sample_steps,
-                sampler=sampler,
-                ddim_eta=ddim_eta,
-                initial_noise=initial_noise,
+            initial_noises = (
+                list(initial_noise)
+                if isinstance(initial_noise, (list, tuple)) else
+                [initial_noise]
             )
-            pred_signal = torch.nan_to_num(
-                pred_signal,
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
-            if not self.diffusion.is_carrier_guided():
-                pred_signal = pred_signal.clamp(-0.1, 0.1)
-            correction, _ = self.diffusion.signal_to_correction(
-                pred_signal,
-                lq,
-                base,
-            )
-            gated_correction = detail_gate * correction
-            target_utility = block_utility_scores(
-                base,
-                gt,
-                gated_correction,
-                residual_scale=residual_scale,
-                block_size=self.utility_mask_net.block_size,
-            )
+            utility_samples = []
+            correction_samples = []
+            for teacher_noise in initial_noises:
+                pred_signal = self.diffusion.sample_residual(
+                    lq,
+                    base,
+                    guidance,
+                    rate_cond=rate_cond,
+                    steps=sample_steps,
+                    sampler=sampler,
+                    ddim_eta=ddim_eta,
+                    initial_noise=teacher_noise,
+                )
+                pred_signal = torch.nan_to_num(
+                    pred_signal,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                if not self.diffusion.is_carrier_guided():
+                    pred_signal = pred_signal.clamp(-0.1, 0.1)
+                correction, _ = self.diffusion.signal_to_correction(
+                    pred_signal,
+                    lq,
+                    base,
+                )
+                gated = detail_gate * correction
+                correction_samples.append(gated)
+                utility_samples.append(
+                    block_utility_scores(
+                        base,
+                        gt,
+                        gated,
+                        residual_scale=residual_scale,
+                        block_size=self.utility_mask_net.block_size,
+                    )
+                )
+            utility_stack = torch.stack(utility_samples, dim=0)
+            target_utility = utility_stack.mean(dim=0)
+            teacher_utility_std = utility_stack.std(
+                dim=0,
+                unbiased=False,
+            ).mean()
+            gated_correction = torch.stack(
+                correction_samples,
+                dim=0,
+            ).mean(dim=0)
 
         pred_score = self.predict_utility_scores(
             lq.detach(),
@@ -391,6 +412,11 @@ class HybridSTDFGRDR(nn.Module):
             correlation_weight=self.utility_mask_opts.get(
                 'correlation_weight', 0.25
             ),
+            topk_weight=self.utility_mask_opts.get('topk_weight', 1.0),
+            topk_ratios=self.utility_mask_opts.get(
+                'topk_ratios',
+                [0.05, 0.10, 0.20],
+            ),
             ranking_pairs=self.utility_mask_opts.get('ranking_pairs', 256),
             ranking_margin=self.utility_mask_opts.get('ranking_margin', 0.05),
             ranking_min_target_gap=self.utility_mask_opts.get(
@@ -404,12 +430,14 @@ class HybridSTDFGRDR(nn.Module):
             'utility_ranking_loss': loss_dict['ranking_loss'],
             'utility_ranking_valid_ratio': loss_dict['ranking_valid_ratio'],
             'utility_correlation_loss': loss_dict['correlation_loss'],
+            'utility_topk_loss': loss_dict['topk_loss'],
             'utility_positive_accuracy': loss_dict['positive_accuracy'],
             'target_positive_ratio': loss_dict['target_positive_ratio'],
             'pred_positive_ratio': loss_dict['pred_positive_ratio'],
             'target_normalized': loss_dict['target_normalized'],
             'pred_utility_score': pred_score,
             'target_utility': target_utility,
+            'teacher_utility_std': teacher_utility_std,
             'gated_correction': gated_correction,
             'guidance': guidance,
             'detail_gate': detail_gate,

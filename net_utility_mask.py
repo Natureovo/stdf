@@ -143,12 +143,24 @@ def _pairwise_ranking_loss(
 
 
 class UtilityConvBlock(nn.Module):
-    def __init__(self, in_nc, out_nc, stride=1):
+    def __init__(self, in_nc, out_nc):
         super(UtilityConvBlock, self).__init__()
         self.body = nn.Sequential(
-            nn.Conv2d(in_nc, out_nc, 3, stride=stride, padding=1),
+            nn.Conv2d(
+                in_nc,
+                out_nc,
+                3,
+                padding=1,
+                padding_mode='replicate',
+            ),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_nc, out_nc, 3, padding=1),
+            nn.Conv2d(
+                out_nc,
+                out_nc,
+                3,
+                padding=1,
+                padding_mode='replicate',
+            ),
             nn.ReLU(inplace=True),
         )
 
@@ -165,25 +177,17 @@ class UtilityMaskNet(nn.Module):
             block_size=16,
             use_artifact_features=True):
         super(UtilityMaskNet, self).__init__()
-        if block_size <= 0 or block_size & (block_size - 1):
-            raise ValueError('Utility block_size should be a power of two.')
+        if block_size <= 0:
+            raise ValueError('Utility block_size should be positive.')
         self.block_size = int(block_size)
         self.use_artifact_features = bool(use_artifact_features)
         input_nc = 20 if self.use_artifact_features else 12
-        self.stem = UtilityConvBlock(input_nc, nf)
-        down_blocks = []
-        channels = nf
-        for level in range(int(math.log2(self.block_size))):
-            out_channels = min(nf * (2 ** min(level + 1, 2)), nf * 4)
-            down_blocks.append(
-                UtilityConvBlock(channels, out_channels, stride=2)
-            )
-            channels = out_channels
-        self.down_blocks = nn.ModuleList(down_blocks)
-        self.head = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1),
+        self.block_encoder = nn.Sequential(
+            nn.Conv2d(input_nc * 2, nf, 1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(channels, 1, 1),
+            UtilityConvBlock(nf, nf),
+            UtilityConvBlock(nf, nf),
+            nn.Conv2d(nf, 1, 1),
         )
 
     def forward(self, lq, base, guidance, detail_gate, rate_cond=None):
@@ -195,10 +199,57 @@ class UtilityMaskNet(nn.Module):
             rate_cond=rate_cond,
             use_artifact_features=self.use_artifact_features,
         )
-        feature = self.stem(features)
-        for block in self.down_blocks:
-            feature = block(feature)
-        return self.head(feature)
+        height, width = features.shape[-2:]
+        pad_h = (-height) % self.block_size
+        pad_w = (-width) % self.block_size
+        if pad_h or pad_w:
+            features = F.pad(
+                features,
+                (0, pad_w, 0, pad_h),
+                mode='replicate',
+            )
+        average = F.avg_pool2d(
+            features,
+            kernel_size=self.block_size,
+            stride=self.block_size,
+        )
+        maximum = F.max_pool2d(
+            features,
+            kernel_size=self.block_size,
+            stride=self.block_size,
+        )
+        return self.block_encoder(torch.cat([average, maximum], dim=1))
+
+
+def _balanced_binary_loss(logits, target, eps=1e-6):
+    target = target.to(logits.dtype)
+    reduce_dims = tuple(range(1, target.dim()))
+    positive_ratio = target.mean(dim=reduce_dims, keepdim=True)
+    positive_weight = 0.5 / positive_ratio.clamp_min(eps)
+    negative_weight = 0.5 / (1.0 - positive_ratio).clamp_min(eps)
+    weights = (
+        target * positive_weight +
+        (1.0 - target) * negative_weight
+    )
+    loss = F.binary_cross_entropy_with_logits(
+        logits,
+        target,
+        reduction='none',
+    )
+    return (loss * weights).sum() / weights.sum().clamp_min(eps)
+
+
+def _topk_selection_loss(pred, target, ratios):
+    centered_pred = pred - pred.mean(dim=(2, 3), keepdim=True)
+    losses = []
+    for ratio in ratios:
+        top_target = _exact_top_mask(target, ratio).view_as(target)
+        losses.append(
+            _balanced_binary_loss(centered_pred, top_target.float())
+        )
+    if not losses:
+        return pred.sum() * 0.0
+    return torch.stack(losses).mean()
 
 
 def utility_prediction_losses(
@@ -209,6 +260,8 @@ def utility_prediction_losses(
         positive_weight=0.5,
         ranking_weight=1.0,
         correlation_weight=0.25,
+        topk_weight=1.0,
+        topk_ratios=(0.05, 0.10, 0.20),
         ranking_pairs=256,
         ranking_margin=0.05,
         ranking_min_target_gap=0.05):
@@ -220,7 +273,7 @@ def utility_prediction_losses(
     pred_normalized = torch.tanh(pred_score)
     regression_loss = F.smooth_l1_loss(pred_normalized, target_normalized)
     positive_target = (target_utility > 0).float()
-    positive_loss = F.binary_cross_entropy_with_logits(
+    positive_loss = _balanced_binary_loss(
         pred_score,
         positive_target,
     )
@@ -235,11 +288,17 @@ def utility_prediction_losses(
         pred_score,
         target_normalized,
     )
+    topk_loss = _topk_selection_loss(
+        pred_score,
+        target_normalized,
+        topk_ratios,
+    )
     loss = (
         float(regression_weight) * regression_loss +
         float(positive_weight) * positive_loss +
         float(ranking_weight) * ranking_loss +
-        float(correlation_weight) * correlation_loss
+        float(correlation_weight) * correlation_loss +
+        float(topk_weight) * topk_loss
     )
     pred_positive = pred_score >= 0
     positive_accuracy = (
@@ -252,6 +311,7 @@ def utility_prediction_losses(
         'ranking_loss': ranking_loss,
         'ranking_valid_ratio': ranking_valid_ratio,
         'correlation_loss': correlation_loss,
+        'topk_loss': topk_loss,
         'positive_accuracy': positive_accuracy,
         'target_positive_ratio': positive_target.mean(),
         'pred_positive_ratio': pred_positive.float().mean(),

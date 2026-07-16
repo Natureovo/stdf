@@ -584,6 +584,12 @@ def main():
                     actual_utility,
                     [args.top_ratio],
                 )[float(args.top_ratio)]
+                update_pair_sums(
+                    totals,
+                    'utility_score_target',
+                    pred_utility_score,
+                    actual_utility,
+                )
                 totals['utility_score_mean'] += float(
                     pred_utility_score.mean().cpu()
                 )
@@ -857,6 +863,10 @@ def main():
                 'top_precision': totals['utility_top_precision'] / count,
                 'top_recall': totals['utility_top_recall'] / count,
                 'top_iou': totals['utility_top_iou'] / count,
+                'score_target': pair_diagnostics(
+                    totals,
+                    'utility_score_target',
+                ),
             },
         })
     report = {
@@ -1044,7 +1054,12 @@ def main():
             'GT diagnostic positive ratio, top precision/IoU: '
             f"{gt_diag['actual_positive_ratio']:.4f}/"
             f"{gt_diag['top_precision']:.4f}/"
-            f"{gt_diag['top_iou']:.4f}"
+                f"{gt_diag['top_iou']:.4f}"
+        )
+        print(
+            'GT diagnostic score-target pearson/cosine: '
+            f"{gt_diag['score_target']['pearson']:.6f}/"
+            f"{gt_diag['score_target']['cosine']:.6f}"
         )
     if args.oracle_utility_diagnostic:
         print('\n-- GT-only block utility upper bounds --')

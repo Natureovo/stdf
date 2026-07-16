@@ -34,9 +34,15 @@ def parse_args():
     parser.add_argument('--residual_scale', type=float, default=0.2)
     parser.add_argument(
         '--target_noise_mode',
-        choices=['random', 'zero'],
-        default='random',
+        choices=['antithetic', 'random', 'zero'],
+        default='antithetic',
         help='Noise used by the frozen GRDR teacher when building utility labels.',
+    )
+    parser.add_argument(
+        '--target_samples',
+        type=int,
+        default=2,
+        help='Number of frozen-GRDR utility samples averaged per crop.',
     )
     parser.add_argument('--qp', type=float, default=None)
     return parser.parse_args()
@@ -149,6 +155,23 @@ def count_trainable_params(model):
     return sum(param.numel() for param in model.parameters() if param.requires_grad)
 
 
+def make_teacher_noises(reference, mode, sample_count):
+    sample_count = int(sample_count)
+    if sample_count <= 0:
+        raise ValueError('--target_samples should be positive.')
+    if mode == 'zero':
+        return [torch.zeros_like(reference)]
+    if mode == 'random':
+        return [torch.randn_like(reference) for _ in range(sample_count)]
+    noises = []
+    while len(noises) < sample_count:
+        noise = torch.randn_like(reference)
+        noises.append(noise)
+        if len(noises) < sample_count:
+            noises.append(-noise)
+    return noises
+
+
 def format_top_ratio_metrics(pred, target, ratios):
     parts = []
     stats = utility_top_ratio_overlap_stats(pred, target, ratios)
@@ -189,8 +212,9 @@ def main():
         f"Guidance checkpoint: [{args.guidance_ckpt}]\n"
         f"GRDR checkpoint: [{args.grdr_ckpt}]\n"
         f"Utility initialization: [{args.utility_init_ckpt}]\n"
-        f"Teacher sampler/steps/noise: "
-        f"[{args.sampler}/{args.sample_steps}/{args.target_noise_mode}]\n"
+        f"Teacher sampler/steps/noise/samples: "
+        f"[{args.sampler}/{args.sample_steps}/"
+        f"{args.target_noise_mode}/{args.target_samples}]\n"
         f"Teacher residual scale: [{args.residual_scale}]\n"
         f"\n{'<' * 10} Options {'>' * 10}\n"
         f"{utils.dict2str(opts)}"
@@ -282,10 +306,11 @@ def main():
                 rate_dim,
                 batch_qp,
             )
-            if args.target_noise_mode == 'zero':
-                initial_noise = torch.zeros_like(gt)
-            else:
-                initial_noise = torch.randn_like(gt)
+            initial_noise = make_teacher_noises(
+                gt,
+                args.target_noise_mode,
+                args.target_samples,
+            )
 
             optimizer.zero_grad()
             outputs = model.utility_mask_training_loss(
@@ -318,6 +343,7 @@ def main():
                     f"rank_valid: "
                     f"[{outputs['utility_ranking_valid_ratio'].item():.4f}], "
                     f"corr: [{outputs['utility_correlation_loss'].item():.4f}], "
+                    f"topk: [{outputs['utility_topk_loss'].item():.4f}], "
                     f"pos_acc: [{outputs['utility_positive_accuracy'].item():.4f}], "
                     f"pred_pos: [{outputs['pred_positive_ratio'].item():.4f}], "
                     f"target_pos: [{outputs['target_positive_ratio'].item():.4f}], "
@@ -327,6 +353,7 @@ def main():
                     f"target_mean/std: "
                     f"[{outputs['target_utility'].mean().item():.3e}/"
                     f"{outputs['target_utility'].std(unbiased=False).item():.3e}], "
+                    f"teacher_std: [{outputs['teacher_utility_std'].item():.3e}], "
                     f"{top_message}"
                 )
                 print(msg)
@@ -348,6 +375,7 @@ def main():
                     'sampler': args.sampler,
                     'ddim_eta': args.ddim_eta,
                     'target_noise_mode': args.target_noise_mode,
+                    'target_samples': args.target_samples,
                     'residual_scale': args.residual_scale,
                     'utility_opts': utility_opts,
                 }, checkpoint_path)
