@@ -125,6 +125,21 @@ network:
     std_weight: 0.25
     tv_weight: 0.0005
 
+  utility_mask:
+    enabled: true
+    nf: 32
+    block_size: 16
+    use_artifact_features: true
+    target_clip: 5.0
+    regression_weight: 1.0
+    positive_weight: 0.5
+    ranking_weight: 1.0
+    correlation_weight: 0.25
+    ranking_pairs: 256
+    ranking_margin: 0.05
+    ranking_min_target_gap: 0.05
+    log_top_ratios: [0.05, 0.10, 0.20]
+
   budget_net:
     enabled: true
     in_dim: 18

@@ -6,6 +6,11 @@ from net_direct_residual import build_direct_residual_head, direct_residual_loss
 from net_grdr import build_grdr
 from net_guidance import build_guidance_net, guidance_prediction_losses
 from net_budget import build_budget_net, budget_prediction_losses
+from net_utility_mask import (
+    block_utility_scores,
+    build_utility_mask_net,
+    utility_prediction_losses,
+)
 from net_stdf import MFVQE
 from utils.detail_guidance import compute_detail_guidance
 
@@ -31,6 +36,9 @@ class HybridSTDFGRDR(nn.Module):
         self.diffusion = build_grdr(opts_dict.get('diffusion', {}))
         self.guidance_net = build_guidance_net(opts_dict.get('guidance_net', {}))
         self.budget_net = build_budget_net(opts_dict.get('budget_net', {}))
+        self.utility_mask_net = build_utility_mask_net(
+            opts_dict.get('utility_mask', {})
+        )
         self.direct_residual = build_direct_residual_head(
             opts_dict.get('direct_residual', {})
         )
@@ -40,6 +48,7 @@ class HybridSTDFGRDR(nn.Module):
         self.guidance_opts = opts_dict.get('detail_guidance', {})
         self.guidance_net_opts = opts_dict.get('guidance_net', {})
         self.budget_net_opts = opts_dict.get('budget_net', {})
+        self.utility_mask_opts = opts_dict.get('utility_mask', {})
         self.direct_residual_opts = opts_dict.get('direct_residual', {})
         self.detail_refine_opts = opts_dict.get('detail_refine', {})
 
@@ -80,6 +89,14 @@ class HybridSTDFGRDR(nn.Module):
 
     def unfreeze_budget_net(self):
         for param in self.budget_net.parameters():
+            param.requires_grad = True
+
+    def freeze_utility_mask_net(self):
+        for param in self.utility_mask_net.parameters():
+            param.requires_grad = False
+
+    def unfreeze_utility_mask_net(self):
+        for param in self.utility_mask_net.parameters():
             param.requires_grad = True
 
     def freeze_direct_residual(self):
@@ -125,6 +142,21 @@ class HybridSTDFGRDR(nn.Module):
 
     def predict_budget(self, lq, base, guidance=None, rate_cond=None):
         return self.budget_net(lq, base, guidance=guidance, rate_cond=rate_cond)
+
+    def predict_utility_scores(
+            self,
+            lq,
+            base,
+            guidance,
+            detail_gate,
+            rate_cond=None):
+        return self.utility_mask_net(
+            lq,
+            base,
+            guidance,
+            detail_gate,
+            rate_cond=rate_cond,
+        )
 
     def predict_direct_residual(
             self,
@@ -276,6 +308,113 @@ class HybridSTDFGRDR(nn.Module):
             'oracle_guidance': oracle_guidance,
             'budget_guidance': budget_guidance,
             'guidance_maps': guidance_maps,
+        }
+
+    def utility_mask_training_loss(
+            self,
+            x,
+            gt,
+            rate_cond=None,
+            sample_steps=5,
+            sampler='ddim',
+            ddim_eta=0.0,
+            residual_scale=0.2,
+            initial_noise=None):
+        """Train block utility prediction from frozen predicted corrections."""
+        with torch.no_grad():
+            base = self.forward_base(x)
+            lq = self.center_frame(x)
+            guidance = self.predict_guidance(
+                lq,
+                base,
+                rate_cond=rate_cond,
+            ).clamp(0, 1)
+            detail_gate = self.diffusion.make_detail_gate(
+                lq,
+                base,
+                guidance,
+                rate_cond=rate_cond,
+            )
+            pred_signal = self.diffusion.sample_residual(
+                lq,
+                base,
+                guidance,
+                rate_cond=rate_cond,
+                steps=sample_steps,
+                sampler=sampler,
+                ddim_eta=ddim_eta,
+                initial_noise=initial_noise,
+            )
+            pred_signal = torch.nan_to_num(
+                pred_signal,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            if not self.diffusion.is_carrier_guided():
+                pred_signal = pred_signal.clamp(-0.1, 0.1)
+            correction, _ = self.diffusion.signal_to_correction(
+                pred_signal,
+                lq,
+                base,
+            )
+            gated_correction = detail_gate * correction
+            target_utility = block_utility_scores(
+                base,
+                gt,
+                gated_correction,
+                residual_scale=residual_scale,
+                block_size=self.utility_mask_net.block_size,
+            )
+
+        pred_score = self.predict_utility_scores(
+            lq.detach(),
+            base.detach(),
+            guidance.detach(),
+            detail_gate.detach(),
+            rate_cond=rate_cond,
+        )
+        if pred_score.shape != target_utility.shape:
+            raise ValueError(
+                'Utility score/target shape mismatch: '
+                f'{tuple(pred_score.shape)} vs {tuple(target_utility.shape)}'
+            )
+        loss_dict = utility_prediction_losses(
+            pred_score,
+            target_utility,
+            target_clip=self.utility_mask_opts.get('target_clip', 5.0),
+            regression_weight=self.utility_mask_opts.get(
+                'regression_weight', 1.0
+            ),
+            positive_weight=self.utility_mask_opts.get('positive_weight', 0.5),
+            ranking_weight=self.utility_mask_opts.get('ranking_weight', 1.0),
+            correlation_weight=self.utility_mask_opts.get(
+                'correlation_weight', 0.25
+            ),
+            ranking_pairs=self.utility_mask_opts.get('ranking_pairs', 256),
+            ranking_margin=self.utility_mask_opts.get('ranking_margin', 0.05),
+            ranking_min_target_gap=self.utility_mask_opts.get(
+                'ranking_min_target_gap', 0.05
+            ),
+        )
+        return {
+            'loss': loss_dict['loss'],
+            'utility_regression_loss': loss_dict['regression_loss'],
+            'utility_positive_loss': loss_dict['positive_loss'],
+            'utility_ranking_loss': loss_dict['ranking_loss'],
+            'utility_ranking_valid_ratio': loss_dict['ranking_valid_ratio'],
+            'utility_correlation_loss': loss_dict['correlation_loss'],
+            'utility_positive_accuracy': loss_dict['positive_accuracy'],
+            'target_positive_ratio': loss_dict['target_positive_ratio'],
+            'pred_positive_ratio': loss_dict['pred_positive_ratio'],
+            'target_normalized': loss_dict['target_normalized'],
+            'pred_utility_score': pred_score,
+            'target_utility': target_utility,
+            'gated_correction': gated_correction,
+            'guidance': guidance,
+            'detail_gate': detail_gate,
+            'base': base,
+            'lq': lq,
         }
 
     def training_loss(

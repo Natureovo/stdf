@@ -28,6 +28,11 @@ except ModuleNotFoundError:
 
 import utils
 from net_hybrid import build_hybrid_stdf_grdr
+from net_utility_mask import (
+    block_utility_scores,
+    top_block_mask,
+    utility_top_ratio_overlap_stats,
+)
 
 
 def parse_video_name(path_or_name):
@@ -78,6 +83,24 @@ def load_budget_weights(budget_net, path):
         if not budget_state:
             budget_state = state_dict
         budget_net.load_state_dict(budget_state, strict=True)
+
+
+def load_utility_weights(utility_net, path):
+    state_dict, checkpoint = load_state_dict(path)
+    if 'utility_state_dict' in checkpoint:
+        utility_net.load_state_dict(
+            checkpoint['utility_state_dict'],
+            strict=True,
+        )
+        return
+
+    utility_state = OrderedDict()
+    for key, value in state_dict.items():
+        if key.startswith('utility_mask_net.'):
+            utility_state[key[len('utility_mask_net.'):]] = value
+    if not utility_state:
+        utility_state = state_dict
+    utility_net.load_state_dict(utility_state, strict=True)
 
 
 def extract_direct_residual_state(path):
@@ -296,6 +319,12 @@ def build_opts(args):
             'nf': args.guidance_nf,
             'rate_dim': args.guidance_rate_dim,
             'target_threshold': args.guidance_target_threshold,
+            'feature_normalization': args.guidance_feature_normalization,
+        },
+        'utility_mask': {
+            'nf': args.utility_nf,
+            'block_size': args.utility_block_size,
+            'use_artifact_features': not args.utility_disable_artifact_features,
         },
         'budget_net': {
             'in_dim': 18,
@@ -350,6 +379,7 @@ def parse_args():
     parser.add_argument('--detail_ckpt', default=None)
     parser.add_argument('--guidance_ckpt', default=None)
     parser.add_argument('--budget_ckpt', default=None)
+    parser.add_argument('--utility_ckpt', default=None)
     parser.add_argument('--out', default='outputs/hybrid_grdr')
     parser.add_argument('--save-name', default=None)
     parser.add_argument('--max_frames', type=int, default=None)
@@ -378,6 +408,7 @@ def parse_args():
             'qp_top_ratio',
             'content_top_ratio',
             'content_qp_top_ratio',
+            'utility_predicted',
         ],
     )
     parser.add_argument('--top_ratio', type=float, default=None)
@@ -467,6 +498,19 @@ def parse_args():
     parser.add_argument('--guidance_nf', type=int, default=32)
     parser.add_argument('--guidance_rate_dim', type=int, default=0)
     parser.add_argument('--guidance_target_threshold', type=float, default=0.3)
+    parser.add_argument(
+        '--guidance_feature_normalization',
+        default='raw',
+        choices=['raw', 'sample_minmax'],
+        help='Must match the feature normalization used to train GuidanceNet.',
+    )
+    parser.add_argument('--utility_nf', type=int, default=32)
+    parser.add_argument('--utility_block_size', type=int, default=16)
+    parser.add_argument(
+        '--utility_disable_artifact_features',
+        action='store_true',
+        help='Build the UtilityNet ablation without block/ringing cues.',
+    )
     parser.add_argument('--direct_nf', type=int, default=32)
     parser.add_argument('--direct_rate_dim', type=int, default=0)
     parser.add_argument(
@@ -567,6 +611,23 @@ def main():
             print(f'auto direct_output_mode: {args.direct_output_mode}')
     if args.refine_mode == 'detail' and args.detail_ckpt is None:
         raise ValueError('--detail_ckpt is required when --refine_mode detail.')
+    if args.mask_mode == 'utility_predicted':
+        if args.refine_mode != 'grdr':
+            raise ValueError('utility_predicted is only supported with GRDR.')
+        if args.oracle_residual or args.oracle_diffusion_target:
+            raise ValueError(
+                'utility_predicted is a no-GT main-path mask, not an oracle diagnostic.'
+            )
+        if args.guidance_mode != 'predicted':
+            raise ValueError(
+                'utility_predicted requires --guidance_mode predicted.'
+            )
+        if args.utility_ckpt is None:
+            raise ValueError('--utility_ckpt is required for utility_predicted.')
+        if args.top_ratio is None or not 0.0 < args.top_ratio <= 1.0:
+            raise ValueError(
+                'utility_predicted requires --top_ratio in (0, 1].'
+            )
 
     print(f'loading raw/lq yuv: {args.video}, frames={nfs}, size={w}x{h}')
     raw_y = utils.import_yuv(
@@ -609,6 +670,8 @@ def main():
         if args.budget_ckpt is None:
             raise ValueError('--budget_ckpt is required for --budget_mode predicted.')
         load_budget_weights(model.budget_net, args.budget_ckpt)
+    if args.mask_mode == 'utility_predicted':
+        load_utility_weights(model.utility_mask_net, args.utility_ckpt)
 
     model = model.to(device)
     model.eval()
@@ -627,6 +690,7 @@ def main():
         'diffusion': count_params(model.diffusion),
         'guidance_net': count_params(model.guidance_net),
         'budget_net': count_params(model.budget_net),
+        'utility_mask_net': count_params(model.utility_mask_net),
         'direct_residual': count_params(model.direct_residual),
         'detail_refine': count_params(model.detail_refine),
         'total': count_params(model),
@@ -691,6 +755,17 @@ def main():
     hybrid_time_counter = utils.Counter()
     total_time_counter = utils.Counter()
     hybrid_y = []
+    utility_diag_counters = {
+        name: utils.Counter()
+        for name in [
+            'score_mean',
+            'score_std',
+            'actual_positive_ratio',
+            'top_precision',
+            'top_recall',
+            'top_iou',
+        ]
+    }
     prev_gt_np = None
     prev_lq_np = None
     prev_base_np = None
@@ -720,7 +795,11 @@ def main():
                 rate_dim=max(
                     args.rate_dim,
                     args.guidance_rate_dim,
-                    1 if ('qp' in args.mask_mode or args.budget_mode == 'predicted') else 0,
+                    1 if (
+                        'qp' in args.mask_mode or
+                        args.budget_mode == 'predicted' or
+                        args.mask_mode == 'utility_predicted'
+                    ) else 0,
                 ),
                 qp=args.qp,
             )
@@ -757,7 +836,29 @@ def main():
                 )
                 top_ratio = pred_budget
                 effective_mask_mode = 'top_ratio'
-            if args.soft_guidance:
+            detail_gate = None
+            pred_utility_score = None
+            if args.mask_mode == 'utility_predicted':
+                detail_gate = model.diffusion.make_detail_gate(
+                    lq_center,
+                    base,
+                    guidance.clamp(0, 1),
+                    rate_cond=diffusion_rate_cond,
+                )
+                pred_utility_score = model.predict_utility_scores(
+                    lq_center,
+                    base,
+                    guidance.clamp(0, 1),
+                    detail_gate,
+                    rate_cond=rate_cond,
+                )
+                write_mask, _ = top_block_mask(
+                    pred_utility_score,
+                    base.shape[-2:],
+                    model.utility_mask_net.block_size,
+                    top_ratio,
+                )
+            elif args.soft_guidance:
                 write_mask = guidance.clamp(0, 1)
             else:
                 write_mask = model.diffusion.make_write_mask(
@@ -824,29 +925,95 @@ def main():
                             shared_diffusion_noise.shape != base.shape):
                         shared_diffusion_noise = torch.randn_like(base)
                     initial_noise = shared_diffusion_noise
-                detail_gate = model.diffusion.make_detail_gate(
-                    lq_center,
-                    base,
-                    guidance.clamp(0, 1),
-                    rate_cond=diffusion_rate_cond,
-                )
+                if detail_gate is None:
+                    detail_gate = model.diffusion.make_detail_gate(
+                        lq_center,
+                        base,
+                        guidance.clamp(0, 1),
+                        rate_cond=diffusion_rate_cond,
+                    )
                 effective_write_mask = write_mask * detail_gate
-                refined = model.diffusion.refine(
-                    lq_center,
-                    base,
-                    guidance,
-                    rate_cond=diffusion_rate_cond,
-                    steps=args.sample_steps,
-                    guidance_threshold=args.guidance_threshold,
-                    mask_mode=effective_mask_mode,
-                    top_ratio=top_ratio,
-                    residual_scale=args.residual_scale,
-                    residual_clip=args.residual_clip,
-                    use_hard_mask=not args.soft_guidance,
-                    sampler=args.diffusion_sampler,
-                    ddim_eta=args.diffusion_ddim_eta,
-                    initial_noise=initial_noise,
-                )
+                if args.mask_mode == 'utility_predicted':
+                    pred_signal = model.diffusion.sample_residual(
+                        lq_center,
+                        base,
+                        guidance,
+                        rate_cond=diffusion_rate_cond,
+                        steps=args.sample_steps,
+                        sampler=args.diffusion_sampler,
+                        ddim_eta=args.diffusion_ddim_eta,
+                        initial_noise=initial_noise,
+                    )
+                    pred_signal = torch.nan_to_num(
+                        pred_signal,
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                    )
+                    if (
+                            not model.diffusion.is_carrier_guided() and
+                            args.residual_clip is not None and
+                            args.residual_clip > 0):
+                        pred_signal = pred_signal.clamp(
+                            -args.residual_clip,
+                            args.residual_clip,
+                        )
+                    pred_correction, _ = model.diffusion.signal_to_correction(
+                        pred_signal,
+                        lq_center,
+                        base,
+                    )
+                    actual_utility = block_utility_scores(
+                        base,
+                        gt,
+                        detail_gate * pred_correction,
+                        args.residual_scale,
+                        model.utility_mask_net.block_size,
+                    )
+                    utility_overlap = utility_top_ratio_overlap_stats(
+                        pred_utility_score,
+                        actual_utility,
+                        [top_ratio],
+                    )[float(top_ratio)]
+                    utility_diag_counters['score_mean'].accum(
+                        float(pred_utility_score.mean().cpu())
+                    )
+                    utility_diag_counters['score_std'].accum(
+                        float(pred_utility_score.std(unbiased=False).cpu())
+                    )
+                    utility_diag_counters['actual_positive_ratio'].accum(
+                        float((actual_utility > 0).float().mean().cpu())
+                    )
+                    utility_diag_counters['top_precision'].accum(
+                        float(utility_overlap['precision'].cpu())
+                    )
+                    utility_diag_counters['top_recall'].accum(
+                        float(utility_overlap['recall'].cpu())
+                    )
+                    utility_diag_counters['top_iou'].accum(
+                        float(utility_overlap['iou'].cpu())
+                    )
+                    refined = (
+                        base +
+                        args.residual_scale * effective_write_mask * pred_correction
+                    ).clamp(0, 1)
+                else:
+                    refined = model.diffusion.refine(
+                        lq_center,
+                        base,
+                        guidance,
+                        rate_cond=diffusion_rate_cond,
+                        steps=args.sample_steps,
+                        guidance_threshold=args.guidance_threshold,
+                        mask_mode=effective_mask_mode,
+                        top_ratio=top_ratio,
+                        residual_scale=args.residual_scale,
+                        residual_clip=args.residual_clip,
+                        use_hard_mask=not args.soft_guidance,
+                        sampler=args.diffusion_sampler,
+                        ddim_eta=args.diffusion_ddim_eta,
+                        initial_noise=initial_noise,
+                    )
             sync_if_cuda(device)
             hybrid_time_counter.accum(time.perf_counter() - hybrid_start)
             total_time_counter.accum(time.perf_counter() - total_start)
@@ -968,6 +1135,7 @@ def main():
         'detail_ckpt': args.detail_ckpt,
         'guidance_ckpt': args.guidance_ckpt,
         'budget_ckpt': args.budget_ckpt,
+        'utility_ckpt': args.utility_ckpt,
         'refine_mode': args.refine_mode,
         'sample_steps': args.sample_steps,
         'diffusion_sampler': args.diffusion_sampler,
@@ -977,6 +1145,8 @@ def main():
         'guidance_threshold': args.guidance_threshold,
         'mask_mode': args.mask_mode,
         'top_ratio': args.top_ratio,
+        'utility_block_size': args.utility_block_size,
+        'utility_artifact_features': not args.utility_disable_artifact_features,
         'budget_mode': args.budget_mode,
         'diffusion_control_enabled': args.diffusion_control_enabled,
         'diffusion_control_main_input': args.diffusion_control_main_input,
@@ -1063,6 +1233,10 @@ def main():
             },
         },
         'local_generation_diagnostics': average_metrics(mask_metric_counters),
+        'utility_mask_diagnostics': (
+            average_metrics(utility_diag_counters)
+            if args.mask_mode == 'utility_predicted' else None
+        ),
         'guidance_mean': guidance_counter.get_ave(),
         'write_area_ratio': mask_counter.get_ave(),
         'predicted_budget': budget_counter.get_ave() if budget_counter.time > 0 else None,
@@ -1103,6 +1277,16 @@ def main():
         report['local_generation_diagnostics']['oracle_soft_budget'],
     ))
     print('write area ratio [{:.4f}]'.format(report['write_area_ratio']))
+    if report['utility_mask_diagnostics'] is not None:
+        utility_diag = report['utility_mask_diagnostics']
+        print(
+            'utility actual-positive/top precision/IoU '
+            '[{:.4f}/{:.4f}/{:.4f}]'.format(
+                utility_diag['actual_positive_ratio'],
+                utility_diag['top_precision'],
+                utility_diag['top_iou'],
+            )
+        )
     print('avg total runtime [{:.4f}] s/frame, fps [{}]'.format(
         report['runtime']['avg_total_seconds_per_frame'],
         fmt_optional(report['runtime']['fps_total'], fmt='{:.3f}'),
