@@ -12,6 +12,10 @@ from net_utility_mask import (
     utility_prediction_losses,
 )
 from net_stdf import MFVQE
+from net_temporal_detail_prior import (
+    build_temporal_detail_prior,
+    temporal_detail_prior_losses,
+)
 from utils.detail_guidance import compute_detail_guidance
 
 
@@ -45,12 +49,19 @@ class HybridSTDFGRDR(nn.Module):
         self.detail_refine = build_detail_refine_head(
             opts_dict.get('detail_refine', {})
         )
+        self.temporal_detail_prior = build_temporal_detail_prior(
+            opts_dict.get('temporal_detail_prior', {}),
+            input_frames=self.input_len,
+        )
         self.guidance_opts = opts_dict.get('detail_guidance', {})
         self.guidance_net_opts = opts_dict.get('guidance_net', {})
         self.budget_net_opts = opts_dict.get('budget_net', {})
         self.utility_mask_opts = opts_dict.get('utility_mask', {})
         self.direct_residual_opts = opts_dict.get('direct_residual', {})
         self.detail_refine_opts = opts_dict.get('detail_refine', {})
+        self.temporal_detail_prior_opts = opts_dict.get(
+            'temporal_detail_prior', {}
+        )
 
     def center_frame(self, x):
         frm_lst = [
@@ -113,6 +124,14 @@ class HybridSTDFGRDR(nn.Module):
 
     def unfreeze_detail_refine(self):
         for param in self.detail_refine.parameters():
+            param.requires_grad = True
+
+    def freeze_temporal_detail_prior(self):
+        for param in self.temporal_detail_prior.parameters():
+            param.requires_grad = False
+
+    def unfreeze_temporal_detail_prior(self):
+        for param in self.temporal_detail_prior.parameters():
             param.requires_grad = True
 
     def make_guidance(self, gt, base):
@@ -188,6 +207,21 @@ class HybridSTDFGRDR(nn.Module):
             lq,
             base,
             guidance,
+            rate_cond=rate_cond,
+            return_aux=return_aux,
+        )
+
+    def predict_temporal_detail_prior(
+            self,
+            temporal_lq,
+            base,
+            guidance=None,
+            rate_cond=None,
+            return_aux=False):
+        return self.temporal_detail_prior(
+            temporal_lq,
+            base,
+            guidance=guidance,
             rate_cond=rate_cond,
             return_aux=return_aux,
         )
@@ -731,6 +765,83 @@ class HybridSTDFGRDR(nn.Module):
             'oracle_guidance': guidance_maps['guidance'],
             'guidance_maps': guidance_maps,
         }
+
+    def temporal_detail_prior_training_loss(
+            self,
+            x,
+            gt,
+            rate_cond=None,
+            freeze_base=True,
+            guidance_mode='none',
+            detach_pred_guidance=True):
+        if freeze_base:
+            with torch.no_grad():
+                base = self.forward_base(x)
+        else:
+            base = self.forward_base(x)
+        lq = self.center_frame(x)
+        guidance_maps = self.make_guidance(gt, base.detach())
+        if guidance_mode == 'none':
+            guidance = torch.zeros_like(base)
+        elif guidance_mode == 'oracle':
+            guidance = guidance_maps['guidance']
+        elif guidance_mode == 'coarse':
+            guidance = self.make_coarse_guidance(lq, base.detach())
+        elif guidance_mode == 'predicted':
+            guidance = self.predict_guidance(
+                lq,
+                base.detach(),
+                rate_cond=rate_cond,
+            )
+            if detach_pred_guidance:
+                guidance = guidance.detach()
+        else:
+            raise ValueError(f'Unsupported guidance_mode: {guidance_mode}')
+
+        amplitude, aux = self.predict_temporal_detail_prior(
+            x,
+            base.detach() if freeze_base else base,
+            guidance=guidance,
+            rate_cond=rate_cond,
+            return_aux=True,
+        )
+        opts = self.temporal_detail_prior_opts
+        loss_dict = temporal_detail_prior_losses(
+            amplitude,
+            aux,
+            base.detach() if freeze_base else base,
+            gt,
+            guidance=guidance,
+            apply_guidance_gate=opts.get('apply_guidance_gate', False),
+            guidance_floor=opts.get('guidance_floor', 0.0),
+            correction_scale=opts.get('correction_scale', 1.0),
+            amplitude_weight=opts.get('amplitude_weight', 1.0),
+            correction_weight=opts.get('correction_weight', 2.0),
+            reconstruction_weight=opts.get('reconstruction_weight', 1.0),
+            highfreq_weight=opts.get('highfreq_weight', 0.5),
+            gradient_weight=opts.get('gradient_weight', 0.1),
+            degrade_weight=opts.get('degrade_weight', 0.0),
+            tv_weight=opts.get('tv_weight', 0.001),
+            carrier_source=opts.get('carrier_source', 'base'),
+            carrier_kernel=opts.get('carrier_kernel', 5),
+            carrier_norm_window=opts.get('carrier_norm_window', 9),
+            target_window=opts.get('target_window', 9),
+            amplitude_clip=opts.get('amplitude_clip', 0.05),
+            correction_clip=opts.get('correction_clip', 0.05),
+            carrier_norm_clip=opts.get('carrier_norm_clip', 3.0),
+            ridge_eps=opts.get('ridge_eps', 1e-3),
+            target_safe_scale=opts.get('target_safe_scale', True),
+        )
+        loss_dict.update({
+            'base': base,
+            'lq': lq,
+            'guidance': guidance,
+            'oracle_guidance': guidance_maps['guidance'],
+            'guidance_maps': guidance_maps,
+            'amplitude': amplitude,
+            'prior_aux': aux,
+        })
+        return loss_dict
 
     @torch.no_grad()
     def refine(

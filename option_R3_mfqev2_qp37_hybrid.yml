@@ -170,6 +170,35 @@ network:
     nf: 32
     rate_dim: 1
 
+  # Stage-0 deterministic baseline. It must learn the stable local projection
+  # target before diffusion is asked to model the remaining uncertainty.
+  temporal_detail_prior:
+    enabled: true
+    in_nc: 1
+    input_frames: 7
+    nf: 24
+    rate_dim: 1
+    use_guidance_input: true
+    carrier_source: base
+    carrier_kernel: 5
+    carrier_norm_window: 9
+    carrier_norm_clip: 3.0
+    target_window: 9
+    amplitude_clip: 0.05
+    correction_clip: 0.05
+    ridge_eps: !!float 1e-3
+    target_safe_scale: true
+    apply_guidance_gate: false
+    guidance_floor: 0.0
+    correction_scale: 1.0
+    amplitude_weight: 1.0
+    correction_weight: 2.0
+    reconstruction_weight: 1.0
+    highfreq_weight: 0.5
+    gradient_weight: 0.1
+    degrade_weight: 0.0
+    tv_weight: 0.001
+
   detail_guidance:
     gradient_weight: 0.35
     highfreq_weight: 0.40
