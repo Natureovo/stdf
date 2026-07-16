@@ -33,6 +33,13 @@ def parse_args():
     parser.add_argument('--exp_name', default=None)
     parser.add_argument('--qp', type=float, default=None)
     parser.add_argument(
+        '--amplitude_prediction_scale',
+        type=int,
+        choices=[1, 4],
+        default=None,
+        help='Override native amplitude resolution; 4 predicts at 1/4 scale.',
+    )
+    parser.add_argument(
         '--overfit_batches',
         type=int,
         default=0,
@@ -54,6 +61,10 @@ def load_opts(args):
         opts['train']['interval_print'] = args.interval_print
     if args.interval_save is not None:
         opts['train']['interval_val'] = args.interval_save
+    if args.amplitude_prediction_scale is not None:
+        opts['network']['temporal_detail_prior'][
+            'amplitude_prediction_scale'
+        ] = args.amplitude_prediction_scale
     base_name = args.exp_name or opts['train'].get('exp_name') or 'temporal_detail_prior'
     opts['train']['exp_name'] = '{}_temporal_prior_{}'.format(
         base_name,
@@ -296,6 +307,9 @@ def main():
                 f"{scalar(outputs['gradient_loss']):.6f}], "
                 f"amp corr/cos: [{scalar(outputs['amplitude_corr']):.4f}/"
                 f"{scalar(outputs['amplitude_cosine']):.4f}], "
+                f"native amp corr/cos: "
+                f"[{scalar(outputs['native_amplitude_corr']):.4f}/"
+                f"{scalar(outputs['native_amplitude_cosine']):.4f}], "
                 f"corr corr/cos: [{scalar(outputs['correction_corr']):.4f}/"
                 f"{scalar(outputs['correction_cosine']):.4f}], "
                 f"amp abs pred/target: [{scalar(outputs['pred_amplitude_abs']):.6f}/"
@@ -334,6 +348,9 @@ def main():
                     'guidance_mode': args.guidance_mode,
                     'guidance_ckpt': args.guidance_ckpt,
                     'overfit_batches': args.overfit_batches,
+                    'amplitude_prediction_scale': (
+                        model.temporal_detail_prior.amplitude_prediction_scale
+                    ),
                     'state_dict': model.state_dict(),
                     'temporal_detail_prior_state_dict': (
                         model.temporal_detail_prior.state_dict()

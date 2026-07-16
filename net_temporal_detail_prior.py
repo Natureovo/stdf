@@ -222,6 +222,7 @@ class TemporalDetailPriorNet(nn.Module):
             use_guidance_input=True,
             use_aligned_features=False,
             aligned_feature_channels=64,
+            amplitude_prediction_scale=1,
             amplitude_clip=0.05,
             correction_clip=0.05,
             carrier_source='base',
@@ -236,6 +237,12 @@ class TemporalDetailPriorNet(nn.Module):
         self.use_guidance_input = bool(use_guidance_input)
         self.use_aligned_features = bool(use_aligned_features)
         self.aligned_feature_channels = int(aligned_feature_channels)
+        self.amplitude_prediction_scale = int(amplitude_prediction_scale)
+        if self.amplitude_prediction_scale not in (1, 4):
+            raise ValueError(
+                'amplitude_prediction_scale should be 1 or 4, got '
+                f'{self.amplitude_prediction_scale}.'
+            )
         self.amplitude_clip = float(amplitude_clip)
         self.correction_clip = float(correction_clip)
         self.carrier_source = carrier_source
@@ -266,8 +273,18 @@ class TemporalDetailPriorNet(nn.Module):
             nn.SiLU(inplace=True),
             nn.Linear(nf * 4, nf * 8),
         )
-        self.up1 = FusionBlock(nf * 4 + nf * 2, nf * 2)
-        self.up2 = FusionBlock(nf * 2 + nf, nf)
+        if self.amplitude_prediction_scale == 1:
+            self.up1 = FusionBlock(nf * 4 + nf * 2, nf * 2)
+            self.up2 = FusionBlock(nf * 2 + nf, nf)
+            self.out = nn.Sequential(
+                ResidualBlock(nf),
+                nn.Conv2d(nf, self.in_nc, 3, padding=1),
+            )
+        else:
+            self.coarse_out = nn.Sequential(
+                ResidualBlock(nf * 4),
+                nn.Conv2d(nf * 4, self.in_nc, 3, padding=1),
+            )
         if self.use_aligned_features:
             self.aligned_adapter0 = AlignedFeatureAdapter(
                 self.aligned_feature_channels,
@@ -282,14 +299,15 @@ class TemporalDetailPriorNet(nn.Module):
                 nf * 4,
             )
             self.aligned_scales = nn.Parameter(torch.ones(3))
-        self.out = nn.Sequential(
-            ResidualBlock(nf),
-            nn.Conv2d(nf, self.in_nc, 3, padding=1),
-        )
         nn.init.zeros_(self.global_modulation[-1].weight)
         nn.init.zeros_(self.global_modulation[-1].bias)
-        nn.init.zeros_(self.out[-1].weight)
-        nn.init.zeros_(self.out[-1].bias)
+        output_head = (
+            self.out
+            if self.amplitude_prediction_scale == 1 else
+            self.coarse_out
+        )
+        nn.init.zeros_(output_head[-1].weight)
+        nn.init.zeros_(output_head[-1].bias)
 
     def center_frame(self, temporal_lq):
         expected = self.input_frames * self.in_nc
@@ -408,21 +426,37 @@ class TemporalDetailPriorNet(nn.Module):
         scale = scale[:, :, None, None]
         shift = shift[:, :, None, None]
         mid = mid * (1.0 + 0.1 * torch.tanh(scale)) + 0.1 * shift
-        up1 = F.interpolate(
-            mid,
-            size=enc1.shape[-2:],
-            mode='bilinear',
-            align_corners=False,
-        )
-        up1 = self.up1(torch.cat([up1, enc1], dim=1))
-        up2 = F.interpolate(
-            up1,
-            size=enc0.shape[-2:],
-            mode='bilinear',
-            align_corners=False,
-        )
-        up2 = self.up2(torch.cat([up2, enc0], dim=1))
-        amplitude = torch.tanh(self.out(up2)) * self.amplitude_clip
+        if self.amplitude_prediction_scale == 1:
+            up1 = F.interpolate(
+                mid,
+                size=enc1.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+            up1 = self.up1(torch.cat([up1, enc1], dim=1))
+            up2 = F.interpolate(
+                up1,
+                size=enc0.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+            up2 = self.up2(torch.cat([up2, enc0], dim=1))
+            amplitude_native = (
+                torch.tanh(self.out(up2)) * self.amplitude_clip
+            )
+        else:
+            amplitude_native = (
+                torch.tanh(self.coarse_out(mid)) * self.amplitude_clip
+            )
+        if amplitude_native.shape[-2:] == base.shape[-2:]:
+            amplitude = amplitude_native
+        else:
+            amplitude = F.interpolate(
+                amplitude_native,
+                size=base.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
         carrier, direction, carrier_rms = make_carrier_direction(
             center,
             base,
@@ -440,6 +474,10 @@ class TemporalDetailPriorNet(nn.Module):
             )
         aux = {
             'amplitude': amplitude,
+            'amplitude_native': amplitude_native,
+            'amplitude_prediction_scale': base.new_tensor(
+                float(self.amplitude_prediction_scale)
+            ),
             'correction': correction,
             'carrier': carrier,
             'direction': direction,
@@ -492,6 +530,58 @@ def _psnr_per_sample(pred, target):
     return -10.0 * torch.log10(mse)
 
 
+def _project_target_to_native_amplitude(
+        target,
+        base,
+        gt,
+        native_size,
+        correction_clip,
+        ridge_eps,
+        safe_global_scale):
+    """Constrain the analytic target to the model's amplitude resolution."""
+    target_native = F.adaptive_avg_pool2d(target['amplitude'], native_size)
+    target_amplitude = F.interpolate(
+        target_native,
+        size=base.shape[-2:],
+        mode='bilinear',
+        align_corners=False,
+    )
+    target_correction = target_amplitude * target['direction']
+    if correction_clip is not None and float(correction_clip) > 0:
+        target_correction = target_correction.clamp(
+            -float(correction_clip),
+            float(correction_clip),
+        )
+    if safe_global_scale:
+        residual = gt - base
+        spatial_dims = tuple(range(1, target_correction.dim()))
+        numerator = (target_correction * residual).sum(
+            dim=spatial_dims,
+            keepdim=True,
+        )
+        denominator = target_correction.square().sum(
+            dim=spatial_dims,
+            keepdim=True,
+        ) + ridge_eps
+        target_scale = (numerator / denominator).clamp(0.0, 1.0)
+        target_native = target_native * target_scale
+        target_amplitude = target_amplitude * target_scale
+        target_correction = target_correction * target_scale
+    else:
+        target_scale = target_correction.new_ones(
+            (target_correction.size(0),) +
+            (1,) * (target_correction.dim() - 1)
+        )
+    target.update({
+        'amplitude_native': target_native,
+        'amplitude': target_amplitude,
+        'correction': target_correction,
+        'refined': (base + target_correction).clamp(0, 1),
+        'target_scale': target_scale,
+    })
+    return target
+
+
 def temporal_detail_prior_losses(
         amplitude,
         aux,
@@ -518,6 +608,10 @@ def temporal_detail_prior_losses(
         ridge_eps=1e-3,
         target_safe_scale=True):
     center = aux['center']
+    amplitude_native = aux.get('amplitude_native', amplitude)
+    uses_coarse_amplitude = (
+        amplitude_native.shape[-2:] != amplitude.shape[-2:]
+    )
     target = make_local_ridge_target(
         center,
         base.detach(),
@@ -530,19 +624,43 @@ def temporal_detail_prior_losses(
         correction_clip=correction_clip,
         carrier_norm_clip=carrier_norm_clip,
         ridge_eps=ridge_eps,
-        safe_global_scale=target_safe_scale,
+        safe_global_scale=(target_safe_scale and not uses_coarse_amplitude),
     )
+    if uses_coarse_amplitude:
+        target = _project_target_to_native_amplitude(
+            target,
+            base.detach(),
+            gt,
+            native_size=amplitude_native.shape[-2:],
+            correction_clip=correction_clip,
+            ridge_eps=ridge_eps,
+            safe_global_scale=target_safe_scale,
+        )
+    else:
+        target['amplitude_native'] = target['amplitude']
     target_amplitude = target['amplitude']
+    target_amplitude_native = target['amplitude_native']
     target_correction = target['correction']
     pred_correction = aux['correction']
 
-    carrier_weight = target['carrier_rms'] / (
-        target['carrier_rms'].mean(dim=(2, 3), keepdim=True) + 1e-6
+    carrier_weight_native = F.adaptive_avg_pool2d(
+        target['carrier_rms'],
+        amplitude_native.shape[-2:],
     )
-    target_weight = 1.0 + target_amplitude.abs() / max(float(amplitude_clip), 1e-6)
-    amp_weight_map = (0.25 + carrier_weight.clamp(max=4.0)) * target_weight
+    carrier_weight_native = carrier_weight_native / (
+        carrier_weight_native.mean(dim=(2, 3), keepdim=True) + 1e-6
+    )
+    target_weight_native = 1.0 + target_amplitude_native.abs() / max(
+        float(amplitude_clip),
+        1e-6,
+    )
+    amp_weight_map = (
+        0.25 + carrier_weight_native.clamp(max=4.0)
+    ) * target_weight_native
     amplitude_loss = (
-        _charbonnier(amplitude - target_amplitude) * amp_weight_map
+        _charbonnier(
+            amplitude_native - target_amplitude_native
+        ) * amp_weight_map
     ).sum() / (amp_weight_map.sum() + 1e-6)
     correction_loss = _charbonnier(
         pred_correction - target_correction
@@ -571,8 +689,14 @@ def temporal_detail_prior_losses(
         (refined - gt).abs() - (base - gt).abs().detach()
     ).mean()
     amplitude_tv = (
-        (amplitude[:, :, :, 1:] - amplitude[:, :, :, :-1]).abs().mean() +
-        (amplitude[:, :, 1:, :] - amplitude[:, :, :-1, :]).abs().mean()
+        (
+            amplitude_native[:, :, :, 1:] -
+            amplitude_native[:, :, :, :-1]
+        ).abs().mean() +
+        (
+            amplitude_native[:, :, 1:, :] -
+            amplitude_native[:, :, :-1, :]
+        ).abs().mean()
     )
     total = (
         float(amplitude_weight) * amplitude_loss +
@@ -605,12 +729,21 @@ def temporal_detail_prior_losses(
         'refined': refined,
         'target_refined': target_refined,
         'target_amplitude': target_amplitude,
+        'target_amplitude_native': target_amplitude_native,
         'target_correction': target_correction,
         'applied_correction': applied_correction,
         'target_applied_correction': target_applied_correction,
         'gate': gate,
         'amplitude_corr': _vector_correlation(amplitude, target_amplitude),
         'amplitude_cosine': _vector_cosine(amplitude, target_amplitude),
+        'native_amplitude_corr': _vector_correlation(
+            amplitude_native,
+            target_amplitude_native,
+        ),
+        'native_amplitude_cosine': _vector_cosine(
+            amplitude_native,
+            target_amplitude_native,
+        ),
         'correction_corr': _vector_correlation(pred_correction, target_correction),
         'correction_cosine': _vector_cosine(pred_correction, target_correction),
         'pred_amplitude_abs': amplitude.abs().mean(),
@@ -630,6 +763,10 @@ def temporal_detail_prior_losses(
         'base_hf_mae': base_hf_mae,
         'refined_hf_mae': refined_hf_mae,
         'target_hf_mae': target_hf_mae,
+        'amplitude_prediction_scale': aux.get(
+            'amplitude_prediction_scale',
+            base.new_ones(()),
+        ),
         'aligned_feature_abs': aux.get(
             'aligned_feature_abs',
             base.new_zeros(()),
@@ -656,6 +793,10 @@ def build_temporal_detail_prior(
         aligned_feature_channels=opts.get(
             'aligned_feature_channels',
             aligned_feature_channels,
+        ),
+        amplitude_prediction_scale=opts.get(
+            'amplitude_prediction_scale',
+            1,
         ),
         amplitude_clip=opts.get('amplitude_clip', 0.05),
         correction_clip=opts.get('correction_clip', 0.05),

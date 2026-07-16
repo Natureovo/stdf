@@ -32,6 +32,13 @@ def parse_args():
     parser.add_argument('--qp', type=float, default=None)
     parser.add_argument('--max_samples', type=int, default=None)
     parser.add_argument(
+        '--amplitude_prediction_scale',
+        type=int,
+        choices=[1, 4],
+        default=None,
+        help='Override native amplitude resolution for checkpoint compatibility.',
+    )
+    parser.add_argument(
         '--sample_mode',
         choices=['sequential', 'uniform', 'video_balanced'],
         default='video_balanced',
@@ -79,18 +86,31 @@ def load_guidance_weights(guidance_net, path):
 def load_prior_weights(prior_net, path):
     checkpoint = torch.load(path, map_location='cpu')
     if 'temporal_detail_prior_state_dict' in checkpoint:
-        prior_net.load_state_dict(
-            checkpoint['temporal_detail_prior_state_dict'],
-            strict=True,
+        prior_state = checkpoint['temporal_detail_prior_state_dict']
+    else:
+        state = clean_state_dict(checkpoint.get('state_dict', checkpoint))
+        prior_state = OrderedDict()
+        prefix = 'temporal_detail_prior.'
+        for key, value in state.items():
+            if key.startswith(prefix):
+                prior_state[key[len(prefix):]] = value
+        prior_state = prior_state or state
+    checkpoint_scale = checkpoint.get('amplitude_prediction_scale')
+    if checkpoint_scale is None:
+        if any(key.startswith('coarse_out.') for key in prior_state):
+            checkpoint_scale = 4
+        elif any(key.startswith('out.') for key in prior_state):
+            checkpoint_scale = 1
+    if (
+            checkpoint_scale is not None and
+            int(checkpoint_scale) != prior_net.amplitude_prediction_scale):
+        raise ValueError(
+            f'Checkpoint amplitude scale is {int(checkpoint_scale)}, but the '
+            f'model uses {prior_net.amplitude_prediction_scale}. Pass '
+            f'--amplitude_prediction_scale {int(checkpoint_scale)} to validate '
+            'this checkpoint.'
         )
-        return
-    state = clean_state_dict(checkpoint.get('state_dict', checkpoint))
-    prior_state = OrderedDict()
-    prefix = 'temporal_detail_prior.'
-    for key, value in state.items():
-        if key.startswith(prefix):
-            prior_state[key[len(prefix):]] = value
-    prior_net.load_state_dict(prior_state or state, strict=True)
+    prior_net.load_state_dict(prior_state, strict=True)
 
 
 def evenly_spaced(items, count):
@@ -147,6 +167,10 @@ def batch_frame_indices(batch, batch_size):
 def main():
     args = parse_args()
     opts = load_opts(args.opt_path)
+    if args.amplitude_prediction_scale is not None:
+        opts['network']['temporal_detail_prior'][
+            'amplitude_prediction_scale'
+        ] = args.amplitude_prediction_scale
     prior_opts = opts['network'].get('temporal_detail_prior', {})
     guidance_opts = opts['network'].get('guidance_net', {})
     rate_dim = max(
@@ -212,6 +236,8 @@ def main():
         'target_frame_win_rate',
         'amplitude_corr',
         'amplitude_cosine',
+        'native_amplitude_corr',
+        'native_amplitude_cosine',
         'correction_corr',
         'correction_cosine',
         'pred_amplitude_abs',
@@ -223,6 +249,7 @@ def main():
         'target_safe_scale',
         'aligned_feature_abs',
         'aligned_injection_abs',
+        'amplitude_prediction_scale',
         'base_hf_mae',
         'refined_hf_mae',
         'target_hf_mae',
@@ -376,6 +403,12 @@ def main():
         'amplitude pearson/cosine, correction pearson/cosine: '
         f"{result['amplitude_corr']:.6f}/{result['amplitude_cosine']:.6f}, "
         f"{result['correction_corr']:.6f}/{result['correction_cosine']:.6f}"
+    )
+    print(
+        'native-scale amplitude pearson/cosine, prediction scale: '
+        f"{result['native_amplitude_corr']:.6f}/"
+        f"{result['native_amplitude_cosine']:.6f}, "
+        f"1/{result['amplitude_prediction_scale']:.0f}"
     )
     print(
         'abs amplitude pred/target, correction pred/target: '
