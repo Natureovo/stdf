@@ -179,6 +179,10 @@ network:
     nf: 24
     rate_dim: 1
     use_guidance_input: true
+    # Inject the frozen 64-channel deformable STDF fusion feature at all
+    # three prior scales. This is the only architectural variable in this run.
+    use_aligned_features: true
+    aligned_feature_channels: 64
     carrier_source: base
     carrier_kernel: 5
     carrier_norm_window: 9

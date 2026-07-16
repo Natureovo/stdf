@@ -182,10 +182,12 @@ class MFVQE(nn.Module):
             out_nc=opts_dict['qenet']['out_nc']
         )
 
-    def forward(self, x):
-        out = self.ffnet(x)
-        out = self.qenet(out)
+    def forward(self, x, return_fused_feat=False):
+        fused_feat = self.ffnet(x)
+        out = self.qenet(fused_feat)
         # e.g., B C=[B1 B2 B3 R1 R2 R3 G1 G2 G3] H W, B C=[Y1 Y2 Y3] H W or B C=[B1 ... B7 R1 ... R7 G1 ... G7] H W
         frm_lst = [self.radius + idx_c * self.input_len for idx_c in range(self.in_nc)]
         out += x[:, frm_lst, ...]  # res: add middle frame
+        if return_fused_feat:
+            return out, fused_feat
         return out

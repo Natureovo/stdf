@@ -52,6 +52,7 @@ class HybridSTDFGRDR(nn.Module):
         self.temporal_detail_prior = build_temporal_detail_prior(
             opts_dict.get('temporal_detail_prior', {}),
             input_frames=self.input_len,
+            aligned_feature_channels=opts_dict['stdf']['out_nc'],
         )
         self.guidance_opts = opts_dict.get('detail_guidance', {})
         self.guidance_net_opts = opts_dict.get('guidance_net', {})
@@ -217,17 +218,22 @@ class HybridSTDFGRDR(nn.Module):
             base,
             guidance=None,
             rate_cond=None,
+            aligned_features=None,
             return_aux=False):
         return self.temporal_detail_prior(
             temporal_lq,
             base,
             guidance=guidance,
             rate_cond=rate_cond,
+            aligned_features=aligned_features,
             return_aux=return_aux,
         )
 
-    def forward_base(self, x):
-        return self.enhancer(x)
+    def forward_base(self, x, return_aligned_features=False):
+        return self.enhancer(
+            x,
+            return_fused_feat=return_aligned_features,
+        )
 
     def guidance_training_loss(self, x, gt, rate_cond=None, freeze_base=True):
         if freeze_base:
@@ -776,9 +782,23 @@ class HybridSTDFGRDR(nn.Module):
             detach_pred_guidance=True):
         if freeze_base:
             with torch.no_grad():
-                base = self.forward_base(x)
+                if self.temporal_detail_prior.use_aligned_features:
+                    base, aligned_features = self.forward_base(
+                        x,
+                        return_aligned_features=True,
+                    )
+                else:
+                    base = self.forward_base(x)
+                    aligned_features = None
         else:
-            base = self.forward_base(x)
+            if self.temporal_detail_prior.use_aligned_features:
+                base, aligned_features = self.forward_base(
+                    x,
+                    return_aligned_features=True,
+                )
+            else:
+                base = self.forward_base(x)
+                aligned_features = None
         lq = self.center_frame(x)
         guidance_maps = self.make_guidance(gt, base.detach())
         if guidance_mode == 'none':
@@ -803,6 +823,7 @@ class HybridSTDFGRDR(nn.Module):
             base.detach() if freeze_base else base,
             guidance=guidance,
             rate_cond=rate_cond,
+            aligned_features=aligned_features,
             return_aux=True,
         )
         opts = self.temporal_detail_prior_opts

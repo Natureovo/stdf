@@ -221,6 +221,8 @@ def main():
         'target_positive_ratio',
         'target_negative_ratio',
         'target_safe_scale',
+        'aligned_feature_abs',
+        'aligned_injection_abs',
         'base_hf_mae',
         'refined_hf_mae',
         'target_hf_mae',
@@ -231,7 +233,14 @@ def main():
             gt = batch['gt'].to(device, non_blocking=True)
             lq_data = batch['lq'].to(device, non_blocking=True)
             temporal_lq = flatten_temporal_lq(lq_data)
-            base = model.forward_base(temporal_lq)
+            if model.temporal_detail_prior.use_aligned_features:
+                base, aligned_features = model.forward_base(
+                    temporal_lq,
+                    return_aligned_features=True,
+                )
+            else:
+                base = model.forward_base(temporal_lq)
+                aligned_features = None
             lq = model.center_frame(temporal_lq)
             batch_qp = batch.get('qp', args.qp)
             rate_cond = make_rate_cond(
@@ -257,6 +266,7 @@ def main():
                 base,
                 guidance=guidance,
                 rate_cond=rate_cond,
+                aligned_features=aligned_features,
                 return_aux=True,
             )
             metrics = temporal_detail_prior_losses(
@@ -378,6 +388,11 @@ def main():
         f"{result['target_negative_ratio']:.4f}"
     )
     print(f"target analytic safety scale: {result['target_safe_scale']:.6f}")
+    print(
+        'aligned feature/injection abs: '
+        f"{result['aligned_feature_abs']:.8f}/"
+        f"{result['aligned_injection_abs']:.8f}"
+    )
     print(
         'HF MAE base/prior/target, prior-base: '
         f"{result['base_hf_mae']:.8f}/{result['refined_hf_mae']:.8f}/"

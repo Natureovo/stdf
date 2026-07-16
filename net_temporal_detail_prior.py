@@ -180,14 +180,37 @@ class FusionBlock(nn.Module):
         return self.res(self.proj(x))
 
 
+class AlignedFeatureAdapter(nn.Module):
+    """Project frozen STDF fusion features into one prior feature scale."""
+
+    def __init__(self, in_channels, out_channels):
+        super(AlignedFeatureAdapter, self).__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1),
+            nn.GroupNorm(_group_count(out_channels), out_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+        )
+
+    def forward(self, x, output_size):
+        if x.shape[-2:] != output_size:
+            x = F.interpolate(
+                x,
+                size=output_size,
+                mode='bilinear',
+                align_corners=False,
+            )
+        return self.body(x)
+
+
 class TemporalDetailPriorNet(nn.Module):
     """Deterministic temporal prior for local carrier amplitude.
 
-    The seven LQ frames are mixed as channels at full resolution. STDF already
-    supplies an aligned stable base; temporal statistics expose disagreement
-    and motion evidence without creating a memory-heavy 3D feature volume.
-    Global pooled bottleneck modulation provides whole-frame context for the
-    local amplitude prediction.
+    The seven LQ frames are mixed as channels at full resolution. Optional
+    frozen STDF deformable-fusion features inject aligned temporal evidence at
+    all three encoder scales. Temporal statistics expose disagreement and
+    motion evidence without creating a memory-heavy 3D feature volume, while
+    global pooled bottleneck modulation supplies whole-frame context.
     """
 
     def __init__(
@@ -197,6 +220,8 @@ class TemporalDetailPriorNet(nn.Module):
             nf=24,
             rate_dim=0,
             use_guidance_input=True,
+            use_aligned_features=False,
+            aligned_feature_channels=64,
             amplitude_clip=0.05,
             correction_clip=0.05,
             carrier_source='base',
@@ -209,6 +234,8 @@ class TemporalDetailPriorNet(nn.Module):
         self.input_frames = int(input_frames)
         self.rate_dim = int(rate_dim)
         self.use_guidance_input = bool(use_guidance_input)
+        self.use_aligned_features = bool(use_aligned_features)
+        self.aligned_feature_channels = int(aligned_feature_channels)
         self.amplitude_clip = float(amplitude_clip)
         self.correction_clip = float(correction_clip)
         self.carrier_source = carrier_source
@@ -241,6 +268,20 @@ class TemporalDetailPriorNet(nn.Module):
         )
         self.up1 = FusionBlock(nf * 4 + nf * 2, nf * 2)
         self.up2 = FusionBlock(nf * 2 + nf, nf)
+        if self.use_aligned_features:
+            self.aligned_adapter0 = AlignedFeatureAdapter(
+                self.aligned_feature_channels,
+                nf,
+            )
+            self.aligned_adapter1 = AlignedFeatureAdapter(
+                self.aligned_feature_channels,
+                nf * 2,
+            )
+            self.aligned_adapter2 = AlignedFeatureAdapter(
+                self.aligned_feature_channels,
+                nf * 4,
+            )
+            self.aligned_scales = nn.Parameter(torch.ones(3))
         self.out = nn.Sequential(
             ResidualBlock(nf),
             nn.Conv2d(nf, self.in_nc, 3, padding=1),
@@ -319,6 +360,7 @@ class TemporalDetailPriorNet(nn.Module):
             base,
             guidance=None,
             rate_cond=None,
+            aligned_features=None,
             return_aux=False):
         features, center = self.make_features(
             temporal_lq,
@@ -327,8 +369,40 @@ class TemporalDetailPriorNet(nn.Module):
             rate_cond=rate_cond,
         )
         enc0 = self.stem(features)
+        aligned_injections = []
+        if self.use_aligned_features:
+            if aligned_features is None:
+                raise ValueError(
+                    'aligned_features is required when use_aligned_features '
+                    'is true.'
+                )
+            if aligned_features.size(1) != self.aligned_feature_channels:
+                raise ValueError(
+                    f'Expected {self.aligned_feature_channels} aligned feature '
+                    f'channels, got {aligned_features.size(1)}.'
+                )
+            injection0 = self.aligned_adapter0(
+                aligned_features,
+                enc0.shape[-2:],
+            ) * torch.tanh(self.aligned_scales[0])
+            enc0 = enc0 + injection0
+            aligned_injections.append(injection0)
         enc1 = self.down1(enc0)
+        if self.use_aligned_features:
+            injection1 = self.aligned_adapter1(
+                aligned_features,
+                enc1.shape[-2:],
+            ) * torch.tanh(self.aligned_scales[1])
+            enc1 = enc1 + injection1
+            aligned_injections.append(injection1)
         enc2 = self.down2(enc1)
+        if self.use_aligned_features:
+            injection2 = self.aligned_adapter2(
+                aligned_features,
+                enc2.shape[-2:],
+            ) * torch.tanh(self.aligned_scales[2])
+            enc2 = enc2 + injection2
+            aligned_injections.append(injection2)
         mid = self.mid(enc2)
         scale, shift = torch.chunk(self.global_modulation(enc2), 2, dim=1)
         scale = scale[:, :, None, None]
@@ -371,6 +445,19 @@ class TemporalDetailPriorNet(nn.Module):
             'direction': direction,
             'carrier_rms': carrier_rms,
             'center': center,
+            'aligned_feature_abs': (
+                aligned_features.abs().mean()
+                if aligned_features is not None else
+                base.new_zeros(())
+            ),
+            'aligned_injection_abs': (
+                torch.stack([
+                    injection.abs().mean()
+                    for injection in aligned_injections
+                ]).mean()
+                if aligned_injections else
+                base.new_zeros(())
+            ),
         }
         if return_aux:
             return amplitude, aux
@@ -543,10 +630,21 @@ def temporal_detail_prior_losses(
         'base_hf_mae': base_hf_mae,
         'refined_hf_mae': refined_hf_mae,
         'target_hf_mae': target_hf_mae,
+        'aligned_feature_abs': aux.get(
+            'aligned_feature_abs',
+            base.new_zeros(()),
+        ),
+        'aligned_injection_abs': aux.get(
+            'aligned_injection_abs',
+            base.new_zeros(()),
+        ),
     }
 
 
-def build_temporal_detail_prior(opts=None, input_frames=7):
+def build_temporal_detail_prior(
+        opts=None,
+        input_frames=7,
+        aligned_feature_channels=64):
     opts = opts or {}
     return TemporalDetailPriorNet(
         in_nc=opts.get('in_nc', 1),
@@ -554,6 +652,11 @@ def build_temporal_detail_prior(opts=None, input_frames=7):
         nf=opts.get('nf', 24),
         rate_dim=opts.get('rate_dim', 0),
         use_guidance_input=opts.get('use_guidance_input', True),
+        use_aligned_features=opts.get('use_aligned_features', False),
+        aligned_feature_channels=opts.get(
+            'aligned_feature_channels',
+            aligned_feature_channels,
+        ),
         amplitude_clip=opts.get('amplitude_clip', 0.05),
         correction_clip=opts.get('correction_clip', 0.05),
         carrier_source=opts.get('carrier_source', 'base'),
