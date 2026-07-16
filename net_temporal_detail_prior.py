@@ -204,12 +204,13 @@ class AlignedFeatureAdapter(nn.Module):
 
 
 class TemporalDetailPriorNet(nn.Module):
-    """Deterministic temporal prior for local carrier amplitude.
+    """Deterministic temporal refinement with configurable output space.
 
     The seven LQ frames are mixed as channels at full resolution. Optional
     frozen STDF deformable-fusion features inject aligned temporal evidence at
-    all three encoder scales. Temporal statistics expose disagreement and
-    motion evidence without creating a memory-heavy 3D feature volume, while
+    all three encoder scales. The head predicts either a local carrier
+    amplitude or a bounded free residual. Temporal statistics expose
+    disagreement and motion evidence without a memory-heavy 3D volume, while
     global pooled bottleneck modulation supplies whole-frame context.
     """
 
@@ -222,6 +223,7 @@ class TemporalDetailPriorNet(nn.Module):
             use_guidance_input=True,
             use_aligned_features=False,
             aligned_feature_channels=64,
+            prediction_mode='carrier_amplitude',
             amplitude_prediction_scale=1,
             amplitude_clip=0.05,
             correction_clip=0.05,
@@ -237,11 +239,24 @@ class TemporalDetailPriorNet(nn.Module):
         self.use_guidance_input = bool(use_guidance_input)
         self.use_aligned_features = bool(use_aligned_features)
         self.aligned_feature_channels = int(aligned_feature_channels)
+        self.prediction_mode = str(prediction_mode)
+        if self.prediction_mode not in ('carrier_amplitude', 'free_residual'):
+            raise ValueError(
+                'prediction_mode should be carrier_amplitude or '
+                f'free_residual, got {self.prediction_mode}.'
+            )
         self.amplitude_prediction_scale = int(amplitude_prediction_scale)
         if self.amplitude_prediction_scale not in (1, 4):
             raise ValueError(
                 'amplitude_prediction_scale should be 1 or 4, got '
                 f'{self.amplitude_prediction_scale}.'
+            )
+        if (
+                self.prediction_mode == 'free_residual' and
+                self.amplitude_prediction_scale != 1):
+            raise ValueError(
+                'free_residual requires amplitude_prediction_scale=1 because '
+                'it predicts a full-resolution correction.'
             )
         self.amplitude_clip = float(amplitude_clip)
         self.correction_clip = float(correction_clip)
@@ -273,13 +288,23 @@ class TemporalDetailPriorNet(nn.Module):
             nn.SiLU(inplace=True),
             nn.Linear(nf * 4, nf * 8),
         )
-        if self.amplitude_prediction_scale == 1:
+        self.use_full_decoder = (
+            self.prediction_mode == 'free_residual' or
+            self.amplitude_prediction_scale == 1
+        )
+        if self.use_full_decoder:
             self.up1 = FusionBlock(nf * 4 + nf * 2, nf * 2)
             self.up2 = FusionBlock(nf * 2 + nf, nf)
-            self.out = nn.Sequential(
-                ResidualBlock(nf),
-                nn.Conv2d(nf, self.in_nc, 3, padding=1),
-            )
+            if self.prediction_mode == 'free_residual':
+                self.residual_out = nn.Sequential(
+                    ResidualBlock(nf),
+                    nn.Conv2d(nf, self.in_nc, 3, padding=1),
+                )
+            else:
+                self.out = nn.Sequential(
+                    ResidualBlock(nf),
+                    nn.Conv2d(nf, self.in_nc, 3, padding=1),
+                )
         else:
             self.coarse_out = nn.Sequential(
                 ResidualBlock(nf * 4),
@@ -301,11 +326,12 @@ class TemporalDetailPriorNet(nn.Module):
             self.aligned_scales = nn.Parameter(torch.ones(3))
         nn.init.zeros_(self.global_modulation[-1].weight)
         nn.init.zeros_(self.global_modulation[-1].bias)
-        output_head = (
-            self.out
-            if self.amplitude_prediction_scale == 1 else
-            self.coarse_out
-        )
+        if self.prediction_mode == 'free_residual':
+            output_head = self.residual_out
+        elif self.amplitude_prediction_scale == 1:
+            output_head = self.out
+        else:
+            output_head = self.coarse_out
         nn.init.zeros_(output_head[-1].weight)
         nn.init.zeros_(output_head[-1].bias)
 
@@ -426,7 +452,7 @@ class TemporalDetailPriorNet(nn.Module):
         scale = scale[:, :, None, None]
         shift = shift[:, :, None, None]
         mid = mid * (1.0 + 0.1 * torch.tanh(scale)) + 0.1 * shift
-        if self.amplitude_prediction_scale == 1:
+        if self.use_full_decoder:
             up1 = F.interpolate(
                 mid,
                 size=enc1.shape[-2:],
@@ -441,18 +467,23 @@ class TemporalDetailPriorNet(nn.Module):
                 align_corners=False,
             )
             up2 = self.up2(torch.cat([up2, enc0], dim=1))
-            amplitude_native = (
-                torch.tanh(self.out(up2)) * self.amplitude_clip
-            )
+            if self.prediction_mode == 'free_residual':
+                signal_native = (
+                    torch.tanh(self.residual_out(up2)) * self.correction_clip
+                )
+            else:
+                signal_native = (
+                    torch.tanh(self.out(up2)) * self.amplitude_clip
+                )
         else:
-            amplitude_native = (
+            signal_native = (
                 torch.tanh(self.coarse_out(mid)) * self.amplitude_clip
             )
-        if amplitude_native.shape[-2:] == base.shape[-2:]:
-            amplitude = amplitude_native
+        if signal_native.shape[-2:] == base.shape[-2:]:
+            signal = signal_native
         else:
-            amplitude = F.interpolate(
-                amplitude_native,
+            signal = F.interpolate(
+                signal_native,
                 size=base.shape[-2:],
                 mode='bilinear',
                 align_corners=False,
@@ -466,17 +497,23 @@ class TemporalDetailPriorNet(nn.Module):
             norm_clip=self.carrier_norm_clip,
             eps=self.ridge_eps,
         )
-        correction = amplitude * direction
-        if self.correction_clip > 0:
-            correction = correction.clamp(
-                -self.correction_clip,
-                self.correction_clip,
-            )
+        if self.prediction_mode == 'free_residual':
+            correction = signal
+            output_scale = 1
+        else:
+            correction = signal * direction
+            if self.correction_clip > 0:
+                correction = correction.clamp(
+                    -self.correction_clip,
+                    self.correction_clip,
+                )
+            output_scale = self.amplitude_prediction_scale
         aux = {
-            'amplitude': amplitude,
-            'amplitude_native': amplitude_native,
+            'prediction_mode': self.prediction_mode,
+            'amplitude': signal,
+            'amplitude_native': signal_native,
             'amplitude_prediction_scale': base.new_tensor(
-                float(self.amplitude_prediction_scale)
+                float(output_scale)
             ),
             'correction': correction,
             'carrier': carrier,
@@ -498,8 +535,8 @@ class TemporalDetailPriorNet(nn.Module):
             ),
         }
         if return_aux:
-            return amplitude, aux
-        return amplitude
+            return signal, aux
+        return signal
 
 
 def _charbonnier(x, eps=1e-3):
@@ -591,6 +628,30 @@ def _project_target_to_native_amplitude(
     return target
 
 
+@torch.no_grad()
+def _make_free_residual_target(base, gt, correction_clip):
+    """GT-only bounded residual used for diagnostics, never supervision."""
+    correction = gt - base
+    if correction_clip is not None and float(correction_clip) > 0:
+        correction = correction.clamp(
+            -float(correction_clip),
+            float(correction_clip),
+        )
+    ones = torch.ones_like(base)
+    return {
+        'amplitude_native': correction,
+        'amplitude': correction,
+        'correction': correction,
+        'refined': (base + correction).clamp(0, 1),
+        'carrier': ones,
+        'direction': ones,
+        'carrier_rms': ones,
+        'target_scale': base.new_ones(
+            (base.size(0),) + (1,) * (base.dim() - 1)
+        ),
+    }
+
+
 def temporal_detail_prior_losses(
         amplitude,
         aux,
@@ -626,37 +687,54 @@ def temporal_detail_prior_losses(
             f'{supervision_mode}'
         )
     analytic_supervision = supervision_mode == 'analytic'
+    prediction_mode = aux.get('prediction_mode', 'carrier_amplitude')
+    if prediction_mode not in ('carrier_amplitude', 'free_residual'):
+        raise ValueError(f'Unsupported prediction_mode: {prediction_mode}')
+    if prediction_mode == 'free_residual' and analytic_supervision:
+        raise ValueError(
+            'free_residual should use target_free supervision; its bounded '
+            'GT residual is diagnostic only.'
+        )
     center = aux['center']
     amplitude_native = aux.get('amplitude_native', amplitude)
     uses_coarse_amplitude = (
         amplitude_native.shape[-2:] != amplitude.shape[-2:]
     )
-    target = make_local_ridge_target(
-        center,
-        base.detach(),
-        gt,
-        carrier_source=carrier_source,
-        carrier_kernel=carrier_kernel,
-        carrier_norm_window=carrier_norm_window,
-        target_window=target_window,
-        amplitude_clip=amplitude_clip,
-        correction_clip=correction_clip,
-        carrier_norm_clip=carrier_norm_clip,
-        ridge_eps=ridge_eps,
-        safe_global_scale=(target_safe_scale and not uses_coarse_amplitude),
-    )
-    if uses_coarse_amplitude:
-        target = _project_target_to_native_amplitude(
-            target,
+    if prediction_mode == 'free_residual':
+        target = _make_free_residual_target(
             base.detach(),
             gt,
-            native_size=amplitude_native.shape[-2:],
             correction_clip=correction_clip,
-            ridge_eps=ridge_eps,
-            safe_global_scale=target_safe_scale,
         )
     else:
-        target['amplitude_native'] = target['amplitude']
+        target = make_local_ridge_target(
+            center,
+            base.detach(),
+            gt,
+            carrier_source=carrier_source,
+            carrier_kernel=carrier_kernel,
+            carrier_norm_window=carrier_norm_window,
+            target_window=target_window,
+            amplitude_clip=amplitude_clip,
+            correction_clip=correction_clip,
+            carrier_norm_clip=carrier_norm_clip,
+            ridge_eps=ridge_eps,
+            safe_global_scale=(
+                target_safe_scale and not uses_coarse_amplitude
+            ),
+        )
+        if uses_coarse_amplitude:
+            target = _project_target_to_native_amplitude(
+                target,
+                base.detach(),
+                gt,
+                native_size=amplitude_native.shape[-2:],
+                correction_clip=correction_clip,
+                ridge_eps=ridge_eps,
+                safe_global_scale=target_safe_scale,
+            )
+        else:
+            target['amplitude_native'] = target['amplitude']
     target_amplitude = target['amplitude']
     target_amplitude_native = target['amplitude_native']
     target_correction = target['correction']
@@ -772,6 +850,9 @@ def temporal_detail_prior_losses(
         ).abs().mean()
     return {
         'loss': total,
+        'free_residual_mode': base.new_tensor(
+            float(prediction_mode == 'free_residual')
+        ),
         'amplitude_loss': amplitude_loss,
         'correction_loss': correction_loss,
         'reconstruction_loss': reconstruction_loss,
@@ -856,6 +937,10 @@ def build_temporal_detail_prior(
         aligned_feature_channels=opts.get(
             'aligned_feature_channels',
             aligned_feature_channels,
+        ),
+        prediction_mode=opts.get(
+            'prediction_mode',
+            'carrier_amplitude',
         ),
         amplitude_prediction_scale=opts.get(
             'amplitude_prediction_scale',

@@ -183,9 +183,10 @@ network:
     # three prior scales.
     use_aligned_features: true
     aligned_feature_channels: 64
-    # Predict a continuous signed amplitude field at 1/4 resolution, then
-    # upsample it for full-resolution carrier modulation.
-    amplitude_prediction_scale: 4
+    # Decisive baseline: remove the carrier parameterization and predict a
+    # bounded full-resolution residual through the complete U-Net decoder.
+    prediction_mode: free_residual
+    amplitude_prediction_scale: 1
     carrier_source: base
     carrier_kernel: 5
     carrier_norm_window: 9
@@ -195,8 +196,8 @@ network:
     correction_clip: 0.05
     ridge_eps: !!float 1e-3
     target_safe_scale: true
-    # Main experiment: analytic amplitude remains diagnostic only. Gradients
-    # come from the final reconstruction and high-frequency fidelity.
+    # Main experiment: the GT-only bounded target remains diagnostic. Gradients
+    # come only from final reconstruction and high-frequency fidelity.
     supervision_mode: target_free
     apply_guidance_gate: false
     guidance_floor: 0.0
@@ -212,7 +213,7 @@ network:
     relative_reconstruction_weight: 1.0
     relative_highfreq_weight: 0.1
     relative_eps: !!float 1e-6
-    tv_weight: 0.01
+    tv_weight: 0.001
 
   detail_guidance:
     gradient_weight: 0.35

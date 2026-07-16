@@ -40,6 +40,12 @@ def parse_args():
         help='Override native amplitude resolution; 4 predicts at 1/4 scale.',
     )
     parser.add_argument(
+        '--prediction_mode',
+        choices=['carrier_amplitude', 'free_residual'],
+        default=None,
+        help='Predict carrier amplitude or a free full-resolution residual.',
+    )
+    parser.add_argument(
         '--supervision_mode',
         choices=['analytic', 'target_free'],
         default=None,
@@ -71,6 +77,10 @@ def load_opts(args):
         opts['network']['temporal_detail_prior'][
             'amplitude_prediction_scale'
         ] = args.amplitude_prediction_scale
+    if args.prediction_mode is not None:
+        opts['network']['temporal_detail_prior'][
+            'prediction_mode'
+        ] = args.prediction_mode
     if args.supervision_mode is not None:
         opts['network']['temporal_detail_prior'][
             'supervision_mode'
@@ -168,6 +178,7 @@ def main():
     interval_save = int(opts['train']['interval_val'])
     prior_opts = opts['network'].get('temporal_detail_prior', {})
     supervision_mode = prior_opts.get('supervision_mode', 'analytic')
+    prediction_mode = prior_opts.get('prediction_mode', 'carrier_amplitude')
     guidance_opts = opts['network'].get('guidance_net', {})
     rate_dim = max(
         int(prior_opts.get('rate_dim', 0)),
@@ -190,6 +201,7 @@ def main():
         f"STDF checkpoint: [{args.stdf_ckpt}]\n"
         f"Guidance mode/checkpoint: [{args.guidance_mode}/{args.guidance_ckpt}]\n"
         f"Supervision mode: [{supervision_mode}]\n"
+        f"Prediction mode: [{prediction_mode}]\n"
         f"Overfit batches: [{args.overfit_batches}]\n"
         f"\n{'<' * 10} Options {'>' * 10}\n"
         f"{utils.dict2str(opts)}"
@@ -312,7 +324,8 @@ def main():
             message = (
                 f"iter: [{iteration}]/{num_iter}, epoch: [{current_epoch}], "
                 f"loss: [{scalar(outputs['loss']):.6f}], "
-                f"amp/corr/rec: [{scalar(outputs['amplitude_loss']):.6f}/"
+                f"diagnostic signal/corr/rec: "
+                f"[{scalar(outputs['amplitude_loss']):.6f}/"
                 f"{scalar(outputs['correction_loss']):.6f}/"
                 f"{scalar(outputs['reconstruction_loss']):.6f}], "
                 f"hf/grad: [{scalar(outputs['highfreq_loss']):.6f}/"
@@ -321,30 +334,36 @@ def main():
                 f"[{scalar(outputs['relative_reconstruction_loss']):.6f}/"
                 f"{scalar(outputs['relative_highfreq_loss']):.6f}/"
                 f"{scalar(outputs['amplitude_tv_loss']):.6f}], "
-                f"amp corr/cos: [{scalar(outputs['amplitude_corr']):.4f}/"
+                f"signal corr/cos: [{scalar(outputs['amplitude_corr']):.4f}/"
                 f"{scalar(outputs['amplitude_cosine']):.4f}], "
-                f"native amp corr/cos: "
+                f"native signal corr/cos: "
                 f"[{scalar(outputs['native_amplitude_corr']):.4f}/"
                 f"{scalar(outputs['native_amplitude_cosine']):.4f}], "
                 f"corr corr/cos: [{scalar(outputs['correction_corr']):.4f}/"
                 f"{scalar(outputs['correction_cosine']):.4f}], "
-                f"amp abs pred/target: [{scalar(outputs['pred_amplitude_abs']):.6f}/"
+                f"signal abs pred/diagnostic: "
+                f"[{scalar(outputs['pred_amplitude_abs']):.6f}/"
                 f"{scalar(outputs['target_amplitude_abs']):.6f}], "
-                f"corr abs pred/target: [{scalar(outputs['pred_correction_abs']):.6f}/"
+                f"corr abs pred/diagnostic: "
+                f"[{scalar(outputs['pred_correction_abs']):.6f}/"
                 f"{scalar(outputs['target_correction_abs']):.6f}], "
-                f"target +/-: [{scalar(outputs['target_positive_ratio']):.4f}/"
+                f"diagnostic target +/-: "
+                f"[{scalar(outputs['target_positive_ratio']):.4f}/"
                 f"{scalar(outputs['target_negative_ratio']):.4f}], "
-                f"target safety scale: [{scalar(outputs['target_safe_scale']):.4f}], "
+                f"diagnostic scale: [{scalar(outputs['target_safe_scale']):.4f}], "
                 f"aligned feature/injection: "
                 f"[{scalar(outputs['aligned_feature_abs']):.6f}/"
                 f"{scalar(outputs['aligned_injection_abs']):.6f}], "
-                f"PSNR base/prior/target/delta: [{scalar(outputs['base_psnr']):.4f}/"
+                f"PSNR base/prior/diagnostic/delta: "
+                f"[{scalar(outputs['base_psnr']):.4f}/"
                 f"{scalar(outputs['refined_psnr']):.4f}/"
                 f"{scalar(outputs['target_psnr']):.4f}/"
                 f"{scalar(outputs['psnr_delta']):+.4f}], "
-                f"target delta: [{scalar(outputs['target_psnr_delta']):+.4f}], "
+                f"diagnostic delta: "
+                f"[{scalar(outputs['target_psnr_delta']):+.4f}], "
                 f"win: [{scalar(outputs['frame_win_rate']):.4f}], "
-                f"HF base/prior/target: [{scalar(outputs['base_hf_mae']):.6f}/"
+                f"HF base/prior/diagnostic: "
+                f"[{scalar(outputs['base_hf_mae']):.6f}/"
                 f"{scalar(outputs['refined_hf_mae']):.6f}/"
                 f"{scalar(outputs['target_hf_mae']):.6f}]"
             )
@@ -365,6 +384,7 @@ def main():
                     'guidance_ckpt': args.guidance_ckpt,
                     'overfit_batches': args.overfit_batches,
                     'supervision_mode': supervision_mode,
+                    'prediction_mode': prediction_mode,
                     'amplitude_prediction_scale': (
                         model.temporal_detail_prior.amplitude_prediction_scale
                     ),

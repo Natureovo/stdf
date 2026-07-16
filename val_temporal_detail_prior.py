@@ -39,6 +39,12 @@ def parse_args():
         help='Override native amplitude resolution for checkpoint compatibility.',
     )
     parser.add_argument(
+        '--prediction_mode',
+        choices=['carrier_amplitude', 'free_residual'],
+        default=None,
+        help='Override prediction parameterization for checkpoint compatibility.',
+    )
+    parser.add_argument(
         '--supervision_mode',
         choices=['analytic', 'target_free'],
         default=None,
@@ -101,6 +107,19 @@ def load_prior_weights(prior_net, path):
             if key.startswith(prefix):
                 prior_state[key[len(prefix):]] = value
         prior_state = prior_state or state
+    checkpoint_mode = checkpoint.get('prediction_mode')
+    if checkpoint_mode is None:
+        checkpoint_mode = (
+            'free_residual'
+            if any(key.startswith('residual_out.') for key in prior_state) else
+            'carrier_amplitude'
+        )
+    if checkpoint_mode != prior_net.prediction_mode:
+        raise ValueError(
+            f'Checkpoint prediction mode is {checkpoint_mode}, but the model '
+            f'uses {prior_net.prediction_mode}. Pass --prediction_mode '
+            f'{checkpoint_mode} to validate this checkpoint.'
+        )
     checkpoint_scale = checkpoint.get('amplitude_prediction_scale')
     if checkpoint_scale is None:
         if any(key.startswith('coarse_out.') for key in prior_state):
@@ -177,12 +196,17 @@ def main():
         opts['network']['temporal_detail_prior'][
             'amplitude_prediction_scale'
         ] = args.amplitude_prediction_scale
+    if args.prediction_mode is not None:
+        opts['network']['temporal_detail_prior'][
+            'prediction_mode'
+        ] = args.prediction_mode
     if args.supervision_mode is not None:
         opts['network']['temporal_detail_prior'][
             'supervision_mode'
         ] = args.supervision_mode
     prior_opts = opts['network'].get('temporal_detail_prior', {})
     supervision_mode = prior_opts.get('supervision_mode', 'analytic')
+    prediction_mode = prior_opts.get('prediction_mode', 'carrier_amplitude')
     guidance_opts = opts['network'].get('guidance_net', {})
     rate_dim = max(
         int(prior_opts.get('rate_dim', 0)),
@@ -267,6 +291,7 @@ def main():
         'relative_reconstruction_loss',
         'relative_highfreq_loss',
         'amplitude_tv_loss',
+        'free_residual_mode',
     ]
 
     with torch.no_grad():
@@ -391,6 +416,7 @@ def main():
         'split': args.split,
         'guidance_mode': args.guidance_mode,
         'supervision_mode': supervision_mode,
+        'prediction_mode': prediction_mode,
         'samples': sample_count,
         'source_samples': source_count,
         'sample_mode': args.sample_mode,
@@ -411,25 +437,25 @@ def main():
     print(
         f"split/sampling: {args.split}/{args.sample_mode}, "
         f"samples: {sample_count}/{source_count}, guidance: {args.guidance_mode}, "
-        f"supervision: {supervision_mode}"
+        f"supervision/prediction: {supervision_mode}/{prediction_mode}"
     )
     print(
-        'PSNR base/prior/target/delta/target-delta: '
+        'PSNR base/prior/diagnostic/delta/diagnostic-delta: '
         f"{result['base_psnr']:.6f}/{result['refined_psnr']:.6f}/"
         f"{result['target_psnr']:.6f}/{result['psnr_delta']:+.6f}/"
         f"{result['target_psnr_delta']:+.6f}"
     )
     print(
-        'frame win-rate prior/target: '
+        'frame win-rate prior/diagnostic: '
         f"{result['frame_win_rate']:.4f}/{result['target_frame_win_rate']:.4f}"
     )
     print(
-        'amplitude pearson/cosine, correction pearson/cosine: '
+        'signal pearson/cosine, correction pearson/cosine: '
         f"{result['amplitude_corr']:.6f}/{result['amplitude_cosine']:.6f}, "
         f"{result['correction_corr']:.6f}/{result['correction_cosine']:.6f}"
     )
     print(
-        'native-scale amplitude pearson/cosine, prediction scale: '
+        'native signal pearson/cosine, prediction scale: '
         f"{result['native_amplitude_corr']:.6f}/"
         f"{result['native_amplitude_cosine']:.6f}, "
         f"1/{result['amplitude_prediction_scale']:.0f}"
@@ -441,23 +467,23 @@ def main():
         f"{result['amplitude_tv_loss']:.6f}"
     )
     print(
-        'abs amplitude pred/target, correction pred/target: '
+        'abs signal pred/diagnostic, correction pred/diagnostic: '
         f"{result['pred_amplitude_abs']:.8f}/{result['target_amplitude_abs']:.8f}, "
         f"{result['pred_correction_abs']:.8f}/{result['target_correction_abs']:.8f}"
     )
     print(
-        'target signed amplitude positive/negative: '
+        'diagnostic target positive/negative: '
         f"{result['target_positive_ratio']:.4f}/"
         f"{result['target_negative_ratio']:.4f}"
     )
-    print(f"target analytic safety scale: {result['target_safe_scale']:.6f}")
+    print(f"diagnostic target scale: {result['target_safe_scale']:.6f}")
     print(
         'aligned feature/injection abs: '
         f"{result['aligned_feature_abs']:.8f}/"
         f"{result['aligned_injection_abs']:.8f}"
     )
     print(
-        'HF MAE base/prior/target, prior-base: '
+        'HF MAE base/prior/diagnostic, prior-base: '
         f"{result['base_hf_mae']:.8f}/{result['refined_hf_mae']:.8f}/"
         f"{result['target_hf_mae']:.8f}/"
         f"{result['refined_hf_mae'] - result['base_hf_mae']:+.8f}"
