@@ -60,6 +60,19 @@ def parse_args():
         ),
     )
     parser.add_argument('--residual_scale', type=float, default=0.2)
+    parser.add_argument(
+        '--prior_modulation_scales',
+        type=float,
+        nargs='+',
+        default=None,
+        help=(
+            'GT-free temporal_prior_gain diagnostic. Each value alpha tests '
+            'base + prior + alpha * (predicted correction - prior), after '
+            '--residual_scale and the configured write mask. Use fixed values '
+            'between 0 and 1; alpha=0 is the deterministic prior anchor and '
+            'alpha=1 is the current diffusion output.'
+        ),
+    )
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--max_samples', type=int, default=None)
@@ -503,6 +516,21 @@ def main():
             '--temporal_prior_ckpt is required when target_mode is '
             'temporal_prior_gain.'
         )
+    if args.prior_modulation_scales is not None:
+        if not uses_temporal_prior:
+            raise ValueError(
+                '--prior_modulation_scales requires target_mode '
+                'temporal_prior_gain.'
+            )
+        if any(
+                scale < 0.0 or scale > 1.0
+                for scale in args.prior_modulation_scales):
+            raise ValueError(
+                '--prior_modulation_scales should all be in [0, 1].'
+            )
+        args.prior_modulation_scales = sorted(set(
+            float(scale) for scale in args.prior_modulation_scales
+        ))
     rate_dim = max(
         int(diffusion_opts.get('rate_dim', 0)),
         int(guidance_opts.get('rate_dim', 0)) if needs_predicted_guidance else 0,
@@ -798,6 +826,50 @@ def main():
                 base + args.residual_scale * target_unit_correction
             ).clamp(0, 1)
             base_frame_values = frame_values(gt, base, hf_kernel)
+            prior_anchor_frame_values = frame_values(
+                gt,
+                prior_anchor,
+                hf_kernel,
+            )
+
+            if args.prior_modulation_scales is not None:
+                modulation = pred_correction - temporal_prior_correction
+                for modulation_scale in args.prior_modulation_scales:
+                    scale_key = str(modulation_scale).replace('.', 'p')
+                    prefix = f'prior_modulation_{scale_key}'
+                    blended_correction = (
+                        temporal_prior_correction +
+                        modulation_scale * modulation
+                    )
+                    blended_output = (
+                        base + args.residual_scale * effective_mask *
+                        blended_correction
+                    ).clamp(0, 1)
+                    blended_values = frame_values(
+                        gt,
+                        blended_output,
+                        hf_kernel,
+                    )
+                    add_values(totals, prefix, blended_values)
+                    psnr_delta_prior = (
+                        blended_values['psnr'] -
+                        prior_anchor_frame_values['psnr']
+                    )
+                    totals[f'{prefix}_psnr_delta_prior_sum'] += (
+                        psnr_delta_prior
+                    )
+                    totals[f'{prefix}_psnr_delta_prior_square_sum'] += (
+                        psnr_delta_prior ** 2
+                    )
+                    totals[f'{prefix}_positive_vs_prior_frames'] += int(
+                        psnr_delta_prior > 0.0
+                    )
+                    totals[f'{prefix}_write_abs'] += float(
+                        (blended_output - base).abs().mean().cpu()
+                    )
+                    totals[f'{prefix}_modulation_abs'] += float(
+                        (blended_output - prior_anchor).abs().mean().cpu()
+                    )
 
             if args.oracle_utility_diagnostic:
                 utility_corrections = OrderedDict([
@@ -848,11 +920,6 @@ def main():
                             totals[f'{prefix}_{key}'] += float(value)
 
             hybrid_frame_values = frame_values(gt, refined, hf_kernel)
-            prior_anchor_frame_values = frame_values(
-                gt,
-                prior_anchor,
-                hf_kernel,
-            )
             oracle_frame_values = frame_values(gt, oracle_target, hf_kernel)
             add_values(totals, 'base', base_frame_values)
             add_values(totals, 'prior_anchor', prior_anchor_frame_values)
@@ -962,6 +1029,43 @@ def main():
         totals['positive_oracle_psnr_frames'],
         sample_count,
     )
+    prior_modulation_report = {
+        'enabled': args.prior_modulation_scales is not None,
+        'uses_gt_to_construct_outputs': False,
+        'selection_note': (
+            'Choose a fixed alpha on validation, then lock it before test.'
+        ),
+        'scales': {},
+    }
+    if args.prior_modulation_scales is not None:
+        for modulation_scale in args.prior_modulation_scales:
+            scale_key = str(modulation_scale).replace('.', 'p')
+            prefix = f'prior_modulation_{scale_key}'
+            values = averaged(totals, prefix, sample_count)
+            prior_modulation_report['scales'][str(modulation_scale)] = {
+                'alpha': modulation_scale,
+                'metrics': values,
+                'delta_vs_base': {
+                    key: values[key] - base_values[key]
+                    for key in base_values
+                },
+                'delta_vs_prior_anchor': {
+                    key: values[key] - prior_anchor_values[key]
+                    for key in base_values
+                },
+                'frame_psnr_delta_vs_prior': distribution_summary(
+                    totals[f'{prefix}_psnr_delta_prior_sum'],
+                    totals[f'{prefix}_psnr_delta_prior_square_sum'],
+                    totals[f'{prefix}_positive_vs_prior_frames'],
+                    sample_count,
+                ),
+                'write_abs': (
+                    totals[f'{prefix}_write_abs'] / max(sample_count, 1)
+                ),
+                'modulation_abs_vs_prior': (
+                    totals[f'{prefix}_modulation_abs'] / max(sample_count, 1)
+                ),
+            }
     utility_report = {
         'enabled': args.oracle_utility_diagnostic,
         'uses_gt': args.oracle_utility_diagnostic,
@@ -1129,6 +1233,7 @@ def main():
         'write_area': totals['write_area'] / max(sample_count, 1),
         'frame_psnr_delta_distribution': frame_psnr_distribution,
         'oracle_frame_psnr_delta_distribution': oracle_psnr_distribution,
+        'prior_modulation_sweep': prior_modulation_report,
         'oracle_utility_diagnostic': utility_report,
         'predicted_utility_mask': predicted_utility_report,
         'correction_diagnostics': {
@@ -1248,6 +1353,24 @@ def main():
         f"{frame_psnr_distribution['win_rate']:.4f}/"
         f"{oracle_psnr_distribution['win_rate']:.4f}"
     )
+    if prior_modulation_report['enabled']:
+        print('\n-- GT-free prior modulation sweep --')
+        print(
+            'alpha=0 keeps the deterministic prior; alpha=1 applies the '
+            'full diffusion modulation'
+        )
+        for scale_key, scale_report in prior_modulation_report['scales'].items():
+            delta_base = scale_report['delta_vs_base']
+            delta_prior = scale_report['delta_vs_prior_anchor']
+            psnr_dist = scale_report['frame_psnr_delta_vs_prior']
+            print(
+                f"alpha {scale_key}: PSNR {scale_report['metrics']['psnr']:.6f}, "
+                f"delta base/prior {delta_base['psnr']:+.6f}/"
+                f"{delta_prior['psnr']:+.6f}, "
+                f"SSIM vs prior {delta_prior['ssim']:+.6f}, "
+                f"win vs prior {psnr_dist['win_rate']:.4f}, "
+                f"modulation abs {scale_report['modulation_abs_vs_prior']:.8f}"
+            )
     if args.mask_mode == 'utility_predicted':
         utility_pred = report['predicted_utility_mask']
         selection = utility_pred['selection_diagnostics']
