@@ -296,6 +296,7 @@ def build_opts(args):
             'control_use_rate': args.diffusion_control_use_rate,
             'control_main_input': args.diffusion_control_main_input,
             'control_hf_kernel': args.diffusion_control_hf_kernel,
+            'temporal_condition_nc': args.diffusion_temporal_condition_nc,
             'num_steps': args.num_steps,
             'sample_steps': args.sample_steps,
             'loss_type': 'l1',
@@ -486,6 +487,7 @@ def parse_args():
         help='full keeps the old concat input plus zero-conv control; noise conditions only through zero-conv.',
     )
     parser.add_argument('--diffusion_control_hf_kernel', type=int, default=5)
+    parser.add_argument('--diffusion_temporal_condition_nc', type=int, default=0)
     parser.add_argument(
         '--diffusion_process_mode',
         default='gaussian',
@@ -720,6 +722,17 @@ def main():
                 'Checkpoint/CLI diffusion process mismatch: '
                 f'{saved_process} vs {model.diffusion.process_mode}.'
             )
+        requested_temporal_nc = int(
+            model.diffusion.denoiser.temporal_condition_nc
+        )
+        saved_temporal_nc = int(
+            grdr_checkpoint.get('temporal_condition_nc', 0)
+        )
+        if saved_temporal_nc != requested_temporal_nc:
+            raise ValueError(
+                'Checkpoint/CLI temporal_condition_nc mismatch: '
+                f'{saved_temporal_nc} vs {requested_temporal_nc}.'
+            )
         if model.diffusion.process_mode == 'residual_shift':
             requested_terminal_weight = float(
                 model.diffusion.residual_shift_terminal_weight
@@ -886,7 +899,14 @@ def main():
             total_start = time.perf_counter()
             sync_if_cuda(device)
             stdf_start = time.perf_counter()
-            base = model.forward_base(input_data)
+            if model.diffusion.denoiser.temporal_condition_nc > 0:
+                base, temporal_condition = model.forward_base(
+                    input_data,
+                    return_aligned_features=True,
+                )
+            else:
+                base = model.forward_base(input_data)
+                temporal_condition = None
             sync_if_cuda(device)
             stdf_time_counter.accum(time.perf_counter() - stdf_start)
             hybrid_start = time.perf_counter()
@@ -1043,6 +1063,7 @@ def main():
                         sampler=args.diffusion_sampler,
                         ddim_eta=args.diffusion_ddim_eta,
                         initial_noise=initial_noise,
+                        temporal_condition=temporal_condition,
                     )
                     pred_signal = torch.nan_to_num(
                         pred_signal,
@@ -1140,6 +1161,7 @@ def main():
                         sampler=args.diffusion_sampler,
                         ddim_eta=args.diffusion_ddim_eta,
                         initial_noise=initial_noise,
+                        temporal_condition=temporal_condition,
                     )
             sync_if_cuda(device)
             hybrid_time_counter.accum(time.perf_counter() - hybrid_start)
@@ -1279,6 +1301,9 @@ def main():
         'budget_mode': args.budget_mode,
         'diffusion_control_enabled': args.diffusion_control_enabled,
         'diffusion_control_main_input': args.diffusion_control_main_input,
+        'diffusion_temporal_condition_nc': (
+            args.diffusion_temporal_condition_nc
+        ),
         'diffusion_target_mode': args.diffusion_target_mode,
         'diffusion_carrier_source': args.diffusion_carrier_source,
         'diffusion_carrier_gain_clip': args.diffusion_carrier_gain_clip,

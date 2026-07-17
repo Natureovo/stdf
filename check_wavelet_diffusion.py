@@ -10,7 +10,15 @@ class FixedSignalDenoiser(nn.Module):
         super(FixedSignalDenoiser, self).__init__()
         self.register_buffer('signal', signal)
 
-    def forward(self, noisy, lq, base, guidance, t, rate_cond=None):
+    def forward(
+            self,
+            noisy,
+            lq,
+            base,
+            guidance,
+            t,
+            rate_cond=None,
+            temporal_condition=None):
         return self.signal.expand(noisy.size(0), -1, -1, -1)
 
 
@@ -24,6 +32,7 @@ def main():
         'control_enabled': True,
         'control_use_rate': True,
         'control_main_input': 'full',
+        'temporal_condition_nc': 4,
         'num_steps': 20,
         'loss_type': 'l2',
         'loss_bg_weight': 1.0,
@@ -50,6 +59,7 @@ def main():
     base = torch.rand(batch_size, 1, height, width)
     guidance = torch.ones_like(base)
     rate_cond = torch.zeros(batch_size, 1)
+    temporal_condition = torch.randn(batch_size, 4, height, width)
 
     target_details = torch.randn(
         batch_size,
@@ -81,6 +91,7 @@ def main():
         gt,
         guidance,
         rate_cond=rate_cond,
+        temporal_condition=temporal_condition,
     )
     if not torch.isfinite(losses['loss']):
         raise AssertionError('Wavelet diffusion loss is not finite.')
@@ -123,6 +134,7 @@ def main():
             sampler='ddim',
             ddim_eta=0.0,
             initial_noise=initial_noise,
+            temporal_condition=temporal_condition,
         )
         correction, _ = diffusion.signal_to_correction(
             sampled_signal,
@@ -139,6 +151,34 @@ def main():
             'A zero-initialized residual-shift model should preserve STDF: '
             f'{identity_error}.'
         )
+    # The zero output head intentionally delays gradients to upstream feature
+    # adapters by one optimizer step. Mimic that step, then verify the aligned
+    # temporal branch participates in terminal prediction.
+    with torch.no_grad():
+        for parameter in diffusion.denoiser.parameters():
+            if parameter.grad is not None:
+                parameter.add_(parameter.grad, alpha=-1e-3)
+    diffusion.zero_grad()
+    diffusion.train()
+    second_losses = diffusion.training_losses(
+        lq,
+        base,
+        gt,
+        guidance,
+        rate_cond=rate_cond,
+        temporal_condition=temporal_condition,
+    )
+    second_losses['terminal_diffusion_loss'].backward()
+    temporal_gradient_sum = sum(
+        float(parameter.grad.abs().sum())
+        for name, parameter in diffusion.denoiser.named_parameters()
+        if name.startswith('temporal_') and parameter.grad is not None
+    )
+    if temporal_gradient_sum <= 0:
+        raise AssertionError(
+            'No terminal gradient reached the temporal condition adapters.'
+        )
+    diffusion.eval()
     diffusion.denoiser = FixedSignalDenoiser(target_signal.detach())
     with torch.no_grad():
         recovered_signal = diffusion.sample_residual(
@@ -150,6 +190,7 @@ def main():
             sampler='ddim',
             ddim_eta=0.0,
             initial_noise=initial_noise,
+            temporal_condition=temporal_condition,
         )
     recovery_error = float((recovered_signal - target_signal).abs().max())
     if recovery_error > 1e-6:
@@ -169,6 +210,7 @@ def main():
         f'{float(losses["terminal_diffusion_loss"]):.6f}'
     )
     print(f'terminal gradient sum: {terminal_gradient_sum:.8e}')
+    print(f'temporal adapter gradient sum: {temporal_gradient_sum:.8e}')
     print(f'denoiser gradient sum: {gradient_sum:.8e}')
     print(f'correction max abs: {float(correction.abs().max()):.8f}')
     print(f'identity correction max abs: {identity_error:.8e}')

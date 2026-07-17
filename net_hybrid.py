@@ -366,7 +366,17 @@ class HybridSTDFGRDR(nn.Module):
             initial_noise=None):
         """Train block utility prediction from frozen predicted corrections."""
         with torch.no_grad():
-            base = self.forward_base(x)
+            use_temporal_condition = (
+                self.diffusion.denoiser.temporal_condition_nc > 0
+            )
+            if use_temporal_condition:
+                base, temporal_condition = self.forward_base(
+                    x,
+                    return_aligned_features=True,
+                )
+            else:
+                base = self.forward_base(x)
+                temporal_condition = None
             lq = self.center_frame(x)
             guidance = self.predict_guidance(
                 lq,
@@ -396,6 +406,7 @@ class HybridSTDFGRDR(nn.Module):
                     sampler=sampler,
                     ddim_eta=ddim_eta,
                     initial_noise=teacher_noise,
+                    temporal_condition=temporal_condition,
                 )
                 pred_signal = torch.nan_to_num(
                     pred_signal,
@@ -525,11 +536,28 @@ class HybridSTDFGRDR(nn.Module):
             freeze_base=True,
             guidance_mode='oracle',
             detach_pred_guidance=True):
+        use_temporal_condition = (
+            self.diffusion.denoiser.temporal_condition_nc > 0
+        )
         if freeze_base:
             with torch.no_grad():
-                base = self.forward_base(x)
+                if use_temporal_condition:
+                    base, temporal_condition = self.forward_base(
+                        x,
+                        return_aligned_features=True,
+                    )
+                else:
+                    base = self.forward_base(x)
+                    temporal_condition = None
         else:
-            base = self.forward_base(x)
+            if use_temporal_condition:
+                base, temporal_condition = self.forward_base(
+                    x,
+                    return_aligned_features=True,
+                )
+            else:
+                base = self.forward_base(x)
+                temporal_condition = None
         lq = self.center_frame(x)
         guidance_maps = self.make_guidance(gt, base.detach())
         if guidance_mode == 'none':
@@ -550,6 +578,7 @@ class HybridSTDFGRDR(nn.Module):
             gt,
             guidance,
             rate_cond=rate_cond,
+            temporal_condition=temporal_condition,
         )
         return {
             'loss': loss_dict['loss'],
@@ -594,6 +623,7 @@ class HybridSTDFGRDR(nn.Module):
             'raw_write_mask': loss_dict['raw_write_mask'],
             'detail_gate': loss_dict['detail_gate'],
             'base': base,
+            'temporal_condition': temporal_condition,
             'guidance': guidance,
             'oracle_guidance': guidance_maps['guidance'],
             'guidance_maps': guidance_maps,
@@ -909,7 +939,14 @@ class HybridSTDFGRDR(nn.Module):
             sampler='ddim',
             ddim_eta=0.0,
             initial_noise=None):
-        base = self.forward_base(x)
+        if self.diffusion.denoiser.temporal_condition_nc > 0:
+            base, temporal_condition = self.forward_base(
+                x,
+                return_aligned_features=True,
+            )
+        else:
+            base = self.forward_base(x)
+            temporal_condition = None
         lq = self.center_frame(x)
         if guidance is None:
             if guidance_mode == 'predicted':
@@ -949,6 +986,7 @@ class HybridSTDFGRDR(nn.Module):
             sampler=sampler,
             ddim_eta=ddim_eta,
             initial_noise=initial_noise,
+            temporal_condition=temporal_condition,
         )
         return {
             'base': base,

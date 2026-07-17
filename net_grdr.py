@@ -161,7 +161,8 @@ class GuidedResidualDenoiser(nn.Module):
             control_enabled=False,
             control_use_rate=True,
             control_main_input='full',
-            control_hf_kernel=5):
+            control_hf_kernel=5,
+            temporal_condition_nc=0):
         super(GuidedResidualDenoiser, self).__init__()
         if control_main_input not in ('full', 'noise'):
             raise ValueError(f'Unsupported control_main_input: {control_main_input}')
@@ -172,6 +173,9 @@ class GuidedResidualDenoiser(nn.Module):
         self.control_use_rate = control_use_rate
         self.control_main_input = control_main_input
         self.control_hf_kernel = control_hf_kernel
+        self.temporal_condition_nc = int(temporal_condition_nc)
+        if self.temporal_condition_nc < 0:
+            raise ValueError('temporal_condition_nc should be non-negative.')
         self.cond = ConditionMLP(time_dim=cond_dim, rate_dim=rate_dim)
         if control_enabled and control_main_input == 'noise':
             input_nc = in_nc
@@ -214,6 +218,21 @@ class GuidedResidualDenoiser(nn.Module):
             self.control_zero_up2 = zero_conv(nf, nf)
         else:
             self.control_in = None
+        if self.temporal_condition_nc > 0:
+            self.temporal_in = nn.Sequential(
+                nn.Conv2d(self.temporal_condition_nc, nf, 3, padding=1),
+                nn.SiLU(),
+            )
+            self.temporal_down1 = nn.Sequential(
+                nn.Conv2d(nf, nf * 2, 4, stride=2, padding=1),
+                nn.SiLU(),
+            )
+            self.temporal_down2 = nn.Sequential(
+                nn.Conv2d(nf * 2, nf * 4, 4, stride=2, padding=1),
+                nn.SiLU(),
+            )
+        else:
+            self.temporal_in = None
 
     def make_control_features(self, lq, base, guidance, rate_cond=None):
         abs_diff = (base - lq).abs()
@@ -246,7 +265,40 @@ class GuidedResidualDenoiser(nn.Module):
         c2 = self.control_down2(c1)
         return c0, c1, c2
 
-    def forward(self, noisy_residual, lq, base, guidance, t, rate_cond=None):
+    def make_temporal_features(self, temporal_condition, target_size):
+        if self.temporal_in is None:
+            return None, None, None
+        if temporal_condition is None:
+            raise ValueError(
+                'temporal_condition is required when temporal_condition_nc '
+                'is positive.'
+            )
+        if temporal_condition.size(1) != self.temporal_condition_nc:
+            raise ValueError(
+                f'Expected {self.temporal_condition_nc} temporal condition '
+                f'channels, got {temporal_condition.size(1)}.'
+            )
+        if temporal_condition.shape[-2:] != target_size:
+            temporal_condition = F.interpolate(
+                temporal_condition,
+                size=target_size,
+                mode='bilinear',
+                align_corners=False,
+            )
+        t0 = self.temporal_in(temporal_condition)
+        t1 = self.temporal_down1(t0)
+        t2 = self.temporal_down2(t1)
+        return t0, t1, t2
+
+    def forward(
+            self,
+            noisy_residual,
+            lq,
+            base,
+            guidance,
+            t,
+            rate_cond=None,
+            temporal_condition=None):
         target_size = noisy_residual.shape[-2:]
         if lq.shape[-2:] != target_size:
             lq = F.interpolate(
@@ -279,6 +331,10 @@ class GuidedResidualDenoiser(nn.Module):
             c0, c1, c2 = self.make_control_features(lq, base, guidance, rate_cond=rate_cond)
         else:
             c0 = c1 = c2 = None
+        t0, t1, t2 = self.make_temporal_features(
+            temporal_condition,
+            target_size,
+        )
         if self.control_enabled and self.control_main_input == 'noise':
             x = noisy_residual
         else:
@@ -286,21 +342,33 @@ class GuidedResidualDenoiser(nn.Module):
         x = self.in_conv(x)
         if self.control_enabled:
             x = x + self.control_zero_in(c0)
+        if t0 is not None:
+            x = x + t0
         x, skip0 = self.down1(x, cond)
         if self.control_enabled:
             x = x + self.control_zero_down1(c1)
+        if t1 is not None:
+            x = x + t1
         x, skip1 = self.down2(x, cond)
         if self.control_enabled:
             x = x + self.control_zero_down2(c2)
+        if t2 is not None:
+            x = x + t2
         x = self.mid(x, cond)
         if self.control_enabled:
             x = x + self.control_zero_mid(c2)
+        if t2 is not None:
+            x = x + t2
         x = self.up1(x, skip1, cond)
         if self.control_enabled:
             x = x + self.control_zero_up1(c1)
+        if t1 is not None:
+            x = x + t1
         x = self.up2(x, skip0, cond)
         if self.control_enabled:
             x = x + self.control_zero_up2(c0)
+        if t0 is not None:
+            x = x + t0
         return self.out_conv(x)
 
 
@@ -886,7 +954,14 @@ class GuidedResidualDiffusion(nn.Module):
             raise ValueError(f'Unsupported mask_mode: {mask_mode}')
         return guidance
 
-    def training_losses(self, lq, base, gt, guidance, rate_cond=None):
+    def training_losses(
+            self,
+            lq,
+            base,
+            gt,
+            guidance,
+            rate_cond=None,
+            temporal_condition=None):
         target_signal = self.make_target_signal(lq, base, gt)
         t = torch.randint(0, self.num_steps, (gt.size(0),), device=gt.device).long()
         noise = torch.randn_like(target_signal)
@@ -908,6 +983,7 @@ class GuidedResidualDiffusion(nn.Module):
             condition_guidance,
             t,
             rate_cond=rate_cond,
+            temporal_condition=temporal_condition,
         )
         diffusion_target = target_signal if self.is_residual_shift() else noise
         if self.loss_type == 'l2':
@@ -933,6 +1009,7 @@ class GuidedResidualDiffusion(nn.Module):
                 condition_guidance,
                 terminal_t,
                 rate_cond=rate_cond,
+                temporal_condition=temporal_condition,
             )
             if self.loss_type == 'l2':
                 terminal_loss_map = (
@@ -1242,13 +1319,21 @@ class GuidedResidualDiffusion(nn.Module):
             'detail_gate': detail_gate,
         }
 
-    def training_loss(self, lq, base, gt, guidance, rate_cond=None):
+    def training_loss(
+            self,
+            lq,
+            base,
+            gt,
+            guidance,
+            rate_cond=None,
+            temporal_condition=None):
         return self.training_losses(
             lq,
             base,
             gt,
             guidance,
             rate_cond=rate_cond,
+            temporal_condition=temporal_condition,
         )['loss']
 
     @torch.no_grad()
@@ -1261,7 +1346,8 @@ class GuidedResidualDiffusion(nn.Module):
             steps=None,
             sampler='ddim',
             ddim_eta=0.0,
-            initial_noise=None):
+            initial_noise=None,
+            temporal_condition=None):
         steps = steps or self.num_steps
         if steps > self.num_steps:
             raise ValueError('steps should be <= num_steps.')
@@ -1326,6 +1412,7 @@ class GuidedResidualDiffusion(nn.Module):
                     condition_guidance,
                     t,
                     rate_cond=rate_cond,
+                    temporal_condition=temporal_condition,
                 ).clamp(-1.0, 1.0)
                 eta_t = _extract(
                     self.residual_shift_etas,
@@ -1368,6 +1455,7 @@ class GuidedResidualDiffusion(nn.Module):
                 condition_guidance,
                 t,
                 rate_cond=rate_cond,
+                temporal_condition=temporal_condition,
             )
             if sampler == 'ddim':
                 alpha_bar_t = _extract(self.alphas_cumprod, t, residual.shape)
@@ -1443,7 +1531,8 @@ class GuidedResidualDiffusion(nn.Module):
             use_hard_mask=True,
             sampler='ddim',
             ddim_eta=0.0,
-            initial_noise=None):
+            initial_noise=None,
+            temporal_condition=None):
         guidance = guidance.clamp(0, 1)
         if residual_scale is None or residual_scale <= 0:
             return base.clamp(0, 1)
@@ -1457,6 +1546,7 @@ class GuidedResidualDiffusion(nn.Module):
             sampler=sampler,
             ddim_eta=ddim_eta,
             initial_noise=initial_noise,
+            temporal_condition=temporal_condition,
         )
         signal = torch.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
         if self.is_wavelet_subband():
@@ -1516,6 +1606,7 @@ def build_grdr(opts=None):
             'control_hf_kernel',
             opts.get('target_highfreq_kernel', 5),
         ),
+        temporal_condition_nc=opts.get('temporal_condition_nc', 0),
     )
     if process_mode == 'residual_shift':
         # A fresh model starts from the identity restoration: zero wavelet

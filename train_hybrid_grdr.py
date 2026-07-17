@@ -157,6 +157,16 @@ def load_resume_state(
             'Resume diffusion process mismatch: '
             f'checkpoint={saved_process}, requested={requested_process}'
         )
+    requested_temporal_nc = int(
+        model.diffusion.denoiser.temporal_condition_nc
+    )
+    saved_temporal_nc = int(checkpoint.get('temporal_condition_nc', 0))
+    if saved_temporal_nc != requested_temporal_nc:
+        raise ValueError(
+            'Resume temporal_condition_nc mismatch: '
+            f'checkpoint={saved_temporal_nc}, '
+            f'requested={requested_temporal_nc}'
+        )
     if requested_process == 'residual_shift':
         requested_terminal_weight = float(
             model.diffusion.residual_shift_terminal_weight
@@ -439,6 +449,7 @@ def main():
                         sampler='ddim',
                         ddim_eta=0.0,
                         initial_noise=diagnostic_noise,
+                        temporal_condition=outputs['temporal_condition'],
                     )
                     diagnostic_correction, diagnostic_prior = (
                         model.diffusion.signal_to_correction(
@@ -519,6 +530,10 @@ def main():
                 wavelet_hh_corr = float(outputs['wavelet_hh_corr'].detach().cpu())
                 wavelet_ll_leakage = float(outputs['wavelet_ll_leakage'].detach().cpu())
                 shift_eta_mean = float(outputs['shift_eta_mean'].detach().cpu())
+                temporal_condition_abs = (
+                    float(outputs['temporal_condition'].abs().mean().cpu())
+                    if outputs['temporal_condition'] is not None else 0.0
+                )
                 msg = (
                     f"iter: [{num_iter_accum}]/{num_iter}, "
                     f"epoch: [{current_epoch}]/{num_epoch - 1}, "
@@ -557,6 +572,7 @@ def main():
                     f"{wavelet_hh_corr:.4f}], "
                     f"wavelet LL leak: [{wavelet_ll_leakage:.8f}], "
                     f"shift eta: [{shift_eta_mean:.4f}], "
+                    f"temporal condition abs: [{temporal_condition_abs:.6f}], "
                     f"sample PSNR delta/corr/abs: "
                     f"[{sample_psnr_delta:+.4f}/{sample_correlation:.4f}/"
                     f"{sample_correction_abs:.6f}], "
@@ -592,6 +608,10 @@ def main():
                     'residual_shift_terminal_weight': diffusion_opts.get(
                         'residual_shift_terminal_weight',
                         1.0,
+                    ),
+                    'temporal_condition_nc': diffusion_opts.get(
+                        'temporal_condition_nc',
+                        0,
                     ),
                     'wavelet_coefficient_clip': diffusion_opts.get(
                         'wavelet_coefficient_clip',

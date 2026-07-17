@@ -162,6 +162,13 @@ def load_grdr_weights(diffusion, path):
             'Checkpoint/config diffusion process mismatch: '
             f'{saved_process} vs {diffusion.process_mode}.'
         )
+    requested_temporal_nc = int(diffusion.denoiser.temporal_condition_nc)
+    saved_temporal_nc = int(checkpoint.get('temporal_condition_nc', 0))
+    if saved_temporal_nc != requested_temporal_nc:
+        raise ValueError(
+            'Checkpoint/config temporal_condition_nc mismatch: '
+            f'{saved_temporal_nc} vs {requested_temporal_nc}.'
+        )
     if diffusion.process_mode == 'residual_shift':
         requested_terminal_weight = float(
             diffusion.residual_shift_terminal_weight
@@ -522,7 +529,14 @@ def main():
                 diffusion_rate = rate_cond[:, :diff_dim] if diff_dim > 0 else None
                 guidance_rate = rate_cond[:, :guide_dim] if guide_dim > 0 else None
 
-            base = model.forward_base(x)
+            if model.diffusion.denoiser.temporal_condition_nc > 0:
+                base, temporal_condition = model.forward_base(
+                    x,
+                    return_aligned_features=True,
+                )
+            else:
+                base = model.forward_base(x)
+                temporal_condition = None
             lq_center = model.center_frame(x)
             oracle_guidance = model.make_guidance(gt, base)['guidance'].clamp(0, 1)
             guidance_by_mode = {
@@ -594,6 +608,7 @@ def main():
                 sampler=args.sampler,
                 ddim_eta=args.ddim_eta,
                 initial_noise=initial_noise,
+                temporal_condition=temporal_condition,
             )
             pred_signal = torch.nan_to_num(
                 pred_signal,
@@ -959,6 +974,9 @@ def main():
         'residual_shift_terminal_weight': (
             model.diffusion.residual_shift_terminal_weight
         ),
+        'temporal_condition_nc': (
+            model.diffusion.denoiser.temporal_condition_nc
+        ),
         'wavelet_coefficient_clip': model.diffusion.wavelet_coefficient_clip,
         'wavelet_condition_scale': model.diffusion.wavelet_condition_scale,
         'wavelet_condition_include_lowpass': (
@@ -1067,6 +1085,8 @@ def main():
         f"{condition_guidance_mode}/{mask_guidance_mode}, "
         f"target: {model.diffusion.target_mode}, "
         f"process: {model.diffusion.process_mode}, "
+        f"temporal channels: "
+        f"{model.diffusion.denoiser.temporal_condition_nc}, "
         f"noise: {args.noise_mode}, "
         f"mask: {args.mask_mode}"
     )

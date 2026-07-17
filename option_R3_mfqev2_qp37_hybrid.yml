@@ -62,6 +62,8 @@ network:
     control_use_rate: true
     control_main_input: full
     control_hf_kernel: 5
+    # Frozen STDF deformable-fusion features carry aligned seven-frame evidence.
+    temporal_condition_nc: 64
     num_steps: 1000
     sample_steps: 5
     diagnostic_sample_steps: 5
