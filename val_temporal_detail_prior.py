@@ -3,6 +3,7 @@ import json
 from collections import OrderedDict, defaultdict
 
 import torch
+import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
@@ -81,6 +82,23 @@ def parse_args():
         choices=['sequential', 'uniform', 'video_balanced'],
         default='video_balanced',
     )
+    parser.add_argument(
+        '--prior_gain_diagnostic',
+        action='store_true',
+        help=(
+            'Report a GT-only upper bound that preserves the predicted prior '
+            'correction direction and changes only its local strength.'
+        ),
+    )
+    parser.add_argument(
+        '--prior_gain_windows',
+        type=int,
+        nargs='+',
+        default=[5, 9, 17],
+        help='Odd local ridge windows used by --prior_gain_diagnostic.',
+    )
+    parser.add_argument('--prior_gain_max', type=float, default=2.0)
+    parser.add_argument('--prior_gain_eps', type=float, default=1e-12)
     parser.add_argument('--report_path', default=None)
     return parser.parse_args()
 
@@ -218,6 +236,42 @@ def batch_frame_indices(batch, batch_size):
     if isinstance(values, (list, tuple)):
         return [int(value) for value in values]
     return [int(values)]
+
+
+def psnr_per_sample(pred, target):
+    mse = (pred - target).square().flatten(1).mean(dim=1).clamp_min(1e-12)
+    return -10.0 * torch.log10(mse)
+
+
+def local_prior_gain_upper_bound(
+        base,
+        gt,
+        prior_correction,
+        window,
+        gain_max,
+        eps):
+    window = int(window)
+    if window <= 0 or window % 2 == 0:
+        raise ValueError('prior_gain_windows should contain positive odd values.')
+    if gain_max <= 0:
+        raise ValueError('prior_gain_max should be positive.')
+    residual = gt - base
+    padding = window // 2
+    numerator = F.avg_pool2d(
+        residual * prior_correction,
+        window,
+        stride=1,
+        padding=padding,
+    )
+    denominator = F.avg_pool2d(
+        prior_correction.square(),
+        window,
+        stride=1,
+        padding=padding,
+    ).clamp_min(float(eps))
+    gain = (numerator / denominator).clamp(0.0, float(gain_max))
+    refined = (base + gain * prior_correction).clamp(0, 1)
+    return refined, gain
 
 
 def tile_starts(length, tile_size, overlap):
@@ -443,6 +497,10 @@ def main():
     temporal_base_error = 0.0
     temporal_prior_error = 0.0
     previous = {}
+    gain_diagnostic_totals = {
+        int(window): defaultdict(float)
+        for window in args.prior_gain_windows
+    }
 
     scalar_keys = [
         'base_psnr',
@@ -586,6 +644,46 @@ def main():
             batch_size = gt.size(0)
             for key in scalar_keys:
                 totals[key] += float(metrics[key].cpu()) * batch_size
+            if args.prior_gain_diagnostic:
+                base_psnr = psnr_per_sample(base, gt)
+                prior_psnr = psnr_per_sample(metrics['refined'], gt)
+                prior_correction = metrics['applied_correction']
+                for window, window_totals in gain_diagnostic_totals.items():
+                    gain_refined, gain = local_prior_gain_upper_bound(
+                        base,
+                        gt,
+                        prior_correction,
+                        window=window,
+                        gain_max=args.prior_gain_max,
+                        eps=args.prior_gain_eps,
+                    )
+                    gain_psnr = psnr_per_sample(gain_refined, gt)
+                    window_totals['psnr'] += float(gain_psnr.sum().cpu())
+                    window_totals['delta_base'] += float(
+                        (gain_psnr - base_psnr).sum().cpu()
+                    )
+                    window_totals['delta_prior'] += float(
+                        (gain_psnr - prior_psnr).sum().cpu()
+                    )
+                    window_totals['win_base'] += float(
+                        (gain_psnr > base_psnr).float().sum().cpu()
+                    )
+                    window_totals['win_prior'] += float(
+                        (gain_psnr > prior_psnr).float().sum().cpu()
+                    )
+                    window_totals['gain_mean'] += float(
+                        gain.mean(dim=(1, 2, 3)).sum().cpu()
+                    )
+                    window_totals['gain_zero'] += float(
+                        (gain <= 1e-6).float().mean(
+                            dim=(1, 2, 3)
+                        ).sum().cpu()
+                    )
+                    window_totals['gain_max'] += float(
+                        (gain >= args.prior_gain_max - 1e-6).float().mean(
+                            dim=(1, 2, 3)
+                        ).sum().cpu()
+                    )
             sample_count += batch_size
 
             names = batch_names(batch, batch_size)
@@ -651,6 +749,19 @@ def main():
             max(temporal_pairs, 1)
         ),
     })
+    if args.prior_gain_diagnostic:
+        result['prior_gain_diagnostic'] = {
+            'gt_only': True,
+            'gain_max': float(args.prior_gain_max),
+            'eps': float(args.prior_gain_eps),
+            'windows': {
+                str(window): {
+                    key: value / sample_count
+                    for key, value in window_totals.items()
+                }
+                for window, window_totals in gain_diagnostic_totals.items()
+            },
+        }
 
     print('\n========== Temporal detail prior validation ==========')
     print(
@@ -675,6 +786,22 @@ def main():
         'frame win-rate prior/target: '
         f"{result['frame_win_rate']:.4f}/{result['target_frame_win_rate']:.4f}"
     )
+    if args.prior_gain_diagnostic:
+        print('\n-- GT-only prior-direction gain upper bounds --')
+        print(
+            f'gain range: [0, {args.prior_gain_max:g}], '
+            'the deterministic prior supplies the signed direction'
+        )
+        for window, values in result['prior_gain_diagnostic'][
+                'windows'].items():
+            print(
+                f"window{window}: PSNR {values['psnr']:.6f}, "
+                f"delta base/prior {values['delta_base']:+.6f}/"
+                f"{values['delta_prior']:+.6f}, win base/prior "
+                f"{values['win_base']:.4f}/{values['win_prior']:.4f}, "
+                f"gain mean/zero/max {values['gain_mean']:.4f}/"
+                f"{values['gain_zero']:.4f}/{values['gain_max']:.4f}"
+            )
     print(
         'signal pearson/cosine, correction pearson/cosine: '
         f"{result['amplitude_corr']:.6f}/{result['amplitude_cosine']:.6f}, "
