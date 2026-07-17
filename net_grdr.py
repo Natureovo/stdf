@@ -410,6 +410,9 @@ class GuidedResidualDiffusion(nn.Module):
             wavelet_coefficient_clip=0.05,
             wavelet_condition_scale=0.10,
             wavelet_condition_include_lowpass=True,
+            prior_gain_window=9,
+            prior_gain_max=2.0,
+            prior_gain_eps=1e-12,
             process_mode='gaussian',
             residual_shift_eta_max=0.999,
             residual_shift_schedule_power=0.5,
@@ -448,6 +451,7 @@ class GuidedResidualDiffusion(nn.Module):
                 'highfreq_gt',
                 'carrier_gain',
                 'carrier_amp',
+                'temporal_prior_gain',
                 'wavelet_subband'):
             raise ValueError(f'Unsupported diffusion target_mode: {target_mode}')
         if carrier_source not in ('base', 'lq', 'base_lq'):
@@ -456,9 +460,12 @@ class GuidedResidualDiffusion(nn.Module):
             raise ValueError(f'Unsupported detail_gate_mode: {detail_gate_mode}')
         if process_mode not in ('gaussian', 'residual_shift'):
             raise ValueError(f'Unsupported diffusion process_mode: {process_mode}')
-        if process_mode == 'residual_shift' and target_mode != 'wavelet_subband':
+        if (
+                process_mode == 'residual_shift' and
+                target_mode not in ('wavelet_subband', 'temporal_prior_gain')):
             raise ValueError(
-                'residual_shift currently requires target_mode=wavelet_subband.'
+                'residual_shift currently requires target_mode='
+                'wavelet_subband or temporal_prior_gain.'
             )
         self.denoiser = denoiser
         self.num_steps = num_steps
@@ -487,6 +494,19 @@ class GuidedResidualDiffusion(nn.Module):
         self.wavelet_condition_include_lowpass = bool(
             wavelet_condition_include_lowpass
         )
+        self.prior_gain_window = int(prior_gain_window)
+        self.prior_gain_max = float(prior_gain_max)
+        self.prior_gain_eps = float(prior_gain_eps)
+        if self.target_mode == 'temporal_prior_gain':
+            if self.prior_gain_window <= 0 or self.prior_gain_window % 2 == 0:
+                raise ValueError('prior_gain_window should be a positive odd value.')
+            if abs(self.prior_gain_max - 2.0) > 1e-12:
+                raise ValueError(
+                    'temporal_prior_gain currently requires prior_gain_max=2 '
+                    'so zero diffusion signal preserves the prior.'
+                )
+            if self.prior_gain_eps <= 0:
+                raise ValueError('prior_gain_eps should be positive.')
         self.process_mode = process_mode
         self.residual_shift_eta_max = float(residual_shift_eta_max)
         self.residual_shift_schedule_power = float(
@@ -600,7 +620,7 @@ class GuidedResidualDiffusion(nn.Module):
         return torch.nan_to_num(pred_residual, nan=0.0, posinf=0.0, neginf=0.0)
 
     def residual_shift_q_sample(self, target_signal, t, noise=None):
-        """Shift a GT correction toward the zero-correction STDF anchor."""
+        """Shift a supervised signal toward its zero-valued inference anchor."""
         if noise is None:
             noise = torch.randn_like(target_signal)
         eta = _extract(self.residual_shift_etas, t, target_signal.shape)
@@ -610,10 +630,17 @@ class GuidedResidualDiffusion(nn.Module):
         )
 
     def is_carrier_guided(self):
-        return self.target_mode in ('carrier_gain', 'carrier_amp')
+        return self.target_mode in (
+            'carrier_gain',
+            'carrier_amp',
+            'temporal_prior_gain',
+        )
 
     def is_wavelet_subband(self):
         return self.target_mode == 'wavelet_subband'
+
+    def is_temporal_prior_gain(self):
+        return self.target_mode == 'temporal_prior_gain'
 
     def signal_shape(self, base):
         if self.is_wavelet_subband():
@@ -696,7 +723,27 @@ class GuidedResidualDiffusion(nn.Module):
             gain = gain.clamp(max=float(self.carrier_gain_clip))
         return gain
 
-    def signal_to_correction(self, signal, lq, base):
+    def signal_to_correction(
+            self,
+            signal,
+            lq,
+            base,
+            temporal_prior_correction=None):
+        if self.is_temporal_prior_gain():
+            if temporal_prior_correction is None:
+                raise ValueError(
+                    'temporal_prior_correction is required for '
+                    'target_mode=temporal_prior_gain.'
+                )
+            if temporal_prior_correction.shape != base.shape:
+                raise ValueError(
+                    'Temporal prior correction/base shape mismatch: '
+                    f'{tuple(temporal_prior_correction.shape)} vs '
+                    f'{tuple(base.shape)}'
+                )
+            delta_gain = signal.clamp(-1.0, 1.0)
+            gain = 1.0 + delta_gain
+            return gain * temporal_prior_correction, delta_gain
         if self.is_wavelet_subband():
             prior = signal.clamp(-1.0, 1.0)
             details = prior * self.wavelet_coefficient_clip
@@ -738,7 +785,38 @@ class GuidedResidualDiffusion(nn.Module):
         carrier = self.make_carrier(lq, base)
         return prior * carrier, prior
 
-    def make_target_signal(self, lq, base, gt):
+    def make_target_signal(
+            self,
+            lq,
+            base,
+            gt,
+            temporal_prior_correction=None):
+        if self.is_temporal_prior_gain():
+            if temporal_prior_correction is None:
+                raise ValueError(
+                    'temporal_prior_correction is required for '
+                    'target_mode=temporal_prior_gain.'
+                )
+            carrier = temporal_prior_correction.detach()
+            residual = (gt - base).detach()
+            padding = self.prior_gain_window // 2
+            numerator = F.avg_pool2d(
+                residual * carrier,
+                self.prior_gain_window,
+                stride=1,
+                padding=padding,
+            )
+            denominator = F.avg_pool2d(
+                carrier.square(),
+                self.prior_gain_window,
+                stride=1,
+                padding=padding,
+            ).clamp_min(self.prior_gain_eps)
+            gain = (numerator / denominator).clamp(
+                0.0,
+                self.prior_gain_max,
+            )
+            return (gain - 1.0).clamp(-1.0, 1.0)
         if self.is_wavelet_subband():
             _, base_details, _ = haar_dwt2(base)
             _, gt_details, _ = haar_dwt2(gt)
@@ -961,8 +1039,14 @@ class GuidedResidualDiffusion(nn.Module):
             gt,
             guidance,
             rate_cond=None,
-            temporal_condition=None):
-        target_signal = self.make_target_signal(lq, base, gt)
+            temporal_condition=None,
+            temporal_prior_correction=None):
+        target_signal = self.make_target_signal(
+            lq,
+            base,
+            gt,
+            temporal_prior_correction=temporal_prior_correction,
+        )
         t = torch.randint(0, self.num_steps, (gt.size(0),), device=gt.device).long()
         noise = torch.randn_like(target_signal)
         if self.is_residual_shift():
@@ -1036,7 +1120,7 @@ class GuidedResidualDiffusion(nn.Module):
                 t,
                 model_output,
             )
-        if self.is_wavelet_subband():
+        if self.is_wavelet_subband() or self.is_temporal_prior_gain():
             pred_signal = pred_signal.clamp(-1.0, 1.0)
             target_signal = target_signal.clamp(-1.0, 1.0)
         elif (
@@ -1065,8 +1149,18 @@ class GuidedResidualDiffusion(nn.Module):
         )
         detail_gate = self.make_detail_gate(lq, base, guidance, rate_cond=rate_cond).detach()
         effective_mask = write_mask * detail_gate
-        pred_correction, pred_prior = self.signal_to_correction(pred_signal, lq, base)
-        target_correction, target_prior = self.signal_to_correction(target_signal, lq, base)
+        pred_correction, pred_prior = self.signal_to_correction(
+            pred_signal,
+            lq,
+            base,
+            temporal_prior_correction=temporal_prior_correction,
+        )
+        target_correction, target_prior = self.signal_to_correction(
+            target_signal,
+            lq,
+            base,
+            temporal_prior_correction=temporal_prior_correction,
+        )
         pred_hybrid = (base + self.train_residual_scale * effective_mask * pred_correction).clamp(0, 1)
         rec_loss = torch.sqrt((pred_hybrid - gt).pow(2) + 1e-6).mean()
 
@@ -1091,11 +1185,22 @@ class GuidedResidualDiffusion(nn.Module):
         bg_weight = (1.0 - prior_mask.detach()).clamp(0, 1)
         residual_bg_loss = (pred_prior.abs() * bg_weight).sum() / (bg_weight.sum() + 1e-6)
 
-        valid_sign = (target_correction.abs() > 1e-4).float()
-        sign_weight = (effective_mask.detach().clamp(0, 1) * valid_sign).detach()
-        target_sign = target_correction.detach().sign()
+        if self.is_temporal_prior_gain():
+            valid_sign = (target_prior.abs() > 1e-4).float()
+            sign_weight = (
+                prior_mask.detach().clamp(0, 1) * valid_sign
+            ).detach()
+            target_sign = target_prior.detach().sign()
+            sign_prediction = pred_prior
+        else:
+            valid_sign = (target_correction.abs() > 1e-4).float()
+            sign_weight = (
+                effective_mask.detach().clamp(0, 1) * valid_sign
+            ).detach()
+            target_sign = target_correction.detach().sign()
+            sign_prediction = pred_correction
         residual_sign_loss = (
-            F.relu(-pred_correction * target_sign) * sign_weight
+            F.relu(-sign_prediction * target_sign) * sign_weight
         ).sum() / (sign_weight.sum() + 1e-6)
 
         pred_hf = high_frequency(pred_hybrid, self.target_highfreq_kernel)
@@ -1200,7 +1305,7 @@ class GuidedResidualDiffusion(nn.Module):
 
         with torch.no_grad():
             sign_acc = (
-                ((pred_correction * target_correction) > 0).float() * sign_weight
+                ((sign_prediction * target_sign) > 0).float() * sign_weight
             ).sum() / (sign_weight.sum() + 1e-6)
             prior_sign_weight = (
                 prior_mask.detach() * (target_prior.abs() > 1e-4).float()
@@ -1326,7 +1431,8 @@ class GuidedResidualDiffusion(nn.Module):
             gt,
             guidance,
             rate_cond=None,
-            temporal_condition=None):
+            temporal_condition=None,
+            temporal_prior_correction=None):
         return self.training_losses(
             lq,
             base,
@@ -1334,6 +1440,7 @@ class GuidedResidualDiffusion(nn.Module):
             guidance,
             rate_cond=rate_cond,
             temporal_condition=temporal_condition,
+            temporal_prior_correction=temporal_prior_correction,
         )['loss']
 
     @torch.no_grad()
@@ -1465,7 +1572,8 @@ class GuidedResidualDiffusion(nn.Module):
                 if (
                         (self.target_mode == 'carrier_amp' and
                          self.carrier_amp_normalize) or
-                        self.is_wavelet_subband()):
+                        self.is_wavelet_subband() or
+                        self.is_temporal_prior_gain()):
                     pred_signal = pred_signal.clamp(-1.0, 1.0)
 
                 if step_idx + 1 < len(step_ids):
@@ -1504,7 +1612,7 @@ class GuidedResidualDiffusion(nn.Module):
                 residual = mean + torch.sqrt(var) * torch.randn_like(residual)
             else:
                 residual = mean
-        if self.is_wavelet_subband():
+        if self.is_wavelet_subband() or self.is_temporal_prior_gain():
             residual = residual.clamp(-1.0, 1.0)
         return residual
 
@@ -1532,7 +1640,8 @@ class GuidedResidualDiffusion(nn.Module):
             sampler='ddim',
             ddim_eta=0.0,
             initial_noise=None,
-            temporal_condition=None):
+            temporal_condition=None,
+            temporal_prior_correction=None):
         guidance = guidance.clamp(0, 1)
         if residual_scale is None or residual_scale <= 0:
             return base.clamp(0, 1)
@@ -1549,7 +1658,7 @@ class GuidedResidualDiffusion(nn.Module):
             temporal_condition=temporal_condition,
         )
         signal = torch.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
-        if self.is_wavelet_subband():
+        if self.is_wavelet_subband() or self.is_temporal_prior_gain():
             signal = signal.clamp(-1.0, 1.0)
         elif (
                 not self.is_carrier_guided() and
@@ -1575,7 +1684,12 @@ class GuidedResidualDiffusion(nn.Module):
         )
         detail_gate = self.make_detail_gate(lq, base, guidance, rate_cond=rate_cond)
         mask = mask * detail_gate
-        correction, _ = self.signal_to_correction(signal, lq, base)
+        correction, _ = self.signal_to_correction(
+            signal,
+            lq,
+            base,
+            temporal_prior_correction=temporal_prior_correction,
+        )
 
         return (base + residual_scale * mask * correction).clamp(0, 1)
 
@@ -1609,8 +1723,8 @@ def build_grdr(opts=None):
         temporal_condition_nc=opts.get('temporal_condition_nc', 0),
     )
     if process_mode == 'residual_shift':
-        # A fresh model starts from the identity restoration: zero wavelet
-        # correction means the STDF base is returned unchanged.
+        # A fresh model starts from its deterministic anchor. Zero means no
+        # wavelet correction, or unit gain for a temporal-prior carrier.
         nn.init.zeros_(denoiser.out_conv[-1].weight)
         if denoiser.out_conv[-1].bias is not None:
             nn.init.zeros_(denoiser.out_conv[-1].bias)
@@ -1648,6 +1762,9 @@ def build_grdr(opts=None):
             0.10,
         ),
         wavelet_condition_include_lowpass=wavelet_include_lowpass,
+        prior_gain_window=opts.get('prior_gain_window', 9),
+        prior_gain_max=opts.get('prior_gain_max', 2.0),
+        prior_gain_eps=opts.get('prior_gain_eps', 1e-12),
         process_mode=process_mode,
         residual_shift_eta_max=opts.get(
             'residual_shift_eta_max',

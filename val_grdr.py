@@ -29,6 +29,7 @@ def parse_args():
     parser.add_argument('--stdf_ckpt', required=True)
     parser.add_argument('--grdr_ckpt', required=True)
     parser.add_argument('--guidance_ckpt', default=None)
+    parser.add_argument('--temporal_prior_ckpt', default=None)
     parser.add_argument('--utility_ckpt', default=None)
     parser.add_argument('--split', choices=['train', 'val', 'test'], default='val')
     parser.add_argument(
@@ -154,6 +155,32 @@ def load_guidance_weights(guidance_net, path):
     guidance_net.load_state_dict(guidance_state or state_dict, strict=True)
 
 
+def load_temporal_prior_weights(prior_net, path):
+    state_dict, checkpoint = load_state_dict(path)
+    prior_state = checkpoint.get('temporal_detail_prior_state_dict')
+    if prior_state is None:
+        prior_state = OrderedDict()
+        for key, value in state_dict.items():
+            if key.startswith('temporal_detail_prior.'):
+                prior_state[key[len('temporal_detail_prior.'):]] = value
+        prior_state = prior_state or state_dict
+    saved_mode = checkpoint.get('prediction_mode')
+    if saved_mode is not None and saved_mode != prior_net.prediction_mode:
+        raise ValueError(
+            'Temporal prior prediction mode mismatch: '
+            f'{saved_mode} vs {prior_net.prediction_mode}.'
+        )
+    saved_scale = checkpoint.get('amplitude_prediction_scale')
+    if (
+            saved_scale is not None and
+            int(saved_scale) != prior_net.amplitude_prediction_scale):
+        raise ValueError(
+            'Temporal prior prediction scale mismatch: '
+            f'{saved_scale} vs {prior_net.amplitude_prediction_scale}.'
+        )
+    prior_net.load_state_dict(prior_state, strict=True)
+
+
 def load_grdr_weights(diffusion, path):
     state_dict, checkpoint = load_state_dict(path)
     saved_process = checkpoint.get('diffusion_process_mode', 'gaussian')
@@ -197,14 +224,25 @@ def load_grdr_weights(diffusion, path):
             'Checkpoint/config diffusion target mismatch: '
             f'{saved_target} vs {diffusion.target_mode}.'
         )
+    if diffusion.is_temporal_prior_gain():
+        for key, requested in (
+                ('prior_gain_window', diffusion.prior_gain_window),
+                ('prior_gain_max', diffusion.prior_gain_max)):
+            saved = checkpoint.get(key)
+            if saved is None or abs(float(saved) - float(requested)) > 1e-12:
+                raise ValueError(
+                    f'Checkpoint/config {key} mismatch: '
+                    f'{saved} vs {requested}.'
+                )
     if 'diffusion_state_dict' in checkpoint:
         diffusion.load_state_dict(checkpoint['diffusion_state_dict'], strict=True)
-        return
+        return checkpoint
     diffusion_state = OrderedDict()
     for key, value in state_dict.items():
         if key.startswith('diffusion.'):
             diffusion_state[key[len('diffusion.'):]] = value
     diffusion.load_state_dict(diffusion_state or state_dict, strict=True)
+    return checkpoint
 
 
 def load_utility_weights(utility_net, path):
@@ -457,6 +495,14 @@ def main():
     guidance_opts = opts['network'].get('guidance_net', {})
     utility_opts = opts['network'].get('utility_mask', {})
     hf_kernel = int(diffusion_opts.get('target_highfreq_kernel', 5))
+    uses_temporal_prior = (
+        diffusion_opts.get('target_mode') == 'temporal_prior_gain'
+    )
+    if uses_temporal_prior and args.temporal_prior_ckpt is None:
+        raise ValueError(
+            '--temporal_prior_ckpt is required when target_mode is '
+            'temporal_prior_gain.'
+        )
     rate_dim = max(
         int(diffusion_opts.get('rate_dim', 0)),
         int(guidance_opts.get('rate_dim', 0)) if needs_predicted_guidance else 0,
@@ -488,7 +534,21 @@ def main():
 
     model = build_hybrid_stdf_grdr(opts['network'])
     load_stdf_weights(model.enhancer, args.stdf_ckpt)
-    load_grdr_weights(model.diffusion, args.grdr_ckpt)
+    grdr_checkpoint = load_grdr_weights(model.diffusion, args.grdr_ckpt)
+    if uses_temporal_prior:
+        load_temporal_prior_weights(
+            model.temporal_detail_prior,
+            args.temporal_prior_ckpt,
+        )
+        saved_prior = grdr_checkpoint.get('temporal_prior_ckpt')
+        if (
+                saved_prior is not None and
+                op.normpath(str(saved_prior)) !=
+                op.normpath(str(args.temporal_prior_ckpt))):
+            raise ValueError(
+                'GRDR checkpoint temporal prior mismatch: '
+                f'{saved_prior} vs {args.temporal_prior_ckpt}.'
+            )
     if needs_predicted_guidance:
         load_guidance_weights(model.guidance_net, args.guidance_ckpt)
     if args.mask_mode == 'utility_predicted':
@@ -529,14 +589,21 @@ def main():
                 diffusion_rate = rate_cond[:, :diff_dim] if diff_dim > 0 else None
                 guidance_rate = rate_cond[:, :guide_dim] if guide_dim > 0 else None
 
-            if model.diffusion.denoiser.temporal_condition_nc > 0:
-                base, temporal_condition = model.forward_base(
+            needs_aligned_features = (
+                model.diffusion.denoiser.temporal_condition_nc > 0 or
+                (
+                    model.diffusion.is_temporal_prior_gain() and
+                    model.temporal_detail_prior.use_aligned_features
+                )
+            )
+            if needs_aligned_features:
+                base, aligned_features = model.forward_base(
                     x,
                     return_aligned_features=True,
                 )
             else:
                 base = model.forward_base(x)
-                temporal_condition = None
+                aligned_features = None
             lq_center = model.center_frame(x)
             oracle_guidance = model.make_guidance(gt, base)['guidance'].clamp(0, 1)
             guidance_by_mode = {
@@ -560,6 +627,14 @@ def main():
                 ).clamp(0, 1)
             condition_guidance = guidance_by_mode[condition_guidance_mode]
             mask_guidance = guidance_by_mode[mask_guidance_mode]
+            temporal_condition, temporal_prior_correction = (
+                model.make_diffusion_prior_conditions(
+                    x,
+                    base,
+                    aligned_features,
+                    rate_cond=diffusion_rate,
+                )
+            )
 
             detail_gate = model.diffusion.make_detail_gate(
                 lq_center,
@@ -616,7 +691,9 @@ def main():
                 posinf=0.0,
                 neginf=0.0,
             )
-            if model.diffusion.is_wavelet_subband():
+            if (
+                    model.diffusion.is_wavelet_subband() or
+                    model.diffusion.is_temporal_prior_gain()):
                 pred_signal = pred_signal.clamp(-1.0, 1.0)
             elif not model.diffusion.is_carrier_guided():
                 pred_signal = pred_signal.clamp(-0.1, 0.1)
@@ -624,10 +701,13 @@ def main():
                 pred_signal,
                 lq_center,
                 base,
+                temporal_prior_correction=temporal_prior_correction,
             )
             if args.mask_mode == 'utility_predicted':
                 gated_candidate = detail_gate * pred_correction
-                if model.diffusion.is_carrier_guided():
+                if model.diffusion.is_temporal_prior_gain():
+                    utility_carrier = temporal_prior_correction
+                elif model.diffusion.is_carrier_guided():
                     utility_carrier = model.diffusion.make_carrier_direction(
                         lq_center,
                         base,
@@ -693,12 +773,25 @@ def main():
             refined = (
                 base + args.residual_scale * pred_unit_correction
             ).clamp(0, 1)
+            if temporal_prior_correction is None:
+                prior_anchor = base
+            else:
+                prior_anchor = (
+                    base + args.residual_scale * effective_mask *
+                    temporal_prior_correction
+                ).clamp(0, 1)
 
-            target_signal = model.diffusion.make_target_signal(lq_center, base, gt)
+            target_signal = model.diffusion.make_target_signal(
+                lq_center,
+                base,
+                gt,
+                temporal_prior_correction=temporal_prior_correction,
+            )
             target_correction, target_prior = model.diffusion.signal_to_correction(
                 target_signal,
                 lq_center,
                 base,
+                temporal_prior_correction=temporal_prior_correction,
             )
             target_unit_correction = effective_mask * target_correction
             oracle_target = (
@@ -755,8 +848,14 @@ def main():
                             totals[f'{prefix}_{key}'] += float(value)
 
             hybrid_frame_values = frame_values(gt, refined, hf_kernel)
+            prior_anchor_frame_values = frame_values(
+                gt,
+                prior_anchor,
+                hf_kernel,
+            )
             oracle_frame_values = frame_values(gt, oracle_target, hf_kernel)
             add_values(totals, 'base', base_frame_values)
+            add_values(totals, 'prior_anchor', prior_anchor_frame_values)
             add_values(totals, 'hybrid', hybrid_frame_values)
             add_values(totals, 'oracle_target', oracle_frame_values)
             totals['write_abs'] += float((refined - base).abs().mean().cpu())
@@ -848,6 +947,7 @@ def main():
             sample_count += 1
 
     base_values = averaged(totals, 'base', sample_count)
+    prior_anchor_values = averaged(totals, 'prior_anchor', sample_count)
     hybrid_values = averaged(totals, 'hybrid', sample_count)
     oracle_values = averaged(totals, 'oracle_target', sample_count)
     frame_psnr_distribution = distribution_summary(
@@ -977,6 +1077,9 @@ def main():
         'temporal_condition_nc': (
             model.diffusion.denoiser.temporal_condition_nc
         ),
+        'temporal_prior_ckpt': args.temporal_prior_ckpt,
+        'prior_gain_window': model.diffusion.prior_gain_window,
+        'prior_gain_max': model.diffusion.prior_gain_max,
         'wavelet_coefficient_clip': model.diffusion.wavelet_coefficient_clip,
         'wavelet_condition_scale': model.diffusion.wavelet_condition_scale,
         'wavelet_condition_include_lowpass': (
@@ -1007,10 +1110,15 @@ def main():
         'noise_mode': args.noise_mode,
         'residual_scale': args.residual_scale,
         'base': base_values,
+        'prior_anchor': prior_anchor_values,
         'hybrid': hybrid_values,
         'oracle_target': oracle_values,
         'delta_hybrid_vs_base': {
             key: hybrid_values[key] - base_values[key] for key in base_values
+        },
+        'delta_hybrid_vs_prior_anchor': {
+            key: hybrid_values[key] - prior_anchor_values[key]
+            for key in base_values
         },
         'delta_oracle_vs_base': {
             key: oracle_values[key] - base_values[key] for key in base_values
@@ -1097,9 +1205,11 @@ def main():
             f"{len(counts)}/{min(counts)}-{max(counts)}"
         )
     print(
-        'PSNR base/hybrid/oracle/delta: '
-        f"{base_values['psnr']:.6f}/{hybrid_values['psnr']:.6f}/"
-        f"{oracle_values['psnr']:.6f}/{report['delta_hybrid_vs_base']['psnr']:.6f}"
+        'PSNR base/prior/hybrid/oracle, hybrid delta base/prior: '
+        f"{base_values['psnr']:.6f}/{prior_anchor_values['psnr']:.6f}/"
+        f"{hybrid_values['psnr']:.6f}/{oracle_values['psnr']:.6f}, "
+        f"{report['delta_hybrid_vs_base']['psnr']:+.6f}/"
+        f"{report['delta_hybrid_vs_prior_anchor']['psnr']:+.6f}"
     )
     print(
         'SSIM base/hybrid/oracle/delta: '

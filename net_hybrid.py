@@ -229,6 +229,56 @@ class HybridSTDFGRDR(nn.Module):
             return_aux=return_aux,
         )
 
+    def make_diffusion_prior_conditions(
+            self,
+            temporal_lq,
+            base,
+            aligned_features,
+            rate_cond=None):
+        temporal_prior_correction = None
+        condition_parts = []
+        if aligned_features is not None:
+            condition_parts.append(aligned_features)
+        if self.diffusion.is_temporal_prior_gain():
+            prior_guidance = torch.zeros_like(base)
+            _, prior_aux = self.predict_temporal_detail_prior(
+                temporal_lq,
+                base,
+                guidance=prior_guidance,
+                rate_cond=rate_cond,
+                aligned_features=aligned_features,
+                return_aux=True,
+            )
+            temporal_prior_correction = prior_aux['correction'].detach()
+            prior_scale = max(
+                float(self.temporal_detail_prior_opts.get(
+                    'correction_clip',
+                    0.05,
+                )),
+                1e-6,
+            )
+            condition_parts.append(
+                (temporal_prior_correction / prior_scale).clamp(-1.0, 1.0)
+            )
+
+        expected_nc = self.diffusion.denoiser.temporal_condition_nc
+        if expected_nc == 0:
+            temporal_condition = None
+        elif condition_parts:
+            temporal_condition = torch.cat(condition_parts, dim=1)
+            if temporal_condition.size(1) != expected_nc:
+                raise ValueError(
+                    'Diffusion temporal condition channel mismatch: '
+                    f'constructed {temporal_condition.size(1)}, expected '
+                    f'{expected_nc}.'
+                )
+        else:
+            raise ValueError(
+                'Diffusion expects temporal conditioning, but no aligned '
+                'features or temporal prior correction were constructed.'
+            )
+        return temporal_condition, temporal_prior_correction
+
     def forward_base(self, x, return_aligned_features=False):
         return self.enhancer(
             x,
@@ -366,23 +416,35 @@ class HybridSTDFGRDR(nn.Module):
             initial_noise=None):
         """Train block utility prediction from frozen predicted corrections."""
         with torch.no_grad():
-            use_temporal_condition = (
-                self.diffusion.denoiser.temporal_condition_nc > 0
+            needs_aligned_features = (
+                self.diffusion.denoiser.temporal_condition_nc > 0 or
+                (
+                    self.diffusion.is_temporal_prior_gain() and
+                    self.temporal_detail_prior.use_aligned_features
+                )
             )
-            if use_temporal_condition:
-                base, temporal_condition = self.forward_base(
+            if needs_aligned_features:
+                base, aligned_features = self.forward_base(
                     x,
                     return_aligned_features=True,
                 )
             else:
                 base = self.forward_base(x)
-                temporal_condition = None
+                aligned_features = None
             lq = self.center_frame(x)
             guidance = self.predict_guidance(
                 lq,
                 base,
                 rate_cond=rate_cond,
             ).clamp(0, 1)
+            temporal_condition, temporal_prior_correction = (
+                self.make_diffusion_prior_conditions(
+                    x,
+                    base,
+                    aligned_features,
+                    rate_cond=rate_cond,
+                )
+            )
             detail_gate = self.diffusion.make_detail_gate(
                 lq,
                 base,
@@ -420,6 +482,7 @@ class HybridSTDFGRDR(nn.Module):
                     pred_signal,
                     lq,
                     base,
+                    temporal_prior_correction=temporal_prior_correction,
                 )
                 gated = detail_gate * correction
                 correction_samples.append(gated)
@@ -447,7 +510,9 @@ class HybridSTDFGRDR(nn.Module):
                 1,
             )
             gated_correction = torch.cat(correction_samples, dim=0)
-            if self.diffusion.is_carrier_guided():
+            if self.diffusion.is_temporal_prior_gain():
+                utility_carrier = temporal_prior_correction
+            elif self.diffusion.is_carrier_guided():
                 utility_carrier = self.diffusion.make_carrier_direction(lq, base)
             else:
                 utility_carrier = correction_samples[0]
@@ -536,28 +601,32 @@ class HybridSTDFGRDR(nn.Module):
             freeze_base=True,
             guidance_mode='oracle',
             detach_pred_guidance=True):
-        use_temporal_condition = (
-            self.diffusion.denoiser.temporal_condition_nc > 0
+        needs_aligned_features = (
+            self.diffusion.denoiser.temporal_condition_nc > 0 or
+            (
+                self.diffusion.is_temporal_prior_gain() and
+                self.temporal_detail_prior.use_aligned_features
+            )
         )
         if freeze_base:
             with torch.no_grad():
-                if use_temporal_condition:
-                    base, temporal_condition = self.forward_base(
+                if needs_aligned_features:
+                    base, aligned_features = self.forward_base(
                         x,
                         return_aligned_features=True,
                     )
                 else:
                     base = self.forward_base(x)
-                    temporal_condition = None
+                    aligned_features = None
         else:
-            if use_temporal_condition:
-                base, temporal_condition = self.forward_base(
+            if needs_aligned_features:
+                base, aligned_features = self.forward_base(
                     x,
                     return_aligned_features=True,
                 )
             else:
                 base = self.forward_base(x)
-                temporal_condition = None
+                aligned_features = None
         lq = self.center_frame(x)
         guidance_maps = self.make_guidance(gt, base.detach())
         if guidance_mode == 'none':
@@ -572,6 +641,14 @@ class HybridSTDFGRDR(nn.Module):
                 guidance = guidance.detach()
         else:
             raise ValueError(f'Unsupported guidance_mode: {guidance_mode}')
+        temporal_condition, temporal_prior_correction = (
+            self.make_diffusion_prior_conditions(
+                x,
+                base.detach() if freeze_base else base,
+                aligned_features,
+                rate_cond=rate_cond,
+            )
+        )
         loss_dict = self.diffusion.training_losses(
             lq,
             base.detach() if freeze_base else base,
@@ -579,6 +656,7 @@ class HybridSTDFGRDR(nn.Module):
             guidance,
             rate_cond=rate_cond,
             temporal_condition=temporal_condition,
+            temporal_prior_correction=temporal_prior_correction,
         )
         return {
             'loss': loss_dict['loss'],
@@ -624,6 +702,7 @@ class HybridSTDFGRDR(nn.Module):
             'detail_gate': loss_dict['detail_gate'],
             'base': base,
             'temporal_condition': temporal_condition,
+            'temporal_prior_correction': temporal_prior_correction,
             'guidance': guidance,
             'oracle_guidance': guidance_maps['guidance'],
             'guidance_maps': guidance_maps,
@@ -939,14 +1018,21 @@ class HybridSTDFGRDR(nn.Module):
             sampler='ddim',
             ddim_eta=0.0,
             initial_noise=None):
-        if self.diffusion.denoiser.temporal_condition_nc > 0:
-            base, temporal_condition = self.forward_base(
+        needs_aligned_features = (
+            self.diffusion.denoiser.temporal_condition_nc > 0 or
+            (
+                self.diffusion.is_temporal_prior_gain() and
+                self.temporal_detail_prior.use_aligned_features
+            )
+        )
+        if needs_aligned_features:
+            base, aligned_features = self.forward_base(
                 x,
                 return_aligned_features=True,
             )
         else:
             base = self.forward_base(x)
-            temporal_condition = None
+            aligned_features = None
         lq = self.center_frame(x)
         if guidance is None:
             if guidance_mode == 'predicted':
@@ -971,6 +1057,14 @@ class HybridSTDFGRDR(nn.Module):
             mask_mode = 'top_ratio'
         elif budget_mode not in ('none', None):
             raise ValueError(f'Unsupported budget_mode: {budget_mode}')
+        temporal_condition, temporal_prior_correction = (
+            self.make_diffusion_prior_conditions(
+                x,
+                base,
+                aligned_features,
+                rate_cond=rate_cond,
+            )
+        )
         refined = self.diffusion.refine(
             lq,
             base,
@@ -987,11 +1081,13 @@ class HybridSTDFGRDR(nn.Module):
             ddim_eta=ddim_eta,
             initial_noise=initial_noise,
             temporal_condition=temporal_condition,
+            temporal_prior_correction=temporal_prior_correction,
         )
         return {
             'base': base,
             'guidance': guidance,
             'budget': pred_budget if pred_budget is not None else budget,
+            'temporal_prior_correction': temporal_prior_correction,
             'refined': refined,
         }
 

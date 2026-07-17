@@ -38,6 +38,14 @@ def parse_args():
         default=None,
         help='GuidanceNet checkpoint, required when --guidance_mode predicted.',
     )
+    parser.add_argument(
+        '--temporal_prior_ckpt',
+        default=None,
+        help=(
+            'Frozen temporal detail prior checkpoint. Required when the '
+            'diffusion target is temporal_prior_gain.'
+        ),
+    )
     parser.add_argument('--local_rank', type=int, default=0)
     parser.add_argument('--num_iter', type=int, default=None)
     parser.add_argument('--interval_print', type=int, default=None)
@@ -121,6 +129,38 @@ def load_guidance_weights(guidance_net, ckp_path):
     guidance_net.load_state_dict(guidance_state or clean_state, strict=True)
 
 
+def load_temporal_prior_weights(prior_net, ckp_path):
+    checkpoint = torch.load(ckp_path, map_location='cpu')
+    state = checkpoint.get('temporal_detail_prior_state_dict')
+    if state is None:
+        full_state = checkpoint.get('state_dict', checkpoint)
+        state = OrderedDict()
+        prefix = 'temporal_detail_prior.'
+        for key, value in full_state.items():
+            if key.startswith('module.'):
+                key = key[7:]
+            if key.startswith(prefix):
+                state[key[len(prefix):]] = value
+        if not state:
+            state = full_state
+    saved_mode = checkpoint.get('prediction_mode')
+    if saved_mode is not None and saved_mode != prior_net.prediction_mode:
+        raise ValueError(
+            'Temporal prior prediction mode mismatch: '
+            f'checkpoint={saved_mode}, model={prior_net.prediction_mode}'
+        )
+    saved_scale = checkpoint.get('amplitude_prediction_scale')
+    if (
+            saved_scale is not None and
+            int(saved_scale) != prior_net.amplitude_prediction_scale):
+        raise ValueError(
+            'Temporal prior prediction scale mismatch: '
+            f'checkpoint={saved_scale}, '
+            f'model={prior_net.amplitude_prediction_scale}'
+        )
+    prior_net.load_state_dict(state, strict=True)
+
+
 def count_trainable_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -148,7 +188,8 @@ def load_resume_state(
         path,
         guidance_mode,
         guidance_ckpt,
-        stdf_ckpt):
+        stdf_ckpt,
+        temporal_prior_ckpt):
     checkpoint = torch.load(path, map_location='cpu')
     requested_process = model.diffusion.process_mode
     saved_process = checkpoint.get('diffusion_process_mode', 'gaussian')
@@ -198,6 +239,16 @@ def load_resume_state(
             f'checkpoint={saved_target}, '
             f'requested={model.diffusion.target_mode}'
         )
+    if model.diffusion.is_temporal_prior_gain():
+        for key, requested in (
+                ('prior_gain_window', model.diffusion.prior_gain_window),
+                ('prior_gain_max', model.diffusion.prior_gain_max)):
+            saved = checkpoint.get(key)
+            if saved is None or abs(float(saved) - float(requested)) > 1e-12:
+                raise ValueError(
+                    f'Resume {key} mismatch: checkpoint={saved}, '
+                    f'requested={requested}'
+                )
     saved_mode = checkpoint.get('guidance_mode')
     if saved_mode is not None and saved_mode != guidance_mode:
         raise ValueError(
@@ -206,7 +257,8 @@ def load_resume_state(
         )
     for key, requested in (
             ('guidance_ckpt', guidance_ckpt),
-            ('stdf_ckpt', stdf_ckpt)):
+            ('stdf_ckpt', stdf_ckpt),
+            ('temporal_prior_ckpt', temporal_prior_ckpt)):
         saved = checkpoint.get(key)
         if saved is not None and requested is not None:
             if op.normpath(str(saved)) != op.normpath(str(requested)):
@@ -279,6 +331,14 @@ def main():
     )
     if args.guidance_mode == 'predicted' and args.guidance_ckpt is None:
         raise ValueError('--guidance_ckpt is required when --guidance_mode predicted.')
+    uses_temporal_prior = (
+        diffusion_opts.get('target_mode') == 'temporal_prior_gain'
+    )
+    if uses_temporal_prior and args.temporal_prior_ckpt is None:
+        raise ValueError(
+            '--temporal_prior_ckpt is required when target_mode is '
+            'temporal_prior_gain.'
+        )
 
     if rank == 0:
         exp_dir = op.dirname(opts_dict['train']['log_path'])
@@ -290,6 +350,7 @@ def main():
             f"STDF checkpoint: [{args.stdf_ckpt}]\n"
             f"Guidance mode: [{args.guidance_mode}]\n"
             f"Guidance checkpoint: [{args.guidance_ckpt}]\n"
+            f"Temporal prior checkpoint: [{args.temporal_prior_ckpt}]\n"
             f"Resume checkpoint: [{args.resume_ckpt}]\n"
             f"\n{'<' * 10} Options {'>' * 10}\n"
             f"{utils.dict2str(opts_dict)}"
@@ -331,6 +392,11 @@ def main():
     load_stdf_weights(model.enhancer, args.stdf_ckpt)
     if args.guidance_mode == 'predicted':
         load_guidance_weights(model.guidance_net, args.guidance_ckpt)
+    if uses_temporal_prior:
+        load_temporal_prior_weights(
+            model.temporal_detail_prior,
+            args.temporal_prior_ckpt,
+        )
     for param in model.parameters():
         param.requires_grad = False
     model.freeze_enhancer()
@@ -341,6 +407,7 @@ def main():
     model.enhancer.eval()
     model.guidance_net.eval()
     model.budget_net.eval()
+    model.temporal_detail_prior.eval()
     model.diffusion.train()
 
     optim_opts = dict(opts_dict['train']['optim'])
@@ -358,6 +425,7 @@ def main():
             args.guidance_mode,
             args.guidance_ckpt,
             args.stdf_ckpt,
+            args.temporal_prior_ckpt,
         )
         if start_iter >= num_iter:
             raise ValueError(
@@ -456,6 +524,9 @@ def main():
                             diagnostic_signal,
                             diagnostic_lq,
                             diagnostic_base,
+                            temporal_prior_correction=outputs[
+                                'temporal_prior_correction'
+                            ],
                         )
                     )
                     diagnostic_hybrid = (
@@ -469,6 +540,9 @@ def main():
                             diagnostic_lq,
                             diagnostic_base,
                             gt_data,
+                            temporal_prior_correction=outputs[
+                                'temporal_prior_correction'
+                            ],
                         )
                     )
                     _, diagnostic_target_prior = (
@@ -476,6 +550,9 @@ def main():
                             diagnostic_target_signal,
                             diagnostic_lq,
                             diagnostic_base,
+                            temporal_prior_correction=outputs[
+                                'temporal_prior_correction'
+                            ],
                         )
                     )
                     sample_psnr_delta = float((
@@ -534,6 +611,10 @@ def main():
                     float(outputs['temporal_condition'].abs().mean().cpu())
                     if outputs['temporal_condition'] is not None else 0.0
                 )
+                temporal_prior_abs = (
+                    float(outputs['temporal_prior_correction'].abs().mean().cpu())
+                    if outputs['temporal_prior_correction'] is not None else 0.0
+                )
                 msg = (
                     f"iter: [{num_iter_accum}]/{num_iter}, "
                     f"epoch: [{current_epoch}]/{num_epoch - 1}, "
@@ -573,6 +654,7 @@ def main():
                     f"wavelet LL leak: [{wavelet_ll_leakage:.8f}], "
                     f"shift eta: [{shift_eta_mean:.4f}], "
                     f"temporal condition abs: [{temporal_condition_abs:.6f}], "
+                    f"temporal prior abs: [{temporal_prior_abs:.6f}], "
                     f"sample PSNR delta/corr/abs: "
                     f"[{sample_psnr_delta:+.4f}/{sample_correlation:.4f}/"
                     f"{sample_correction_abs:.6f}], "
@@ -597,6 +679,7 @@ def main():
                     'stdf_ckpt': args.stdf_ckpt,
                     'guidance_mode': args.guidance_mode,
                     'guidance_ckpt': args.guidance_ckpt,
+                    'temporal_prior_ckpt': args.temporal_prior_ckpt,
                     'diffusion_target_mode': diffusion_opts.get(
                         'target_mode',
                         'pixel_residual',
@@ -619,6 +702,12 @@ def main():
                     'wavelet_condition_include_lowpass': diffusion_opts.get(
                         'wavelet_condition_include_lowpass',
                         True,
+                    ),
+                    'prior_gain_window': diffusion_opts.get(
+                        'prior_gain_window',
+                    ),
+                    'prior_gain_max': diffusion_opts.get(
+                        'prior_gain_max',
                     ),
                     'resumed_from': args.resume_ckpt,
                     'state_dict': model.state_dict(),
