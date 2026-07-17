@@ -34,6 +34,7 @@ def main():
         'residual_shift_eta_max': 0.999,
         'residual_shift_schedule_power': 0.5,
         'residual_shift_noise_scale': 0.10,
+        'residual_shift_terminal_weight': 1.0,
         'wavelet_coefficient_clip': 0.05,
         'wavelet_condition_scale': 0.10,
         'detail_gate_mode': 'none',
@@ -83,6 +84,24 @@ def main():
     )
     if not torch.isfinite(losses['loss']):
         raise AssertionError('Wavelet diffusion loss is not finite.')
+    if not torch.isfinite(losses['terminal_diffusion_loss']):
+        raise AssertionError('Terminal diffusion loss is not finite.')
+    denoiser_parameters = tuple(diffusion.denoiser.parameters())
+    terminal_gradients = torch.autograd.grad(
+        losses['terminal_diffusion_loss'],
+        denoiser_parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    terminal_gradient_sum = sum(
+        float(gradient.abs().sum())
+        for gradient in terminal_gradients
+        if gradient is not None
+    )
+    if terminal_gradient_sum <= 0:
+        raise AssertionError(
+            'No gradient reached the denoiser from terminal supervision.'
+        )
     losses['loss'].backward()
     gradient_sum = sum(
         float(parameter.grad.abs().sum())
@@ -145,6 +164,11 @@ def main():
     print('========== Wavelet diffusion checks ==========')
     print(f'target/sample shape: {expected_shape}')
     print(f'loss: {float(losses["loss"]):.6f}')
+    print(
+        'terminal diffusion loss: '
+        f'{float(losses["terminal_diffusion_loss"]):.6f}'
+    )
+    print(f'terminal gradient sum: {terminal_gradient_sum:.8e}')
     print(f'denoiser gradient sum: {gradient_sum:.8e}')
     print(f'correction max abs: {float(correction.abs().max()):.8f}')
     print(f'identity correction max abs: {identity_error:.8e}')

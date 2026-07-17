@@ -71,6 +71,7 @@ network:
     residual_shift_eta_max: 0.999
     residual_shift_schedule_power: 0.5
     residual_shift_noise_scale: 0.10
+    residual_shift_terminal_weight: 1.0
     loss_type: l1
     loss_bg_weight: 1.0
     rec_weight: 1.0

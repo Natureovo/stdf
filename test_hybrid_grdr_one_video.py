@@ -307,6 +307,9 @@ def build_opts(args):
             'residual_shift_noise_scale': (
                 args.diffusion_residual_shift_noise_scale
             ),
+            'residual_shift_terminal_weight': (
+                args.diffusion_residual_shift_terminal_weight
+            ),
             'target_mode': args.diffusion_target_mode,
             'target_highfreq_kernel': args.diffusion_target_highfreq_kernel,
             'wavelet_coefficient_clip': args.diffusion_wavelet_coefficient_clip,
@@ -491,6 +494,7 @@ def parse_args():
     parser.add_argument('--diffusion_residual_shift_eta_max', type=float, default=0.999)
     parser.add_argument('--diffusion_residual_shift_schedule_power', type=float, default=0.5)
     parser.add_argument('--diffusion_residual_shift_noise_scale', type=float, default=0.10)
+    parser.add_argument('--diffusion_residual_shift_terminal_weight', type=float, default=1.0)
     parser.add_argument(
         '--diffusion_target_mode',
         default='pixel_residual',
@@ -716,6 +720,33 @@ def main():
                 'Checkpoint/CLI diffusion process mismatch: '
                 f'{saved_process} vs {model.diffusion.process_mode}.'
             )
+        if model.diffusion.process_mode == 'residual_shift':
+            requested_terminal_weight = float(
+                model.diffusion.residual_shift_terminal_weight
+            )
+            saved_terminal_weight = grdr_checkpoint.get(
+                'residual_shift_terminal_weight'
+            )
+            if (
+                    saved_terminal_weight is None and
+                    requested_terminal_weight > 0):
+                raise ValueError(
+                    'This residual-shift checkpoint predates terminal anchor '
+                    'supervision. Train a new checkpoint, or pass '
+                    '--diffusion_residual_shift_terminal_weight 0 only for '
+                    'a legacy comparison.'
+                )
+            if (
+                    saved_terminal_weight is not None and
+                    abs(
+                        float(saved_terminal_weight) -
+                        requested_terminal_weight
+                    ) > 1e-12):
+                raise ValueError(
+                    'Residual-shift terminal weight mismatch: '
+                    f'{saved_terminal_weight} vs '
+                    f'{requested_terminal_weight}.'
+                )
         saved_target = grdr_checkpoint.get('diffusion_target_mode')
         if (
                 saved_target is not None and

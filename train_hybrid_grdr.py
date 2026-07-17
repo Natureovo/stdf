@@ -157,6 +157,28 @@ def load_resume_state(
             'Resume diffusion process mismatch: '
             f'checkpoint={saved_process}, requested={requested_process}'
         )
+    if requested_process == 'residual_shift':
+        requested_terminal_weight = float(
+            model.diffusion.residual_shift_terminal_weight
+        )
+        saved_terminal_weight = checkpoint.get(
+            'residual_shift_terminal_weight'
+        )
+        if saved_terminal_weight is None and requested_terminal_weight > 0:
+            raise ValueError(
+                'This residual-shift checkpoint predates terminal anchor '
+                'supervision and cannot be resumed safely. Start a new '
+                'training run instead.'
+            )
+        if (
+                saved_terminal_weight is not None and
+                abs(float(saved_terminal_weight) - requested_terminal_weight)
+                > 1e-12):
+            raise ValueError(
+                'Resume residual_shift_terminal_weight mismatch: '
+                f'checkpoint={saved_terminal_weight}, '
+                f'requested={requested_terminal_weight}'
+            )
     saved_target = checkpoint.get('diffusion_target_mode')
     if (
             saved_target is not None and
@@ -462,6 +484,8 @@ def main():
                 write_area = float(outputs['write_mask'].mean().detach().cpu())
                 base_mean = float(outputs['base'].mean().detach().cpu())
                 diff_loss = outputs['diffusion_loss']
+                random_diff_loss = outputs['random_diffusion_loss']
+                terminal_diff_loss = outputs['terminal_diffusion_loss']
                 rec_loss = outputs['reconstruction_loss']
                 residual_loss = outputs['residual_loss']
                 residual_bg_loss = outputs['residual_bg_loss']
@@ -501,6 +525,8 @@ def main():
                     f"lr: [{lr * 1e4:.3f}]x1e-4, "
                     f"loss: [{loss.item():.4f}], "
                     f"diff_loss: [{diff_loss.item():.4f}], "
+                    f"random_diff: [{random_diff_loss.item():.4f}], "
+                    f"terminal_diff: [{terminal_diff_loss.item():.4f}], "
                     f"rec_loss: [{rec_loss.item():.4f}], "
                     f"res_loss: [{residual_loss.item():.4f}], "
                     f"res_bg: [{residual_bg_loss.item():.4f}], "
@@ -562,6 +588,10 @@ def main():
                     'diffusion_process_mode': diffusion_opts.get(
                         'process_mode',
                         'gaussian',
+                    ),
+                    'residual_shift_terminal_weight': diffusion_opts.get(
+                        'residual_shift_terminal_weight',
+                        1.0,
                     ),
                     'wavelet_coefficient_clip': diffusion_opts.get(
                         'wavelet_coefficient_clip',

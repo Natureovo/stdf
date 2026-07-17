@@ -346,6 +346,7 @@ class GuidedResidualDiffusion(nn.Module):
             residual_shift_eta_max=0.999,
             residual_shift_schedule_power=0.5,
             residual_shift_noise_scale=0.10,
+            residual_shift_terminal_weight=1.0,
             carrier_source='base',
             carrier_gain_clip=0.5,
             carrier_norm_clip=3.0,
@@ -424,6 +425,9 @@ class GuidedResidualDiffusion(nn.Module):
             residual_shift_schedule_power
         )
         self.residual_shift_noise_scale = float(residual_shift_noise_scale)
+        self.residual_shift_terminal_weight = float(
+            residual_shift_terminal_weight
+        )
         if self.process_mode == 'residual_shift':
             if not 0.0 < self.residual_shift_eta_max < 1.0:
                 raise ValueError('residual_shift_eta_max should be in (0, 1).')
@@ -434,6 +438,10 @@ class GuidedResidualDiffusion(nn.Module):
             if self.residual_shift_noise_scale <= 0:
                 raise ValueError(
                     'residual_shift_noise_scale should be positive.'
+                )
+            if self.residual_shift_terminal_weight < 0:
+                raise ValueError(
+                    'residual_shift_terminal_weight should be non-negative.'
                 )
         if self.target_mode == 'wavelet_subband':
             if self.wavelet_coefficient_clip <= 0:
@@ -911,12 +919,41 @@ class GuidedResidualDiffusion(nn.Module):
         weight = self.loss_bg_weight + (1.0 - self.loss_bg_weight) * guidance_weight
         weight = weight.expand_as(loss_map)
         diff_loss = (loss_map * weight).sum() / (weight.sum() + 1e-6)
+        random_diff_loss = diff_loss
 
         if self.is_residual_shift():
-            # Direct x0 prediction prevents the high-noise endpoint from
-            # amplifying small model errors and makes zero output equal STDF.
-            pred_signal = model_output
+            # The endpoint contains no GT signal. This extra prediction forces
+            # the model to use LQ/STDF/QP conditions instead of copying x_t.
+            terminal_t = torch.full_like(t, self.num_steps - 1)
+            terminal_state = torch.zeros_like(target_signal)
+            terminal_output = self.denoiser(
+                terminal_state,
+                condition_lq,
+                condition_base,
+                condition_guidance,
+                terminal_t,
+                rate_cond=rate_cond,
+            )
+            if self.loss_type == 'l2':
+                terminal_loss_map = (
+                    terminal_output - target_signal
+                ).pow(2)
+            else:
+                terminal_loss_map = (
+                    terminal_output - target_signal
+                ).abs()
+            terminal_diff_loss = (
+                terminal_loss_map * weight
+            ).sum() / (weight.sum() + 1e-6)
+            diff_loss = (
+                diff_loss +
+                self.residual_shift_terminal_weight * terminal_diff_loss
+            )
+            # Reconstruction and directional losses must evaluate the
+            # condition-only endpoint prediction, not a GT-leaking random t.
+            pred_signal = terminal_output
         else:
+            terminal_diff_loss = diff_loss.detach() * 0.0
             pred_signal = self.predict_residual_from_noise(
                 noisy_residual,
                 t,
@@ -1164,6 +1201,8 @@ class GuidedResidualDiffusion(nn.Module):
         return {
             'loss': total_loss,
             'diffusion_loss': diff_loss,
+            'random_diffusion_loss': random_diff_loss,
+            'terminal_diffusion_loss': terminal_diff_loss,
             'reconstruction_loss': rec_loss,
             'residual_loss': residual_loss,
             'residual_bg_loss': residual_bg_loss,
@@ -1530,6 +1569,10 @@ def build_grdr(opts=None):
         residual_shift_noise_scale=opts.get(
             'residual_shift_noise_scale',
             0.10,
+        ),
+        residual_shift_terminal_weight=opts.get(
+            'residual_shift_terminal_weight',
+            1.0,
         ),
         carrier_source=opts.get('carrier_source', 'base'),
         carrier_gain_clip=opts.get('carrier_gain_clip', 0.5),

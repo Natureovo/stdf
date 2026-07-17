@@ -162,6 +162,28 @@ def load_grdr_weights(diffusion, path):
             'Checkpoint/config diffusion process mismatch: '
             f'{saved_process} vs {diffusion.process_mode}.'
         )
+    if diffusion.process_mode == 'residual_shift':
+        requested_terminal_weight = float(
+            diffusion.residual_shift_terminal_weight
+        )
+        saved_terminal_weight = checkpoint.get(
+            'residual_shift_terminal_weight'
+        )
+        if saved_terminal_weight is None and requested_terminal_weight > 0:
+            raise ValueError(
+                'This residual-shift checkpoint predates terminal anchor '
+                'supervision. Train a new checkpoint, or set '
+                'residual_shift_terminal_weight to 0 only for a legacy '
+                'comparison.'
+            )
+        if (
+                saved_terminal_weight is not None and
+                abs(float(saved_terminal_weight) - requested_terminal_weight)
+                > 1e-12):
+            raise ValueError(
+                'Residual-shift terminal weight mismatch: '
+                f'{saved_terminal_weight} vs {requested_terminal_weight}.'
+            )
     saved_target = checkpoint.get('diffusion_target_mode')
     if saved_target is not None and saved_target != diffusion.target_mode:
         raise ValueError(
@@ -934,6 +956,9 @@ def main():
         'mask_guidance_mode': mask_guidance_mode,
         'diffusion_target_mode': model.diffusion.target_mode,
         'diffusion_process_mode': model.diffusion.process_mode,
+        'residual_shift_terminal_weight': (
+            model.diffusion.residual_shift_terminal_weight
+        ),
         'wavelet_coefficient_clip': model.diffusion.wavelet_coefficient_clip,
         'wavelet_condition_scale': model.diffusion.wavelet_condition_scale,
         'wavelet_condition_include_lowpass': (

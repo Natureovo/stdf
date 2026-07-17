@@ -554,6 +554,8 @@ class HybridSTDFGRDR(nn.Module):
         return {
             'loss': loss_dict['loss'],
             'diffusion_loss': loss_dict['diffusion_loss'],
+            'random_diffusion_loss': loss_dict['random_diffusion_loss'],
+            'terminal_diffusion_loss': loss_dict['terminal_diffusion_loss'],
             'reconstruction_loss': loss_dict['reconstruction_loss'],
             'residual_loss': loss_dict['residual_loss'],
             'residual_bg_loss': loss_dict['residual_bg_loss'],
