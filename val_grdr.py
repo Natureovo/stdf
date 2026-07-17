@@ -51,9 +51,12 @@ def parse_args():
     parser.add_argument('--ddim_eta', type=float, default=0.0)
     parser.add_argument(
         '--noise_mode',
-        choices=['independent', 'shared'],
+        choices=['zero', 'independent', 'shared'],
         default='independent',
-        help='Reuse one initial noise tensor per compressed video sequence.',
+        help=(
+            'zero evaluates the deterministic STDF anchor; shared reuses one '
+            'initial state per compressed video sequence.'
+        ),
     )
     parser.add_argument('--residual_scale', type=float, default=0.2)
     parser.add_argument('--seed', type=int, default=7)
@@ -153,6 +156,18 @@ def load_guidance_weights(guidance_net, path):
 
 def load_grdr_weights(diffusion, path):
     state_dict, checkpoint = load_state_dict(path)
+    saved_process = checkpoint.get('diffusion_process_mode', 'gaussian')
+    if saved_process != diffusion.process_mode:
+        raise ValueError(
+            'Checkpoint/config diffusion process mismatch: '
+            f'{saved_process} vs {diffusion.process_mode}.'
+        )
+    saved_target = checkpoint.get('diffusion_target_mode')
+    if saved_target is not None and saved_target != diffusion.target_mode:
+        raise ValueError(
+            'Checkpoint/config diffusion target mismatch: '
+            f'{saved_target} vs {diffusion.target_mode}.'
+        )
     if 'diffusion_state_dict' in checkpoint:
         diffusion.load_state_dict(checkpoint['diffusion_state_dict'], strict=True)
         return
@@ -535,7 +550,11 @@ def main():
                 )
             name = data['name_vid'][0]
             initial_noise = None
-            if args.noise_mode == 'shared':
+            if args.noise_mode == 'zero':
+                initial_noise = base.new_zeros(
+                    model.diffusion.signal_shape(base)
+                )
+            elif args.noise_mode == 'shared':
                 if (
                         name not in shared_noises or
                         tuple(shared_noises[name].shape) !=
@@ -914,6 +933,7 @@ def main():
         'condition_guidance_mode': condition_guidance_mode,
         'mask_guidance_mode': mask_guidance_mode,
         'diffusion_target_mode': model.diffusion.target_mode,
+        'diffusion_process_mode': model.diffusion.process_mode,
         'wavelet_coefficient_clip': model.diffusion.wavelet_coefficient_clip,
         'wavelet_condition_scale': model.diffusion.wavelet_condition_scale,
         'wavelet_condition_include_lowpass': (
@@ -1021,6 +1041,7 @@ def main():
         f"condition/mask guidance: "
         f"{condition_guidance_mode}/{mask_guidance_mode}, "
         f"target: {model.diffusion.target_mode}, "
+        f"process: {model.diffusion.process_mode}, "
         f"noise: {args.noise_mode}, "
         f"mask: {args.mask_mode}"
     )

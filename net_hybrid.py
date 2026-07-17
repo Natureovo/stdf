@@ -586,6 +586,7 @@ class HybridSTDFGRDR(nn.Module):
             'wavelet_hl_corr': loss_dict['wavelet_hl_corr'],
             'wavelet_hh_corr': loss_dict['wavelet_hh_corr'],
             'wavelet_ll_leakage': loss_dict['wavelet_ll_leakage'],
+            'shift_eta_mean': loss_dict['shift_eta_mean'],
             'pred_hybrid': loss_dict['pred_hybrid'],
             'write_mask': loss_dict['write_mask'],
             'raw_write_mask': loss_dict['raw_write_mask'],

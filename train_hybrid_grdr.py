@@ -125,6 +125,23 @@ def count_trainable_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def batch_psnr(pred, target):
+    mse = (pred - target).square().flatten(1).mean(dim=1).clamp_min(1e-12)
+    return -10.0 * torch.log10(mse)
+
+
+def tensor_correlation(pred, target):
+    pred = pred.flatten(1)
+    target = target.flatten(1)
+    pred = pred - pred.mean(dim=1, keepdim=True)
+    target = target - target.mean(dim=1, keepdim=True)
+    numerator = (pred * target).sum(dim=1)
+    denominator = torch.sqrt(
+        pred.square().sum(dim=1) * target.square().sum(dim=1) + 1e-8
+    )
+    return (numerator / denominator).mean()
+
+
 def load_resume_state(
         model,
         optimizer,
@@ -133,6 +150,22 @@ def load_resume_state(
         guidance_ckpt,
         stdf_ckpt):
     checkpoint = torch.load(path, map_location='cpu')
+    requested_process = model.diffusion.process_mode
+    saved_process = checkpoint.get('diffusion_process_mode', 'gaussian')
+    if saved_process != requested_process:
+        raise ValueError(
+            'Resume diffusion process mismatch: '
+            f'checkpoint={saved_process}, requested={requested_process}'
+        )
+    saved_target = checkpoint.get('diffusion_target_mode')
+    if (
+            saved_target is not None and
+            saved_target != model.diffusion.target_mode):
+        raise ValueError(
+            'Resume diffusion target mismatch: '
+            f'checkpoint={saved_target}, '
+            f'requested={model.diffusion.target_mode}'
+        )
     saved_mode = checkpoint.get('guidance_mode')
     if saved_mode is not None and saved_mode != guidance_mode:
         raise ValueError(
@@ -364,6 +397,66 @@ def main():
             optimizer.step()
 
             if rank == 0 and num_iter_accum % interval_print == 0:
+                model.diffusion.eval()
+                with torch.no_grad():
+                    diagnostic_lq = model.center_frame(input_data)
+                    diagnostic_base = outputs['base'].detach()
+                    diagnostic_guidance = outputs['guidance'].detach()
+                    diagnostic_noise = diagnostic_base.new_zeros(
+                        model.diffusion.signal_shape(diagnostic_base)
+                    )
+                    diagnostic_signal = model.diffusion.sample_residual(
+                        diagnostic_lq,
+                        diagnostic_base,
+                        diagnostic_guidance,
+                        rate_cond=rate_cond,
+                        steps=int(diffusion_opts.get(
+                            'diagnostic_sample_steps',
+                            5,
+                        )),
+                        sampler='ddim',
+                        ddim_eta=0.0,
+                        initial_noise=diagnostic_noise,
+                    )
+                    diagnostic_correction, diagnostic_prior = (
+                        model.diffusion.signal_to_correction(
+                            diagnostic_signal,
+                            diagnostic_lq,
+                            diagnostic_base,
+                        )
+                    )
+                    diagnostic_hybrid = (
+                        diagnostic_base +
+                        float(model.diffusion.train_residual_scale) *
+                        outputs['write_mask'].detach() *
+                        diagnostic_correction
+                    ).clamp(0, 1)
+                    diagnostic_target_signal = (
+                        model.diffusion.make_target_signal(
+                            diagnostic_lq,
+                            diagnostic_base,
+                            gt_data,
+                        )
+                    )
+                    _, diagnostic_target_prior = (
+                        model.diffusion.signal_to_correction(
+                            diagnostic_target_signal,
+                            diagnostic_lq,
+                            diagnostic_base,
+                        )
+                    )
+                    sample_psnr_delta = float((
+                        batch_psnr(diagnostic_hybrid, gt_data) -
+                        batch_psnr(diagnostic_base, gt_data)
+                    ).mean().cpu())
+                    sample_correlation = float(tensor_correlation(
+                        diagnostic_prior,
+                        diagnostic_target_prior,
+                    ).cpu())
+                    sample_correction_abs = float(
+                        diagnostic_correction.abs().mean().cpu()
+                    )
+                model.diffusion.train()
                 lr = optimizer.param_groups[0]['lr']
                 guidance_mean = float(outputs['guidance'].mean().detach().cpu())
                 write_area = float(outputs['write_mask'].mean().detach().cpu())
@@ -401,6 +494,7 @@ def main():
                 wavelet_hl_corr = float(outputs['wavelet_hl_corr'].detach().cpu())
                 wavelet_hh_corr = float(outputs['wavelet_hh_corr'].detach().cpu())
                 wavelet_ll_leakage = float(outputs['wavelet_ll_leakage'].detach().cpu())
+                shift_eta_mean = float(outputs['shift_eta_mean'].detach().cpu())
                 msg = (
                     f"iter: [{num_iter_accum}]/{num_iter}, "
                     f"epoch: [{current_epoch}]/{num_epoch - 1}, "
@@ -436,6 +530,10 @@ def main():
                     f"[{wavelet_lh_corr:.4f}/{wavelet_hl_corr:.4f}/"
                     f"{wavelet_hh_corr:.4f}], "
                     f"wavelet LL leak: [{wavelet_ll_leakage:.8f}], "
+                    f"shift eta: [{shift_eta_mean:.4f}], "
+                    f"sample PSNR delta/corr/abs: "
+                    f"[{sample_psnr_delta:+.4f}/{sample_correlation:.4f}/"
+                    f"{sample_correction_abs:.6f}], "
                     f"guidance_mean: [{guidance_mean:.4f}], "
                     f"write_area: [{write_area:.4f}], "
                     f"base_mean: [{base_mean:.4f}]"
@@ -460,6 +558,10 @@ def main():
                     'diffusion_target_mode': diffusion_opts.get(
                         'target_mode',
                         'pixel_residual',
+                    ),
+                    'diffusion_process_mode': diffusion_opts.get(
+                        'process_mode',
+                        'gaussian',
                     ),
                     'wavelet_coefficient_clip': diffusion_opts.get(
                         'wavelet_coefficient_clip',

@@ -63,8 +63,15 @@ network:
     control_main_input: full
     control_hf_kernel: 5
     num_steps: 1000
-    sample_steps: 20
-    loss_type: l2
+    sample_steps: 5
+    diagnostic_sample_steps: 5
+    # Residual-shift diffusion moves GT wavelet correction toward the
+    # zero-correction STDF anchor instead of destroying it with unit noise.
+    process_mode: residual_shift
+    residual_shift_eta_max: 0.999
+    residual_shift_schedule_power: 0.5
+    residual_shift_noise_scale: 0.10
+    loss_type: l1
     loss_bg_weight: 1.0
     rec_weight: 1.0
     target_mode: wavelet_subband

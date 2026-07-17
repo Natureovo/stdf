@@ -342,6 +342,10 @@ class GuidedResidualDiffusion(nn.Module):
             wavelet_coefficient_clip=0.05,
             wavelet_condition_scale=0.10,
             wavelet_condition_include_lowpass=True,
+            process_mode='gaussian',
+            residual_shift_eta_max=0.999,
+            residual_shift_schedule_power=0.5,
+            residual_shift_noise_scale=0.10,
             carrier_source='base',
             carrier_gain_clip=0.5,
             carrier_norm_clip=3.0,
@@ -381,6 +385,12 @@ class GuidedResidualDiffusion(nn.Module):
             raise ValueError(f'Unsupported carrier_source: {carrier_source}')
         if detail_gate_mode not in ('none', 'hf_gap', 'multi_cue'):
             raise ValueError(f'Unsupported detail_gate_mode: {detail_gate_mode}')
+        if process_mode not in ('gaussian', 'residual_shift'):
+            raise ValueError(f'Unsupported diffusion process_mode: {process_mode}')
+        if process_mode == 'residual_shift' and target_mode != 'wavelet_subband':
+            raise ValueError(
+                'residual_shift currently requires target_mode=wavelet_subband.'
+            )
         self.denoiser = denoiser
         self.num_steps = num_steps
         self.loss_type = loss_type
@@ -408,6 +418,23 @@ class GuidedResidualDiffusion(nn.Module):
         self.wavelet_condition_include_lowpass = bool(
             wavelet_condition_include_lowpass
         )
+        self.process_mode = process_mode
+        self.residual_shift_eta_max = float(residual_shift_eta_max)
+        self.residual_shift_schedule_power = float(
+            residual_shift_schedule_power
+        )
+        self.residual_shift_noise_scale = float(residual_shift_noise_scale)
+        if self.process_mode == 'residual_shift':
+            if not 0.0 < self.residual_shift_eta_max < 1.0:
+                raise ValueError('residual_shift_eta_max should be in (0, 1).')
+            if self.residual_shift_schedule_power <= 0:
+                raise ValueError(
+                    'residual_shift_schedule_power should be positive.'
+                )
+            if self.residual_shift_noise_scale <= 0:
+                raise ValueError(
+                    'residual_shift_noise_scale should be positive.'
+                )
         if self.target_mode == 'wavelet_subband':
             if self.wavelet_coefficient_clip <= 0:
                 raise ValueError(
@@ -463,6 +490,24 @@ class GuidedResidualDiffusion(nn.Module):
         posterior_var = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
         self.register_buffer('posterior_variance', posterior_var.clamp(min=1e-20))
 
+        shift_progress = torch.linspace(
+            0.0,
+            1.0,
+            num_steps,
+            dtype=torch.float32,
+        )
+        shift_etas = self.residual_shift_eta_max * shift_progress.pow(
+            self.residual_shift_schedule_power
+        )
+        self.register_buffer(
+            'residual_shift_etas',
+            shift_etas,
+            persistent=False,
+        )
+
+    def is_residual_shift(self):
+        return self.process_mode == 'residual_shift'
+
     def q_sample(self, residual, t, noise=None):
         if noise is None:
             noise = torch.randn_like(residual)
@@ -477,6 +522,16 @@ class GuidedResidualDiffusion(nn.Module):
             _extract(self.sqrt_one_minus_alphas_cumprod, t, noisy_residual.shape) * pred_noise
         ) / (_extract(self.sqrt_alphas_cumprod, t, noisy_residual.shape) + 1e-6)
         return torch.nan_to_num(pred_residual, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def residual_shift_q_sample(self, target_signal, t, noise=None):
+        """Shift a GT correction toward the zero-correction STDF anchor."""
+        if noise is None:
+            noise = torch.randn_like(target_signal)
+        eta = _extract(self.residual_shift_etas, t, target_signal.shape)
+        return (
+            (1.0 - eta) * target_signal +
+            self.residual_shift_noise_scale * torch.sqrt(eta) * noise
+        )
 
     def is_carrier_guided(self):
         return self.target_mode in ('carrier_gain', 'carrier_amp')
@@ -495,11 +550,22 @@ class GuidedResidualDiffusion(nn.Module):
         return tuple(base.shape)
 
     def make_initial_noise(self, base):
-        return torch.randn(
+        noise = torch.randn(
             self.signal_shape(base),
             device=base.device,
             dtype=base.dtype,
         )
+        if self.is_residual_shift():
+            eta_terminal = self.residual_shift_etas[-1].to(
+                device=base.device,
+                dtype=base.dtype,
+            )
+            return (
+                self.residual_shift_noise_scale *
+                torch.sqrt(eta_terminal) *
+                noise
+            )
+        return noise
 
     def prepare_denoiser_conditions(self, lq, base, guidance):
         if not self.is_wavelet_subband():
@@ -816,11 +882,18 @@ class GuidedResidualDiffusion(nn.Module):
         target_signal = self.make_target_signal(lq, base, gt)
         t = torch.randint(0, self.num_steps, (gt.size(0),), device=gt.device).long()
         noise = torch.randn_like(target_signal)
-        noisy_residual = self.q_sample(target_signal, t, noise=noise)
+        if self.is_residual_shift():
+            noisy_residual = self.residual_shift_q_sample(
+                target_signal,
+                t,
+                noise=noise,
+            )
+        else:
+            noisy_residual = self.q_sample(target_signal, t, noise=noise)
         condition_lq, condition_base, condition_guidance = (
             self.prepare_denoiser_conditions(lq, base, guidance)
         )
-        pred_noise = self.denoiser(
+        model_output = self.denoiser(
             noisy_residual,
             condition_lq,
             condition_base,
@@ -828,17 +901,27 @@ class GuidedResidualDiffusion(nn.Module):
             t,
             rate_cond=rate_cond,
         )
+        diffusion_target = target_signal if self.is_residual_shift() else noise
         if self.loss_type == 'l2':
-            loss_map = (pred_noise - noise).pow(2)
+            loss_map = (model_output - diffusion_target).pow(2)
         else:
-            loss_map = (pred_noise - noise).abs()
+            loss_map = (model_output - diffusion_target).abs()
 
         guidance_weight = condition_guidance.detach().clamp(0, 1)
         weight = self.loss_bg_weight + (1.0 - self.loss_bg_weight) * guidance_weight
         weight = weight.expand_as(loss_map)
         diff_loss = (loss_map * weight).sum() / (weight.sum() + 1e-6)
 
-        pred_signal = self.predict_residual_from_noise(noisy_residual, t, pred_noise)
+        if self.is_residual_shift():
+            # Direct x0 prediction prevents the high-noise endpoint from
+            # amplifying small model errors and makes zero output equal STDF.
+            pred_signal = model_output
+        else:
+            pred_signal = self.predict_residual_from_noise(
+                noisy_residual,
+                t,
+                model_output,
+            )
         if self.is_wavelet_subband():
             pred_signal = pred_signal.clamp(-1.0, 1.0)
             target_signal = target_signal.clamp(-1.0, 1.0)
@@ -1052,6 +1135,14 @@ class GuidedResidualDiffusion(nn.Module):
                     base.new_zeros(()) for _ in range(3)
                 ]
                 wavelet_ll_leakage = base.new_zeros(())
+            if self.is_residual_shift():
+                shift_eta_mean = _extract(
+                    self.residual_shift_etas,
+                    t,
+                    target_signal.shape,
+                ).mean()
+            else:
+                shift_eta_mean = base.new_zeros(())
 
         total_loss = (
             diff_loss +
@@ -1105,6 +1196,7 @@ class GuidedResidualDiffusion(nn.Module):
             'wavelet_hl_corr': wavelet_correlations[1],
             'wavelet_hh_corr': wavelet_correlations[2],
             'wavelet_ll_leakage': wavelet_ll_leakage,
+            'shift_eta_mean': shift_eta_mean,
             'pred_hybrid': pred_hybrid,
             'write_mask': effective_mask,
             'raw_write_mask': write_mask,
@@ -1175,6 +1267,59 @@ class GuidedResidualDiffusion(nn.Module):
         condition_lq, condition_base, condition_guidance = (
             self.prepare_denoiser_conditions(lq, base, guidance)
         )
+        if self.is_residual_shift():
+            if sampler != 'ddim' or float(ddim_eta) != 0.0:
+                raise ValueError(
+                    'residual_shift currently supports deterministic DDIM '
+                    'sampling with ddim_eta=0 only.'
+                )
+            for step_idx, t_scalar in enumerate(step_ids):
+                t = torch.full(
+                    (base.size(0),),
+                    int(t_scalar.item()),
+                    device=base.device,
+                    dtype=torch.long,
+                )
+                pred_signal = self.denoiser(
+                    residual,
+                    condition_lq,
+                    condition_base,
+                    condition_guidance,
+                    t,
+                    rate_cond=rate_cond,
+                ).clamp(-1.0, 1.0)
+                eta_t = _extract(
+                    self.residual_shift_etas,
+                    t,
+                    residual.shape,
+                )
+                if step_idx + 1 < len(step_ids):
+                    prev_scalar = int(step_ids[step_idx + 1].item())
+                    prev_t = torch.full_like(t, prev_scalar)
+                    eta_prev = _extract(
+                        self.residual_shift_etas,
+                        prev_t,
+                        residual.shape,
+                    )
+                else:
+                    eta_prev = torch.zeros_like(eta_t)
+                noise_denom = (
+                    self.residual_shift_noise_scale *
+                    torch.sqrt(eta_t)
+                )
+                pred_noise = torch.where(
+                    noise_denom > 1e-8,
+                    (residual - (1.0 - eta_t) * pred_signal) /
+                    noise_denom.clamp_min(1e-8),
+                    torch.zeros_like(residual),
+                )
+                residual = (
+                    (1.0 - eta_prev) * pred_signal +
+                    self.residual_shift_noise_scale *
+                    torch.sqrt(eta_prev) * pred_noise
+                )
+            return residual.clamp(-1.0, 1.0)
+
         for step_idx, t_scalar in enumerate(step_ids):
             t = torch.full((base.size(0),), int(t_scalar.item()), device=base.device, dtype=torch.long)
             pred_noise = self.denoiser(
@@ -1309,6 +1454,7 @@ class GuidedResidualDiffusion(nn.Module):
 def build_grdr(opts=None):
     opts = opts or {}
     target_mode = opts.get('target_mode', 'pixel_residual')
+    process_mode = opts.get('process_mode', 'gaussian')
     configured_in_nc = int(opts.get('in_nc', 1))
     wavelet_include_lowpass = bool(opts.get(
         'wavelet_condition_include_lowpass',
@@ -1332,6 +1478,12 @@ def build_grdr(opts=None):
             opts.get('target_highfreq_kernel', 5),
         ),
     )
+    if process_mode == 'residual_shift':
+        # A fresh model starts from the identity restoration: zero wavelet
+        # correction means the STDF base is returned unchanged.
+        nn.init.zeros_(denoiser.out_conv[-1].weight)
+        if denoiser.out_conv[-1].bias is not None:
+            nn.init.zeros_(denoiser.out_conv[-1].bias)
     return GuidedResidualDiffusion(
         denoiser=denoiser,
         num_steps=opts.get('num_steps', 1000),
@@ -1366,6 +1518,19 @@ def build_grdr(opts=None):
             0.10,
         ),
         wavelet_condition_include_lowpass=wavelet_include_lowpass,
+        process_mode=process_mode,
+        residual_shift_eta_max=opts.get(
+            'residual_shift_eta_max',
+            0.999,
+        ),
+        residual_shift_schedule_power=opts.get(
+            'residual_shift_schedule_power',
+            0.5,
+        ),
+        residual_shift_noise_scale=opts.get(
+            'residual_shift_noise_scale',
+            0.10,
+        ),
         carrier_source=opts.get('carrier_source', 'base'),
         carrier_gain_clip=opts.get('carrier_gain_clip', 0.5),
         carrier_norm_clip=opts.get('carrier_norm_clip', 3.0),

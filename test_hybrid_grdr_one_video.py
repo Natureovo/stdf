@@ -299,6 +299,14 @@ def build_opts(args):
             'num_steps': args.num_steps,
             'sample_steps': args.sample_steps,
             'loss_type': 'l1',
+            'process_mode': args.diffusion_process_mode,
+            'residual_shift_eta_max': args.diffusion_residual_shift_eta_max,
+            'residual_shift_schedule_power': (
+                args.diffusion_residual_shift_schedule_power
+            ),
+            'residual_shift_noise_scale': (
+                args.diffusion_residual_shift_noise_scale
+            ),
             'target_mode': args.diffusion_target_mode,
             'target_highfreq_kernel': args.diffusion_target_highfreq_kernel,
             'wavelet_coefficient_clip': args.diffusion_wavelet_coefficient_clip,
@@ -401,8 +409,11 @@ def parse_args():
     parser.add_argument(
         '--diffusion_noise_mode',
         default='independent',
-        choices=['independent', 'shared'],
-        help='Reuse one initial DDIM noise tensor across frames in shared mode.',
+        choices=['zero', 'independent', 'shared'],
+        help=(
+            'zero uses the deterministic STDF anchor; shared reuses one '
+            'initial DDIM state across frames.'
+        ),
     )
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--guidance_threshold', type=float, default=0.6)
@@ -472,6 +483,14 @@ def parse_args():
         help='full keeps the old concat input plus zero-conv control; noise conditions only through zero-conv.',
     )
     parser.add_argument('--diffusion_control_hf_kernel', type=int, default=5)
+    parser.add_argument(
+        '--diffusion_process_mode',
+        default='gaussian',
+        choices=['gaussian', 'residual_shift'],
+    )
+    parser.add_argument('--diffusion_residual_shift_eta_max', type=float, default=0.999)
+    parser.add_argument('--diffusion_residual_shift_schedule_power', type=float, default=0.5)
+    parser.add_argument('--diffusion_residual_shift_noise_scale', type=float, default=0.10)
     parser.add_argument(
         '--diffusion_target_mode',
         default='pixel_residual',
@@ -688,6 +707,23 @@ def main():
         )
     if args.grdr_ckpt is not None:
         _, grdr_checkpoint = load_state_dict(args.grdr_ckpt)
+        saved_process = grdr_checkpoint.get(
+            'diffusion_process_mode',
+            'gaussian',
+        )
+        if saved_process != model.diffusion.process_mode:
+            raise ValueError(
+                'Checkpoint/CLI diffusion process mismatch: '
+                f'{saved_process} vs {model.diffusion.process_mode}.'
+            )
+        saved_target = grdr_checkpoint.get('diffusion_target_mode')
+        if (
+                saved_target is not None and
+                saved_target != model.diffusion.target_mode):
+            raise ValueError(
+                'Checkpoint/CLI diffusion target mismatch: '
+                f'{saved_target} vs {model.diffusion.target_mode}.'
+            )
         if 'diffusion_state_dict' in grdr_checkpoint:
             model.diffusion.load_state_dict(grdr_checkpoint['diffusion_state_dict'], strict=True)
         else:
@@ -945,7 +981,11 @@ def main():
                 refined = (base + write_mask * args.detail_correction_scale * detail_correction).clamp(0, 1)
             else:
                 initial_noise = None
-                if args.diffusion_noise_mode == 'shared':
+                if args.diffusion_noise_mode == 'zero':
+                    initial_noise = base.new_zeros(
+                        model.diffusion.signal_shape(base)
+                    )
+                elif args.diffusion_noise_mode == 'shared':
                     if (
                             shared_diffusion_noise is None or
                             tuple(shared_diffusion_noise.shape) !=
