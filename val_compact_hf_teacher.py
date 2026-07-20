@@ -55,6 +55,11 @@ def parse_args():
         type=float,
         default=0.02,
     )
+    parser.add_argument(
+        '--required_detail_delta',
+        type=float,
+        default=0.01,
+    )
     parser.add_argument('--required_win_rate', type=float, default=0.80)
     return parser.parse_args()
 
@@ -185,15 +190,33 @@ def main():
                 return_aux=True,
             )
             zero_latent = base
-            mismatched_local, mismatched_global = mismatch_compact_tokens(
-                aux['local_tokens'],
-                aux['global_token'],
+            mismatched_detail, mismatched_local, mismatched_global = (
+                mismatch_compact_tokens(
+                    aux['detail_tokens'],
+                    aux['local_tokens'],
+                    aux['global_token'],
+                )
             )
             mismatched_latent, _ = teacher.decode(
                 base,
                 aligned_features,
+                mismatched_detail,
                 mismatched_local,
                 mismatched_global,
+            )
+            coarse_only, _ = teacher.decode(
+                base,
+                aligned_features,
+                torch.zeros_like(aux['detail_tokens']),
+                aux['local_tokens'],
+                aux['global_token'],
+            )
+            detail_only, _ = teacher.decode(
+                base,
+                aligned_features,
+                aux['detail_tokens'],
+                torch.zeros_like(aux['local_tokens']),
+                torch.zeros_like(aux['global_token']),
             )
             base_values = frame_values(gt, base, highfreq_kernel)
             zero_values = frame_values(gt, zero_latent, highfreq_kernel)
@@ -202,10 +225,14 @@ def main():
                 mismatched_latent,
                 highfreq_kernel,
             )
+            coarse_values = frame_values(gt, coarse_only, highfreq_kernel)
+            detail_values = frame_values(gt, detail_only, highfreq_kernel)
             teacher_values = frame_values(gt, refined, highfreq_kernel)
             add_values(totals, 'base', base_values)
             add_values(totals, 'zero', zero_values)
             add_values(totals, 'mismatch', mismatch_values)
+            add_values(totals, 'coarse', coarse_values)
+            add_values(totals, 'detail', detail_values)
             add_values(totals, 'teacher', teacher_values)
             totals['win_vs_base'] += int(
                 teacher_values['psnr'] > base_values['psnr']
@@ -215,6 +242,15 @@ def main():
             )
             totals['win_vs_mismatch'] += int(
                 teacher_values['psnr'] > mismatch_values['psnr']
+            )
+            totals['win_vs_coarse'] += int(
+                teacher_values['psnr'] > coarse_values['psnr']
+            )
+            totals['detail_token_abs'] += float(
+                aux['detail_tokens'].abs().mean().cpu()
+            )
+            totals['detail_token_std'] += float(
+                aux['detail_tokens'].std(unbiased=False).cpu()
             )
             totals['local_token_abs'] += float(
                 aux['local_tokens'].abs().mean().cpu()
@@ -265,6 +301,8 @@ def main():
     base = averaged(totals, 'base', sample_count)
     zero = averaged(totals, 'zero', sample_count)
     mismatch = averaged(totals, 'mismatch', sample_count)
+    coarse = averaged(totals, 'coarse', sample_count)
+    detail = averaged(totals, 'detail', sample_count)
     teacher_values = averaged(totals, 'teacher', sample_count)
     delta_vs_base = {
         key: teacher_values[key] - base[key] for key in base
@@ -275,13 +313,18 @@ def main():
     delta_vs_mismatch = {
         key: teacher_values[key] - mismatch[key] for key in mismatch
     }
+    delta_vs_coarse = {
+        key: teacher_values[key] - coarse[key] for key in coarse
+    }
     win_vs_base = totals['win_vs_base'] / sample_count
     win_vs_zero = totals['win_vs_zero'] / sample_count
     win_vs_mismatch = totals['win_vs_mismatch'] / sample_count
+    win_vs_coarse = totals['win_vs_coarse'] / sample_count
     passes_gate = (
         delta_vs_base['psnr'] >= args.required_psnr_delta and
         delta_vs_zero['psnr'] >= args.required_latent_delta and
         delta_vs_mismatch['psnr'] >= args.required_mismatch_delta and
+        delta_vs_coarse['psnr'] >= args.required_detail_delta and
         win_vs_base >= args.required_win_rate and
         delta_vs_base['highfreq_mae'] <= 0.0 and
         delta_vs_base['gradient_mae'] <= 0.0
@@ -297,13 +340,19 @@ def main():
         'base': base,
         'zero_latent': zero,
         'mismatched_latent': mismatch,
+        'coarse_only': coarse,
+        'detail_only': detail,
         'teacher': teacher_values,
         'delta_teacher_vs_base': delta_vs_base,
         'delta_teacher_vs_zero_latent': delta_vs_zero,
         'delta_teacher_vs_mismatched_latent': delta_vs_mismatch,
+        'delta_teacher_vs_coarse_only': delta_vs_coarse,
         'win_rate_vs_base': win_vs_base,
         'win_rate_vs_zero_latent': win_vs_zero,
         'win_rate_vs_mismatched_latent': win_vs_mismatch,
+        'win_rate_vs_coarse_only': win_vs_coarse,
+        'detail_token_abs': totals['detail_token_abs'] / sample_count,
+        'detail_token_std': totals['detail_token_std'] / sample_count,
         'local_token_abs': totals['local_token_abs'] / sample_count,
         'local_token_std': totals['local_token_std'] / sample_count,
         'global_token_abs': totals['global_token_abs'] / sample_count,
@@ -329,6 +378,9 @@ def main():
             'required_psnr_delta_vs_mismatched_latent': (
                 args.required_mismatch_delta
             ),
+            'required_psnr_delta_vs_coarse_only': (
+                args.required_detail_delta
+            ),
             'required_win_rate_vs_base': args.required_win_rate,
             'requires_non_worse_highfreq_and_gradient_mae': True,
         },
@@ -340,15 +392,17 @@ def main():
         f"{args.sample_mode}, samples: {sample_count}/{source_count}"
     )
     print(
-        'PSNR base/zero-latent/mismatched-latent/teacher: '
+        'PSNR base/zero/mismatch/coarse-only/detail-only/teacher: '
         f"{base['psnr']:.6f}/{zero['psnr']:.6f}/"
         f"{mismatch['psnr']:.6f}/"
+        f"{coarse['psnr']:.6f}/{detail['psnr']:.6f}/"
         f"{teacher_values['psnr']:.6f}"
     )
     print(
-        'teacher PSNR delta vs base/zero-latent/mismatched-latent: '
+        'teacher PSNR delta vs base/zero/mismatch/coarse-only: '
         f"{delta_vs_base['psnr']:+.6f}/{delta_vs_zero['psnr']:+.6f}/"
-        f"{delta_vs_mismatch['psnr']:+.6f}"
+        f"{delta_vs_mismatch['psnr']:+.6f}/"
+        f"{delta_vs_coarse['psnr']:+.6f}"
     )
     print(
         'teacher SSIM/gradient/HF delta vs base: '
@@ -357,11 +411,14 @@ def main():
         f"{delta_vs_base['highfreq_mae']:+.8f}"
     )
     print(
-        'frame win-rate vs base/zero-latent/mismatched-latent: '
-        f'{win_vs_base:.4f}/{win_vs_zero:.4f}/{win_vs_mismatch:.4f}'
+        'frame win-rate vs base/zero/mismatch/coarse-only: '
+        f'{win_vs_base:.4f}/{win_vs_zero:.4f}/'
+        f'{win_vs_mismatch:.4f}/{win_vs_coarse:.4f}'
     )
     print(
-        'local token abs/std, global abs, correction abs, latent/pixel: '
+        'detail/local token abs/std, global abs, correction abs, latent/pixel: '
+        f"{report['detail_token_abs']:.6f}/"
+        f"{report['detail_token_std']:.6f}/"
         f"{report['local_token_abs']:.6f}/"
         f"{report['local_token_std']:.6f}/"
         f"{report['global_token_abs']:.6f}/"
@@ -380,6 +437,7 @@ def main():
         f"(requires teacher-base >= {args.required_psnr_delta:+.3f} dB, "
         f"teacher-zero >= {args.required_latent_delta:+.3f} dB, "
         f"teacher-mismatch >= {args.required_mismatch_delta:+.3f} dB, "
+        f"teacher-coarse >= {args.required_detail_delta:+.3f} dB, "
         f"win >= {args.required_win_rate:.2f}, HF/gradient non-worse)"
     )
 

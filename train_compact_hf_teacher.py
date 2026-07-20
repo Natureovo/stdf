@@ -31,6 +31,8 @@ def parse_args():
     parser.add_argument('--interval_print', type=int, default=None)
     parser.add_argument('--interval_save', type=int, default=None)
     parser.add_argument('--overfit_batches', type=int, default=0)
+    parser.add_argument('--init_teacher_ckpt', default=None)
+    parser.add_argument('--detail_warmup_iter', type=int, default=None)
     parser.add_argument('--exp_name', default=None)
     parser.add_argument('--local_rank', type=int, default=0)
     return parser.parse_args()
@@ -49,6 +51,10 @@ def load_opts(args):
         opts['train']['interval_print'] = args.interval_print
     if args.interval_save is not None:
         opts['train']['interval_val'] = args.interval_save
+    if args.detail_warmup_iter is not None:
+        opts['network']['compact_hf_teacher']['detail_warmup_iter'] = (
+            args.detail_warmup_iter
+        )
     base_name = args.exp_name or 'compact_hf_teacher_qp37'
     opts['train']['exp_name'] = '{}_compact_hf_teacher_{}'.format(
         base_name,
@@ -75,6 +81,47 @@ def count_trainable_params(module):
     )
 
 
+def load_teacher_init(teacher, path):
+    checkpoint = torch.load(path, map_location='cpu')
+    state = checkpoint.get(
+        'compact_hf_teacher_state_dict',
+        checkpoint.get('state_dict', checkpoint),
+    )
+    state = {
+        key[7:] if key.startswith('module.') else key: value
+        for key, value in state.items()
+    }
+    result = teacher.load_state_dict(state, strict=False)
+    allowed_missing = (
+        'encoder.detail_head.',
+        'decoder.detail_injection.',
+    )
+    unexpected_missing = [
+        key for key in result.missing_keys
+        if not key.startswith(allowed_missing)
+    ]
+    if unexpected_missing or result.unexpected_keys:
+        raise ValueError(
+            'Incompatible teacher init checkpoint. Missing: {}, '
+            'unexpected: {}.'.format(
+                unexpected_missing,
+                result.unexpected_keys,
+            )
+        )
+    return result.missing_keys
+
+
+def set_detail_only_training(teacher, enabled):
+    for parameter in teacher.parameters():
+        parameter.requires_grad = not enabled
+    if enabled:
+        for module in (
+                teacher.encoder.detail_head,
+                teacher.decoder.detail_injection):
+            for parameter in module.parameters():
+                parameter.requires_grad = True
+
+
 def main():
     args = parse_args()
     if args.overfit_batches < 0:
@@ -96,6 +143,7 @@ def main():
         f"{'<' * 10} Compact HF Teacher Training {'>' * 10}\n"
         f"Timestamp: [{utils.get_timestr()}]\n"
         f"STDF checkpoint: [{args.stdf_ckpt}]\n"
+        f"Teacher init checkpoint: [{args.init_teacher_ckpt}]\n"
         f"GT use: [teacher encoder only]\n"
         f"Overfit batches: [{args.overfit_batches}]\n\n"
         f"{'<' * 10} Options {'>' * 10}\n{utils.dict2str(opts)}"
@@ -139,6 +187,22 @@ def main():
         teacher_opts,
         aligned_feature_channels=opts['network']['stdf']['out_nc'],
     )
+    if args.init_teacher_ckpt is not None:
+        missing_keys = load_teacher_init(teacher, args.init_teacher_ckpt)
+        init_message = (
+            f'Initialized compatible teacher weights from '
+            f'{args.init_teacher_ckpt}; new parameters: {missing_keys}'
+        )
+        print(init_message)
+        log_fp.write(init_message + '\n')
+        log_fp.flush()
+    detail_warmup_iter = (
+        int(teacher_opts.get('detail_warmup_iter', 1000))
+        if args.init_teacher_ckpt is not None else 0
+    )
+    if detail_warmup_iter < 0:
+        raise ValueError('detail_warmup_iter should be non-negative.')
+    set_detail_only_training(teacher, detail_warmup_iter > 0)
     enhancer = enhancer.to(device).eval()
     teacher = teacher.to(device).train()
 
@@ -152,6 +216,7 @@ def main():
         f"total iters: [{num_iter}]\n"
         f"total epochs: [{num_epoch}]\n"
         f"iter per epoch: [{iter_per_epoch}]\n"
+        f"detail-only warmup iters: [{detail_warmup_iter}]\n"
         f"trainable params: [{count_trainable_params(teacher)}]\n"
         f"\n{'<' * 10} Training {'>' * 10}"
     )
@@ -173,6 +238,17 @@ def main():
     loader_iterator = iter(train_loader)
     current_epoch = 0
     for iteration in range(1, num_iter + 1):
+        if (
+                detail_warmup_iter > 0 and
+                iteration == detail_warmup_iter + 1):
+            set_detail_only_training(teacher, False)
+            warmup_message = (
+                f'> Detail-only warmup finished at iter '
+                f'{detail_warmup_iter}; all teacher parameters are trainable.'
+            )
+            print(warmup_message)
+            log_fp.write(warmup_message + '\n')
+            log_fp.flush()
         if fixed_batches:
             train_data = fixed_batches[(iteration - 1) % len(fixed_batches)]
         else:
@@ -202,15 +278,26 @@ def main():
         )
         with torch.no_grad():
             zero_latent_refined = base.detach()
-            mismatched_local, mismatched_global = mismatch_compact_tokens(
-                aux['local_tokens'],
-                aux['global_token'],
+            mismatched_detail, mismatched_local, mismatched_global = (
+                mismatch_compact_tokens(
+                    aux['detail_tokens'],
+                    aux['local_tokens'],
+                    aux['global_token'],
+                )
             )
             mismatched_latent_refined, _ = teacher.decode(
                 base.detach(),
                 aligned_features.detach(),
+                mismatched_detail,
                 mismatched_local,
                 mismatched_global,
+            )
+            coarse_only_refined, _ = teacher.decode(
+                base.detach(),
+                aligned_features.detach(),
+                torch.zeros_like(aux['detail_tokens']),
+                aux['local_tokens'],
+                aux['global_token'],
             )
         outputs = compact_hf_teacher_losses(
             refined,
@@ -219,6 +306,7 @@ def main():
             gt,
             zero_latent_refined=zero_latent_refined,
             mismatched_latent_refined=mismatched_latent_refined,
+            coarse_only_refined=coarse_only_refined,
             charbonnier_weight=teacher_opts.get(
                 'charbonnier_weight', 1.0
             ),
@@ -240,6 +328,12 @@ def main():
             ),
             mismatch_advantage_ratio=teacher_opts.get(
                 'mismatch_advantage_ratio', 0.98
+            ),
+            detail_advantage_weight=teacher_opts.get(
+                'detail_advantage_weight', 0.25
+            ),
+            detail_advantage_ratio=teacher_opts.get(
+                'detail_advantage_ratio', 0.99
             ),
             highfreq_kernel=teacher_opts.get('highfreq_kernel', 5),
             eps=teacher_opts.get('loss_eps', 1e-3),
@@ -264,20 +358,28 @@ def main():
                 f"mismatch advantage/relative mse: "
                 f"[{scalar(outputs['mismatch_advantage_loss']):.6f}/"
                 f"{scalar(outputs['mismatch_relative_mse']):.4f}], "
-                f"PSNR base/zero/mismatch/teacher, delta base/zero/mismatch: "
+                f"detail advantage/relative mse: "
+                f"[{scalar(outputs['detail_advantage_loss']):.6f}/"
+                f"{scalar(outputs['detail_relative_mse']):.4f}], "
+                f"PSNR base/zero/mismatch/coarse/teacher, "
+                f"delta base/zero/mismatch/coarse: "
                 f"[{scalar(outputs['base_psnr']):.4f}/"
                 f"{scalar(outputs['zero_latent_psnr']):.4f}/"
                 f"{scalar(outputs['mismatched_latent_psnr']):.4f}/"
+                f"{scalar(outputs['coarse_only_psnr']):.4f}/"
                 f"{scalar(outputs['refined_psnr']):.4f}/"
                 f"{scalar(outputs['psnr_delta']):+.4f}/"
                 f"{scalar(outputs['psnr_delta_vs_zero_latent']):+.4f}/"
-                f"{scalar(outputs['psnr_delta_vs_mismatched_latent']):+.4f}], "
+                f"{scalar(outputs['psnr_delta_vs_mismatched_latent']):+.4f}/"
+                f"{scalar(outputs['psnr_delta_vs_coarse_only']):+.4f}], "
                 f"win: [{scalar(outputs['frame_win_rate']):.4f}], "
                 f"HF base/teacher: "
                 f"[{scalar(outputs['base_highfreq_mae']):.8f}/"
                 f"{scalar(outputs['refined_highfreq_mae']):.8f}], "
-                f"tokens local abs/std, global abs: "
-                f"[{scalar(outputs['local_token_abs']):.5f}/"
+                f"tokens detail abs/std, local abs/std, global abs: "
+                f"[{scalar(outputs['detail_token_abs']):.5f}/"
+                f"{scalar(outputs['detail_token_std']):.5f}/"
+                f"{scalar(outputs['local_token_abs']):.5f}/"
                 f"{scalar(outputs['local_token_std']):.5f}/"
                 f"{scalar(outputs['global_token_abs']):.5f}], "
                 f"token activity: "
@@ -296,7 +398,10 @@ def main():
             torch.save({
                 'num_iter_accum': iteration,
                 'stdf_ckpt': args.stdf_ckpt,
+                'init_teacher_ckpt': args.init_teacher_ckpt,
+                'detail_warmup_iter': detail_warmup_iter,
                 'compact_hf_teacher_state_dict': teacher.state_dict(),
+                'detail_channels': teacher.detail_channels,
                 'latent_channels': teacher.latent_channels,
                 'global_channels': teacher.global_channels,
                 'optimizer': optimizer.state_dict(),

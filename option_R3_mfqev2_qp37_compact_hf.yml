@@ -54,8 +54,12 @@ network:
     enabled: true
     in_nc: 1
     nf: 32
+    # H/8 detail tokens retain local texture phase; H/16 latent tokens carry
+    # wider structural context and the pooled token carries global statistics.
+    detail_channels: 8
     latent_channels: 32
     global_channels: 64
+    detail_warmup_iter: 1000
     aligned_feature_channels: 64
     correction_clip: 0.10
     highfreq_kernel: 5
@@ -73,6 +77,9 @@ network:
     # the decoder from treating any non-zero token as a generic enhance flag.
     mismatch_advantage_weight: 0.5
     mismatch_advantage_ratio: 0.98
+    # The complete two-scale prior must outperform H/16 + global alone.
+    detail_advantage_weight: 0.25
+    detail_advantage_ratio: 0.99
     loss_eps: 0.001
 
 train:

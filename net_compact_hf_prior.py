@@ -25,14 +25,16 @@ def _psnr_per_sample(prediction, target):
     return -10.0 * torch.log10(mse.clamp_min(1e-12))
 
 
-def mismatch_compact_tokens(local_tokens, global_token):
+def mismatch_compact_tokens(detail_tokens, local_tokens, global_token):
     """Build a GT-free wrong-token control for latent specificity tests."""
     if local_tokens.shape[0] > 1:
         return (
+            torch.roll(detail_tokens, shifts=1, dims=0),
             torch.roll(local_tokens, shifts=1, dims=0),
             torch.roll(global_token, shifts=1, dims=0),
         )
     return (
+        torch.flip(detail_tokens, dims=(-2, -1)),
         torch.flip(local_tokens, dims=(-2, -1)),
         -global_token,
     )
@@ -99,8 +101,14 @@ class UpBlock(nn.Module):
 class CompactHFTeacherEncoder(nn.Module):
     """Encode GT-only Haar detail evidence into compact spatial tokens."""
 
-    def __init__(self, nf=32, latent_channels=32, global_channels=64):
+    def __init__(
+            self,
+            nf=32,
+            detail_channels=8,
+            latent_channels=32,
+            global_channels=64):
         super(CompactHFTeacherEncoder, self).__init__()
+        self.detail_channels = int(detail_channels)
         self.latent_channels = int(latent_channels)
         self.global_channels = int(global_channels)
 
@@ -121,6 +129,12 @@ class CompactHFTeacherEncoder(nn.Module):
         )
         self.to_eighth = DownBlock(nf * 2, nf * 3)
         self.to_sixteenth = DownBlock(nf * 3, nf * 4)
+        self.detail_head = nn.Sequential(
+            nn.GroupNorm(_group_count(nf * 3), nf * 3),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(nf * 3, self.detail_channels, 1),
+            nn.Tanh(),
+        )
         self.local_head = nn.Sequential(
             nn.GroupNorm(_group_count(nf * 4), nf * 4),
             nn.SiLU(inplace=True),
@@ -155,10 +169,12 @@ class CompactHFTeacherEncoder(nn.Module):
             level2_from_level1,
             level2_direct,
         ], dim=1))
-        features = self.to_sixteenth(self.to_eighth(level2))
-        local_tokens = self.local_head(features)
+        features_eighth = self.to_eighth(level2)
+        detail_tokens = self.detail_head(features_eighth)
+        features_sixteenth = self.to_sixteenth(features_eighth)
+        local_tokens = self.local_head(features_sixteenth)
         global_token = self.global_head(local_tokens)
-        return local_tokens, global_token
+        return detail_tokens, local_tokens, global_token
 
 
 class CompactHFUNetDecoder(nn.Module):
@@ -168,6 +184,7 @@ class CompactHFUNetDecoder(nn.Module):
             self,
             in_nc=1,
             nf=32,
+            detail_channels=8,
             latent_channels=32,
             global_channels=64,
             aligned_feature_channels=64,
@@ -190,6 +207,13 @@ class CompactHFUNetDecoder(nn.Module):
         self.down2 = DownBlock(nf * 2, nf * 3)
         self.down3 = DownBlock(nf * 3, nf * 4)
         self.down4 = DownBlock(nf * 4, nf * 4)
+        self.detail_injection = nn.Conv2d(
+            detail_channels,
+            nf * 4,
+            1,
+            bias=False,
+        )
+        nn.init.zeros_(self.detail_injection.weight)
         self.token_fuse = nn.Sequential(
             nn.Conv2d(nf * 4 + latent_channels, nf * 4, 3, padding=1),
             ResidualBlock(nf * 4),
@@ -214,6 +238,7 @@ class CompactHFUNetDecoder(nn.Module):
             self,
             x4,
             skips,
+            detail_tokens,
             local_tokens,
             global_token):
         x4 = self.token_fuse(torch.cat([x4, local_tokens], dim=1))
@@ -223,6 +248,14 @@ class CompactHFUNetDecoder(nn.Module):
         x4 = x4 * (1.0 + scale) + shift
 
         x0, x1, x2, x3 = skips
+        if detail_tokens.shape[-2:] != x3.shape[-2:]:
+            detail_tokens = F.interpolate(
+                detail_tokens,
+                size=x3.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+        x3 = x3 + self.detail_injection(detail_tokens)
         decoded = self.up4(x4, x3)
         decoded = self.up3(decoded, x2)
         decoded = self.up2(decoded, x1)
@@ -233,6 +266,7 @@ class CompactHFUNetDecoder(nn.Module):
             self,
             base,
             aligned_features,
+            detail_tokens,
             local_tokens,
             global_token,
             return_activity=False):
@@ -253,12 +287,14 @@ class CompactHFUNetDecoder(nn.Module):
         token_prediction = self._decode_tokens(
             x4,
             skips,
+            detail_tokens,
             local_tokens,
             global_token,
         )
         zero_prediction = self._decode_tokens(
             x4,
             skips,
+            torch.zeros_like(detail_tokens),
             torch.zeros_like(local_tokens),
             torch.zeros_like(global_token),
         )
@@ -268,12 +304,19 @@ class CompactHFUNetDecoder(nn.Module):
             torch.tanh(token_effect)
         )
         refined = (base + correction).clamp(0.0, 1.0)
-        token_activity = F.interpolate(
+        detail_activity = F.interpolate(
+            detail_tokens.detach().abs().mean(dim=1, keepdim=True),
+            size=base.shape[-2:],
+            mode='bilinear',
+            align_corners=False,
+        )
+        local_activity = F.interpolate(
             local_tokens.detach().abs().mean(dim=1, keepdim=True),
             size=base.shape[-2:],
             mode='bilinear',
             align_corners=False,
         )
+        token_activity = 0.5 * (detail_activity + local_activity)
         if return_activity:
             return refined, correction, token_activity
         return refined, correction
@@ -290,17 +333,20 @@ class CompactHFTeacher(nn.Module):
     def __init__(self, opts=None, aligned_feature_channels=64):
         super(CompactHFTeacher, self).__init__()
         opts = opts or {}
+        self.detail_channels = int(opts.get('detail_channels', 8))
         self.latent_channels = int(opts.get('latent_channels', 32))
         self.global_channels = int(opts.get('global_channels', 64))
         nf = int(opts.get('nf', 32))
         self.encoder = CompactHFTeacherEncoder(
             nf=nf,
+            detail_channels=self.detail_channels,
             latent_channels=self.latent_channels,
             global_channels=self.global_channels,
         )
         self.decoder = CompactHFUNetDecoder(
             in_nc=int(opts.get('in_nc', 1)),
             nf=nf,
+            detail_channels=self.detail_channels,
             latent_channels=self.latent_channels,
             global_channels=self.global_channels,
             aligned_feature_channels=aligned_feature_channels,
@@ -310,10 +356,17 @@ class CompactHFTeacher(nn.Module):
     def encode(self, gt, base):
         return self.encoder(gt, base)
 
-    def decode(self, base, aligned_features, local_tokens, global_token):
+    def decode(
+            self,
+            base,
+            aligned_features,
+            detail_tokens,
+            local_tokens,
+            global_token):
         return self.decoder(
             base,
             aligned_features,
+            detail_tokens,
             local_tokens,
             global_token,
         )
@@ -325,13 +378,15 @@ class CompactHFTeacher(nn.Module):
             aligned_features,
             zero_latent=False,
             return_aux=False):
-        local_tokens, global_token = self.encode(gt, base)
+        detail_tokens, local_tokens, global_token = self.encode(gt, base)
         if zero_latent:
+            detail_tokens = torch.zeros_like(detail_tokens)
             local_tokens = torch.zeros_like(local_tokens)
             global_token = torch.zeros_like(global_token)
         refined, correction, token_activity = self.decoder(
             base,
             aligned_features,
+            detail_tokens,
             local_tokens,
             global_token,
             return_activity=True,
@@ -340,11 +395,14 @@ class CompactHFTeacher(nn.Module):
             return refined
         pixel_count = float(gt.shape[-2] * gt.shape[-1])
         latent_count = float(
+            detail_tokens.shape[1] * detail_tokens.shape[-2] *
+            detail_tokens.shape[-1] +
             local_tokens.shape[1] * local_tokens.shape[-2] *
             local_tokens.shape[-1] + global_token.shape[1]
         )
         return refined, {
             'correction': correction,
+            'detail_tokens': detail_tokens,
             'local_tokens': local_tokens,
             'global_token': global_token,
             'token_activity': token_activity,
@@ -359,6 +417,7 @@ def compact_hf_teacher_losses(
         gt,
         zero_latent_refined=None,
         mismatched_latent_refined=None,
+        coarse_only_refined=None,
         charbonnier_weight=1.0,
         mse_weight=0.5,
         wavelet_weight=0.2,
@@ -369,6 +428,8 @@ def compact_hf_teacher_losses(
         latent_advantage_ratio=0.95,
         mismatch_advantage_weight=0.5,
         mismatch_advantage_ratio=0.98,
+        detail_advantage_weight=0.25,
+        detail_advantage_ratio=0.99,
         highfreq_kernel=5,
         eps=1e-3):
     charbonnier_loss = _charbonnier(refined - gt, eps=eps).mean()
@@ -395,6 +456,8 @@ def compact_hf_teacher_losses(
         zero_latent_refined = base
     if mismatched_latent_refined is None:
         mismatched_latent_refined = zero_latent_refined
+    if coarse_only_refined is None:
+        coarse_only_refined = zero_latent_refined
     refined_mse_per_sample = (
         refined - gt
     ).square().flatten(1).mean(dim=1)
@@ -416,6 +479,15 @@ def compact_hf_teacher_losses(
     mismatch_advantage_loss = F.relu(
         mismatch_relative_mse - float(mismatch_advantage_ratio)
     ).mean()
+    coarse_mse_per_sample = (
+        coarse_only_refined.detach() - gt
+    ).square().flatten(1).mean(dim=1)
+    detail_relative_mse = refined_mse_per_sample / (
+        coarse_mse_per_sample + 1e-8
+    )
+    detail_advantage_loss = F.relu(
+        detail_relative_mse - float(detail_advantage_ratio)
+    ).mean()
     total = (
         float(charbonnier_weight) * charbonnier_loss +
         float(mse_weight) * mse_loss +
@@ -424,7 +496,8 @@ def compact_hf_teacher_losses(
         float(gradient_weight) * gradient_loss +
         float(correction_weight) * correction_loss +
         float(latent_advantage_weight) * latent_advantage_loss +
-        float(mismatch_advantage_weight) * mismatch_advantage_loss
+        float(mismatch_advantage_weight) * mismatch_advantage_loss +
+        float(detail_advantage_weight) * detail_advantage_loss
     )
 
     with torch.no_grad():
@@ -434,6 +507,7 @@ def compact_hf_teacher_losses(
             mismatched_latent_refined,
             gt,
         )
+        coarse_only_psnr = _psnr_per_sample(coarse_only_refined, gt)
         refined_psnr = _psnr_per_sample(refined, gt)
         base_gradient_mae = (
             sobel_magnitude(base) - sobel_magnitude(gt)
@@ -453,9 +527,12 @@ def compact_hf_teacher_losses(
         'latent_relative_mse': latent_relative_mse.mean(),
         'mismatch_advantage_loss': mismatch_advantage_loss,
         'mismatch_relative_mse': mismatch_relative_mse.mean(),
+        'detail_advantage_loss': detail_advantage_loss,
+        'detail_relative_mse': detail_relative_mse.mean(),
         'base_psnr': base_psnr.mean(),
         'zero_latent_psnr': zero_latent_psnr.mean(),
         'mismatched_latent_psnr': mismatched_latent_psnr.mean(),
+        'coarse_only_psnr': coarse_only_psnr.mean(),
         'refined_psnr': refined_psnr.mean(),
         'psnr_delta': (refined_psnr - base_psnr).mean(),
         'psnr_delta_vs_zero_latent': (
@@ -464,11 +541,16 @@ def compact_hf_teacher_losses(
         'psnr_delta_vs_mismatched_latent': (
             refined_psnr - mismatched_latent_psnr
         ).mean(),
+        'psnr_delta_vs_coarse_only': (
+            refined_psnr - coarse_only_psnr
+        ).mean(),
         'frame_win_rate': (refined_psnr > base_psnr).float().mean(),
         'base_highfreq_mae': (base_hf - gt_hf).abs().mean(),
         'refined_highfreq_mae': (refined_hf - gt_hf).abs().mean(),
         'base_gradient_mae': base_gradient_mae,
         'refined_gradient_mae': refined_gradient_mae,
+        'detail_token_abs': aux['detail_tokens'].detach().abs().mean(),
+        'detail_token_std': aux['detail_tokens'].detach().std(unbiased=False),
         'local_token_abs': aux['local_tokens'].detach().abs().mean(),
         'local_token_std': aux['local_tokens'].detach().std(unbiased=False),
         'global_token_abs': aux['global_token'].detach().abs().mean(),
