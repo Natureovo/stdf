@@ -1,0 +1,113 @@
+dataset:
+  train:
+    type: MFQEv2Dataset
+    root: /media/cp/SWH-4T机械红/MFQEv2_dataset
+    gt_path: mfqev2_train_gt.lmdb
+    lq_path: mfqev2_train_lq.lmdb
+    meta_info_fp: meta_info.txt
+    qp: 37
+    exclude_video_ids: ['007', '010', '013', '020', '042', '047', '051', '069', '084', '106']
+    gt_size: 128
+    use_flip: true
+    use_rot: true
+    random_reverse: true
+    enlarge_ratio: 1
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 8
+
+  val:
+    type: VideoTestMFQEv2Dataset
+    root: /media/cp/SWH-4T机械红/MFQEv2_dataset
+    gt_path: train_108/raw
+    lq_path: train_108/HM16.5_LDP/QP37
+    qp: 37
+    include_video_ids: ['007', '010', '013', '020', '042', '047', '051', '069', '084', '106']
+
+  test:
+    type: VideoTestMFQEv2Dataset
+    root: /media/cp/SWH-4T机械红/MFQEv2_dataset
+    gt_path: test_18/raw
+    lq_path: test_18/HM16.5_LDP/QP37
+    qp: 37
+
+network:
+  radius: 3
+
+  stdf:
+    in_nc: 1
+    out_nc: 64
+    nf: 32
+    nb: 3
+    base_ks: 3
+    deform_ks: 3
+
+  qenet:
+    in_nc: 64
+    out_nc: 1
+    nf: 48
+    nb: 8
+    base_ks: 3
+
+  # Stage 1 follows compact-prior restoration: GT is available only to this
+  # teacher encoder. The later diffusion student will predict the same tokens.
+  compact_hf_teacher:
+    enabled: true
+    in_nc: 1
+    nf: 32
+    latent_channels: 32
+    global_channels: 64
+    aligned_feature_channels: 64
+    correction_clip: 0.10
+    highfreq_kernel: 5
+    charbonnier_weight: 1.0
+    mse_weight: 0.5
+    wavelet_weight: 0.2
+    highfreq_weight: 0.1
+    gradient_weight: 0.02
+    correction_weight: 0.0001
+    # Require GT-derived compact tokens to reduce MSE by at least 5% compared
+    # with the same decoder receiving zero tokens.
+    latent_advantage_weight: 0.5
+    latent_advantage_ratio: 0.95
+    # Correct GT tokens must also beat tokens from another sample. This keeps
+    # the decoder from treating any non-zero token as a generic enhance flag.
+    mismatch_advantage_weight: 0.5
+    mismatch_advantage_ratio: 0.98
+    loss_eps: 0.001
+
+train:
+  exp_name: MFQEv2_QP37_compact_hf_teacher
+  random_seed: 7
+  pre-val: false
+  num_iter: 10000
+  interval_print: 100
+  interval_val: 2500
+  pbar_len: 100
+
+  optim:
+    type: Adam
+    lr: 0.0001
+    betas: [0.9, 0.999]
+    eps: 0.00000001
+
+  scheduler:
+    is_on: false
+    type: CosineAnnealingRestartLR
+    periods: [10000]
+    restart_weights: [1]
+    eta_min: 0.0000001
+
+  loss:
+    type: CharbonnierLoss
+    eps: 0.000001
+
+  criterion:
+    type: PSNR
+    unit: dB
+
+test:
+  restore_iter: 0
+  pbar_len: 100
+  criterion:
+    type: PSNR
+    unit: dB
