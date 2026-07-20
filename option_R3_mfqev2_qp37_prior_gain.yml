@@ -231,6 +231,34 @@ network:
     relative_eps: !!float 1e-6
     tv_weight: 0.001
 
+  # Stage-1 learnability gate. This U-Net keeps the frozen temporal prior as
+  # its exact zero-output anchor and learns only a bounded gain residual.
+  prior_modulator:
+    enabled: true
+    in_nc: 1
+    input_frames: 7
+    nf: 24
+    rate_dim: 1
+    use_aligned_features: true
+    aligned_feature_channels: 64
+    # Crop-trained global pooling previously caused full-frame domain shift.
+    use_global_modulation: false
+    prior_condition_clip: 0.05
+    max_delta_gain: 0.5
+    carrier_source: base
+    carrier_kernel: 5
+    carrier_norm_window: 9
+    carrier_norm_clip: 3.0
+    ridge_eps: !!float 1e-3
+    relative_reconstruction_weight: 1.0
+    reconstruction_weight: 0.1
+    relative_highfreq_weight: 0.1
+    gradient_weight: 0.02
+    non_degrade_weight: 0.25
+    tv_weight: 0.001
+    magnitude_weight: 0.0001
+    relative_eps: !!float 1e-6
+
   detail_guidance:
     gradient_weight: 0.35
     highfreq_weight: 0.40

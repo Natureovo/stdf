@@ -16,6 +16,7 @@ from net_temporal_detail_prior import (
     build_temporal_detail_prior,
     temporal_detail_prior_losses,
 )
+from net_prior_modulator import build_prior_modulator
 from utils.detail_guidance import compute_detail_guidance
 
 
@@ -54,6 +55,11 @@ class HybridSTDFGRDR(nn.Module):
             input_frames=self.input_len,
             aligned_feature_channels=opts_dict['stdf']['out_nc'],
         )
+        self.prior_modulator = build_prior_modulator(
+            opts_dict.get('prior_modulator', {}),
+            input_frames=self.input_len,
+            aligned_feature_channels=opts_dict['stdf']['out_nc'],
+        )
         self.guidance_opts = opts_dict.get('detail_guidance', {})
         self.guidance_net_opts = opts_dict.get('guidance_net', {})
         self.budget_net_opts = opts_dict.get('budget_net', {})
@@ -63,6 +69,7 @@ class HybridSTDFGRDR(nn.Module):
         self.temporal_detail_prior_opts = opts_dict.get(
             'temporal_detail_prior', {}
         )
+        self.prior_modulator_opts = opts_dict.get('prior_modulator', {})
 
     def center_frame(self, x):
         frm_lst = [
@@ -133,6 +140,14 @@ class HybridSTDFGRDR(nn.Module):
 
     def unfreeze_temporal_detail_prior(self):
         for param in self.temporal_detail_prior.parameters():
+            param.requires_grad = True
+
+    def freeze_prior_modulator(self):
+        for param in self.prior_modulator.parameters():
+            param.requires_grad = False
+
+    def unfreeze_prior_modulator(self):
+        for param in self.prior_modulator.parameters():
             param.requires_grad = True
 
     def make_guidance(self, gt, base):
@@ -224,6 +239,23 @@ class HybridSTDFGRDR(nn.Module):
             temporal_lq,
             base,
             guidance=guidance,
+            rate_cond=rate_cond,
+            aligned_features=aligned_features,
+            return_aux=return_aux,
+        )
+
+    def predict_prior_modulation(
+            self,
+            temporal_lq,
+            base,
+            prior_correction,
+            rate_cond=None,
+            aligned_features=None,
+            return_aux=False):
+        return self.prior_modulator(
+            temporal_lq,
+            base,
+            prior_correction,
             rate_cond=rate_cond,
             aligned_features=aligned_features,
             return_aux=return_aux,
