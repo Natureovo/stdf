@@ -1,0 +1,145 @@
+dataset:
+  train:
+    type: MFQEv2Dataset
+    root: /media/cp/SWH-4T机械红/MFQEv2_dataset
+    gt_path: mfqev2_train_gt.lmdb
+    lq_path: mfqev2_train_lq.lmdb
+    meta_info_fp: meta_info.txt
+    qp: 37
+    exclude_video_ids: ['007', '010', '013', '020', '042', '047', '051', '069', '084', '106']
+    gt_size: 128
+    use_flip: true
+    use_rot: true
+    random_reverse: true
+    enlarge_ratio: 1
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 4
+
+  val:
+    type: VideoTestMFQEv2Dataset
+    root: /media/cp/SWH-4T机械红/MFQEv2_dataset
+    gt_path: train_108/raw
+    lq_path: train_108/HM16.5_LDP/QP37
+    qp: 37
+    include_video_ids: ['007', '010', '013', '020', '042', '047', '051', '069', '084', '106']
+
+  test:
+    type: VideoTestMFQEv2Dataset
+    root: /media/cp/SWH-4T机械红/MFQEv2_dataset
+    gt_path: test_18/raw
+    lq_path: test_18/HM16.5_LDP/QP37
+    qp: 37
+
+network:
+  radius: 3
+
+  stdf:
+    in_nc: 1
+    out_nc: 64
+    nf: 32
+    nb: 3
+    base_ks: 3
+    deform_ks: 3
+
+  qenet:
+    in_nc: 64
+    out_nc: 1
+    nf: 48
+    nb: 8
+    base_ks: 3
+
+  # Initialized from the useful GT-only multiscale teacher. During alignment
+  # it remains a training-only posterior and is never used at inference.
+  compact_hf_teacher:
+    enabled: true
+    in_nc: 1
+    nf: 32
+    detail_channels: 8
+    latent_channels: 32
+    global_channels: 64
+    aligned_feature_channels: 64
+    correction_clip: 0.10
+
+  guidance_net:
+    enabled: true
+    in_nc: 1
+    nf: 32
+    rate_dim: 1
+    feature_normalization: raw
+
+  # Inference-time conditional prior. Its forward path has no GT argument.
+  compact_hf_student:
+    enabled: true
+    in_nc: 1
+    nf: 32
+    rate_dim: 1
+    feature_normalization: raw
+    aligned_feature_channels: 64
+    detail_channels: 8
+    latent_channels: 32
+    global_channels: 64
+
+  aligned_compact_hf:
+    enabled: true
+    highfreq_kernel: 5
+    # The no-GT prior learns fastest. Small posterior/decoder learning rates
+    # allow the useful teacher latent to become predictable without collapsing.
+    prior_lr: 0.0001
+    posterior_lr: 0.00002
+    decoder_lr: 0.00001
+    prior_reconstruction_weight: 1.0
+    posterior_reconstruction_weight: 0.5
+    prior_mse_weight: 0.5
+    posterior_mse_weight: 0.25
+    detail_alignment_weight: 0.1
+    local_alignment_weight: 0.1
+    global_alignment_weight: 0.05
+    alignment_cosine_weight: 0.25
+    image_alignment_weight: 0.25
+    highfreq_weight: 0.1
+    gradient_weight: 0.02
+    # Both branches must beat the identity STDF baseline. The posterior
+    # requirement prevents trivial latent collapse during joint alignment.
+    prior_advantage_weight: 0.5
+    prior_advantage_ratio: 0.995
+    posterior_preserve_weight: 0.5
+    posterior_preserve_ratio: 0.95
+    correction_weight: 0.0001
+    loss_eps: 0.001
+
+train:
+  exp_name: MFQEv2_QP37_aligned_compact_hf
+  random_seed: 7
+  pre-val: false
+  num_iter: 5000
+  interval_print: 100
+  interval_val: 1000
+  pbar_len: 100
+
+  optim:
+    type: Adam
+    lr: 0.0001
+    betas: [0.9, 0.999]
+    eps: 0.00000001
+
+  scheduler:
+    is_on: false
+    type: CosineAnnealingRestartLR
+    periods: [5000]
+    restart_weights: [1]
+    eta_min: 0.0000001
+
+  loss:
+    type: CharbonnierLoss
+    eps: 0.000001
+
+  criterion:
+    type: PSNR
+    unit: dB
+
+test:
+  restore_iter: 0
+  pbar_len: 100
+  criterion:
+    type: PSNR
+    unit: dB
