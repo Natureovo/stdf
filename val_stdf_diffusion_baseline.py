@@ -65,6 +65,16 @@ def parse_args():
         choices=['full', 'tile'],
         default='tile',
     )
+    parser.add_argument(
+        '--region_mode',
+        choices=['none', 'oracle_residual_top'],
+        default='none',
+        help=(
+            'Optional diagnostic fusion region. oracle_residual_top keeps '
+            'only the top-ratio pixels with largest |GT - STDF|.'
+        ),
+    )
+    parser.add_argument('--region_top_ratio', type=float, default=0.1)
     parser.add_argument('--tile_size', type=int, default=256)
     parser.add_argument('--tile_overlap', type=int, default=32)
     parser.add_argument('--num_workers', type=int, default=0)
@@ -192,6 +202,31 @@ def frame_delta_summary(video_values, left, right):
         'win_rate': float((values > 0.0).mean()),
         'n': int(values.size),
     }
+
+
+def top_ratio_mask(score, ratio):
+    ratio = float(ratio)
+    if ratio <= 0.0:
+        return torch.zeros_like(score)
+    if ratio >= 1.0:
+        return torch.ones_like(score)
+    flat = score.reshape(score.size(0), -1)
+    k = max(1, int(round(flat.size(1) * ratio)))
+    values, _ = torch.topk(flat, k, dim=1, largest=True, sorted=False)
+    threshold = values.min(dim=1).values.view(-1, 1, 1, 1)
+    return (score >= threshold).to(score.dtype)
+
+
+def diagnostic_region_mask(gt, base, mode, ratio):
+    if mode == 'none':
+        return torch.ones_like(base)
+    if mode == 'oracle_residual_top':
+        return top_ratio_mask((gt - base).abs(), ratio)
+    raise ValueError(f'Unsupported region mode: {mode}')
+
+
+def fuse_region(base, candidate, mask):
+    return (base + mask * (candidate - base)).clamp(0.0, 1.0)
 
 
 def batch_names(batch, batch_size):
@@ -329,6 +364,7 @@ def main():
     temporal_totals = defaultdict(float)
     temporal_counts = defaultdict(int)
     runtimes = defaultdict(float)
+    region_area_total = 0.0
     sample_count = 0
 
     with torch.no_grad():
@@ -360,6 +396,13 @@ def main():
             method_counts['base'] += 1
             video_psnr[names[0]]['base'].append(base_values['psnr'])
             qp_psnr[str(qps[0])]['base'].append(base_values['psnr'])
+            region_mask = diagnostic_region_mask(
+                gt,
+                base,
+                args.region_mode,
+                args.region_top_ratio,
+            )
+            region_area_total += float(region_mask.mean().item())
 
             outputs = {'base': base}
             if deterministic is not None:
@@ -374,6 +417,7 @@ def main():
                     tile_size=tile_size,
                     tile_overlap=args.tile_overlap,
                 )
+                det_image = fuse_region(base, det_image, region_mask)
                 if device.type == 'cuda':
                     torch.cuda.synchronize()
                 runtimes['deterministic'] += time.perf_counter() - start
@@ -410,6 +454,7 @@ def main():
                         tile_size=tile_size,
                         tile_overlap=args.tile_overlap,
                     )
+                    diff_image = fuse_region(base, diff_image, region_mask)
                     if device.type == 'cuda':
                         torch.cuda.synchronize()
                     runtimes['resshift'] += time.perf_counter() - start
@@ -481,6 +526,11 @@ def main():
             'sample_steps': sample_steps,
             'noise_mode': args.noise_mode,
             'seeds': seeds,
+        },
+        'region': {
+            'mode': args.region_mode,
+            'top_ratio': float(args.region_top_ratio),
+            'mean_area': region_area_total / max(sample_count, 1),
         },
         'checkpoints': {
             'stdf': args.stdf_ckpt,
@@ -625,6 +675,12 @@ def main():
         f"inference: {args.inference_mode}, steps/noise/seeds: "
         f"{sample_steps}/{args.noise_mode}/{seeds}"
     )
+    if args.region_mode != 'none':
+        print(
+            f"region diagnostic: {args.region_mode}, top_ratio "
+            f"{args.region_top_ratio:.4f}, mean area "
+            f"{result['region']['mean_area']:.4f}"
+        )
     print(
         'parameters deterministic/resshift: '
         f"{result['parameter_count']['deterministic']}/"
