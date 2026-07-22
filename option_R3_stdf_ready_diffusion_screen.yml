@@ -1,0 +1,88 @@
+dataset:
+  train:
+    type: STDFReadyVideoDataset
+    root: /home/cp/桌面/yx/modelone/dataset
+    manifest_path: stdf_ready/manifests/video_train.csv
+    yuv_type: 420p
+    qp: 42
+    gt_size: 128
+    use_flip: true
+    use_rot: true
+    enlarge_ratio: 1
+    num_worker_per_gpu: 2
+    batch_size_per_gpu: 4
+
+  val:
+    type: STDFReadyVideoDataset
+    root: /home/cp/桌面/yx/modelone/dataset
+    manifest_path: stdf_ready/manifests/video_val.csv
+    yuv_type: 420p
+    qp: 42
+
+  test:
+    type: STDFReadyVideoDataset
+    root: /home/cp/桌面/yx/modelone/dataset
+    manifest_path: stdf_ready/manifests/video_test.csv
+    yuv_type: 420p
+    qp: 42
+
+network:
+  radius: 3
+
+  stdf:
+    in_nc: 1
+    out_nc: 64
+    nf: 32
+    nb: 3
+    base_ks: 3
+    deform_ks: 3
+
+  qenet:
+    in_nc: 64
+    out_nc: 1
+    nf: 48
+    nb: 8
+    base_ks: 3
+
+  stdf_diffusion_baseline:
+    temporal_frames: 7
+    use_temporal_lq: true
+    use_aligned_features: false
+    aligned_feature_channels: 64
+    aligned_projection_channels: 8
+    nf: 48
+    cond_dim: 128
+    rate_dim: 1
+    num_steps: 15
+    sample_steps: 4
+    shift_power: 0.3
+    kappa: 1.0
+    eta_end: 0.999
+    residual_scale: 0.05
+    latent_clip: 3.0
+    loss_eps: 0.001
+
+train:
+  exp_name: STDFReady_STDF_matched_screen
+  random_seed: 7
+  num_iter: 3000
+  interval_print: 100
+  interval_val: 1000
+  grad_clip: 5.0
+
+  optim:
+    type: Adam
+    lr: 0.0001
+    betas: [0.9, 0.999]
+    eps: 0.00000001
+
+  baseline_loss:
+    latent_weight: 1.0
+    image_weight: 1.0
+    highfreq_weight: 0.1
+    gradient_weight: 0.05
+    highfreq_kernel: 5
+
+test:
+  sample_steps: 4
+  seeds: [7, 17, 29]

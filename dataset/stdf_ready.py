@@ -119,7 +119,22 @@ class STDFReadyVideoDataset(data.Dataset):
         self.root = Path(opts_dict['root'])
         self.manifest_path = _resolve_path(self.root, opts_dict['manifest_path'])
         self.yuv_type = opts_dict.get('yuv_type', '420p')
-        self.rows = _read_csv(self.manifest_path)
+        self.gt_size = opts_dict.get('gt_size', None)
+        self.use_flip = opts_dict.get('use_flip', False)
+        self.use_rot = opts_dict.get('use_rot', False)
+        self.qp = opts_dict.get('qp', None)
+        rows = _read_csv(self.manifest_path)
+        if self.qp is not None:
+            target_qp = float(self.qp)
+            rows = [
+                row for row in rows
+                if abs(float(row['qp']) - target_qp) < 1e-6
+            ]
+            if not rows:
+                raise ValueError(
+                    f'No QP{target_qp:g} rows in {self.manifest_path}.'
+                )
+        self.rows = rows
         self.video_entries = []
         self.samples = []
 
@@ -144,6 +159,13 @@ class STDFReadyVideoDataset(data.Dataset):
             })
             for frame_idx in range(nfs):
                 self.samples.append((index_vid, frame_idx))
+        self.data_info = {
+            'name_vid': [
+                self.video_entries[index_vid]['name_vid']
+                for index_vid, _ in self.samples
+            ],
+            'frame_idx': [frame_idx for _, frame_idx in self.samples],
+        }
 
     def __getitem__(self, index):
         index_vid, frame_idx = self.samples[index]
@@ -177,6 +199,20 @@ class STDFReadyVideoDataset(data.Dataset):
             img_lqs.append(
                 np.expand_dims(np.squeeze(img), 2).astype(np.float32) / 255.
             )
+
+        if self.gt_size is not None:
+            img_gt, img_lqs = paired_random_crop(
+                img_gt,
+                img_lqs,
+                self.gt_size,
+                str(info['gt_yuv']),
+            )
+
+        if self.use_flip or self.use_rot:
+            img_lqs.append(img_gt)
+            img_results = augment(img_lqs, self.use_flip, self.use_rot)
+            img_lqs = img_results[:-1]
+            img_gt = img_results[-1]
 
         img_lqs.append(img_gt)
         img_results = totensor(img_lqs)
