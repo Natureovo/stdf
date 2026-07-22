@@ -211,7 +211,8 @@ def main():
     totals = defaultdict(float)
     sample_count = 0
     base_wins = 0
-    with torch.inference_mode():
+    # torch.inference_mode is unavailable in the legacy STDF PyTorch stack.
+    with torch.no_grad():
         for batch in tqdm(loader):
             gt = batch['gt'].to(device, non_blocking=True)
             temporal_lq = flatten_temporal_lq(
