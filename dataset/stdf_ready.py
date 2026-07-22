@@ -236,3 +236,195 @@ class STDFReadyVideoDataset(data.Dataset):
 
     def get_vid_num(self):
         return len(self.video_entries)
+
+
+class STDFReadyMultiQPDataset(data.Dataset):
+    """Return frame-aligned clips from every requested compression level.
+
+    ``lq_levels`` is ordered from the cleanest compressed level to the most
+    degraded one, for example QP42, QP47, QP51. All levels share exactly the
+    same crop and augmentation so their codec transitions remain paired.
+    """
+
+    def __init__(self, opts_dict, radius):
+        super().__init__()
+        if radius == 0:
+            raise ValueError(
+                'STDFReadyMultiQPDataset expects temporal neighbors.'
+            )
+        self.opts_dict = opts_dict
+        self.radius = int(radius)
+        self.root = Path(opts_dict['root'])
+        self.manifest_path = _resolve_path(
+            self.root,
+            opts_dict['manifest_path'],
+        )
+        self.yuv_type = opts_dict.get('yuv_type', '420p')
+        self.gt_size = opts_dict.get('gt_size', None)
+        self.use_flip = opts_dict.get('use_flip', False)
+        self.use_rot = opts_dict.get('use_rot', False)
+        self.qps = tuple(float(value) for value in opts_dict.get('qps', QPS))
+        self.strict_qps = bool(opts_dict.get('strict_qps', True))
+        if not self.qps:
+            raise ValueError('At least one QP is required.')
+        if (
+                tuple(sorted(self.qps)) != self.qps or
+                len(set(self.qps)) != len(self.qps)):
+            raise ValueError('qps must be unique and ordered from low to high.')
+
+        grouped_rows = {}
+        for row in _read_csv(self.manifest_path):
+            qp = float(row['qp'])
+            if qp not in self.qps:
+                continue
+            video_rows = grouped_rows.setdefault(row['video_id'], {})
+            if qp in video_rows:
+                raise ValueError(
+                    f"Duplicate QP{qp:g} row for video {row['video_id']}."
+                )
+            video_rows[qp] = row
+
+        self.video_entries = []
+        self.samples = []
+        missing = {}
+        for video_id in sorted(grouped_rows):
+            rows_by_qp = grouped_rows[video_id]
+            absent = [qp for qp in self.qps if qp not in rows_by_qp]
+            if absent:
+                missing[video_id] = absent
+                continue
+
+            rows = [rows_by_qp[qp] for qp in self.qps]
+            heights = {int(row['height']) for row in rows}
+            widths = {int(row['width']) for row in rows}
+            gt_paths = {
+                str(_resolve_path(self.root, row['gt_yuv']).resolve())
+                for row in rows
+            }
+            if len(heights) != 1 or len(widths) != 1 or len(gt_paths) != 1:
+                raise ValueError(
+                    f'Unaligned multi-QP metadata for video {video_id}.'
+                )
+
+            h, w = heights.pop(), widths.pop()
+            gt_yuv = _resolve_path(self.root, rows[0]['gt_yuv'])
+            lq_yuvs = [
+                _resolve_path(self.root, row['lq_yuv']) for row in rows
+            ]
+            frame_counts = [
+                _infer_yuv_frame_num(gt_yuv, h, w, self.yuv_type)
+            ]
+            frame_counts.extend(
+                _infer_yuv_frame_num(path, h, w, self.yuv_type)
+                for path in lq_yuvs
+            )
+            nfs = min(frame_counts)
+            index_vid = len(self.video_entries)
+            self.video_entries.append({
+                'video_id': video_id,
+                'rows': rows,
+                'gt_yuv': gt_yuv,
+                'lq_yuvs': lq_yuvs,
+                'h': h,
+                'w': w,
+                'nfs': nfs,
+                'index_vid': index_vid,
+            })
+            self.samples.extend(
+                (index_vid, frame_idx) for frame_idx in range(nfs)
+            )
+
+        if missing and self.strict_qps:
+            examples = ', '.join(
+                '{}:{}'.format(
+                    video_id,
+                    '/'.join(f'{qp:g}' for qp in absent),
+                )
+                for video_id, absent in list(missing.items())[:5]
+            )
+            raise ValueError(
+                'Some videos do not contain all requested QPs. Missing '
+                f'video:QPs examples: {examples}'
+            )
+        if not self.video_entries:
+            raise ValueError(
+                f'No complete multi-QP videos found in {self.manifest_path}.'
+            )
+        self.data_info = {
+            'name_vid': [
+                self.video_entries[index_vid]['video_id']
+                for index_vid, _ in self.samples
+            ],
+            'frame_idx': [frame_idx for _, frame_idx in self.samples],
+        }
+
+    def _read_y(self, path, h, w, frame_idx):
+        image = import_yuv(
+            seq_path=str(path),
+            h=h,
+            w=w,
+            tot_frm=1,
+            yuv_type=self.yuv_type,
+            start_frm=int(frame_idx),
+            only_y=True,
+        )
+        return np.expand_dims(np.squeeze(image), 2).astype(np.float32) / 255.
+
+    def __getitem__(self, index):
+        index_vid, frame_idx = self.samples[index]
+        info = self.video_entries[index_vid]
+        h, w, nfs = info['h'], info['w'], info['nfs']
+        img_gt = self._read_y(info['gt_yuv'], h, w, frame_idx)
+        neighbor_indexes = np.clip(
+            np.arange(frame_idx - self.radius, frame_idx + self.radius + 1),
+            0,
+            nfs - 1,
+        ).tolist()
+
+        flat_lqs = []
+        for lq_yuv in info['lq_yuvs']:
+            images = [
+                self._read_y(lq_yuv, h, w, neighbor_index)
+                for neighbor_index in neighbor_indexes
+            ]
+            flat_lqs.extend(images)
+
+        if self.gt_size is not None:
+            img_gt, flat_lqs = paired_random_crop(
+                img_gt,
+                flat_lqs,
+                self.gt_size,
+                str(info['gt_yuv']),
+            )
+
+        if self.use_flip or self.use_rot:
+            augmented = augment(
+                flat_lqs + [img_gt],
+                self.use_flip,
+                self.use_rot,
+            )
+            flat_lqs, img_gt = augmented[:-1], augmented[-1]
+
+        tensors = totensor(flat_lqs + [img_gt])
+        lq_tensors, img_gt = tensors[:-1], tensors[-1]
+        frames_per_level = 2 * self.radius + 1
+        lq_levels = []
+        for level_index in range(len(self.qps)):
+            begin = level_index * frames_per_level
+            end = begin + frames_per_level
+            lq_levels.append(torch.stack(lq_tensors[begin:end], dim=0))
+
+        return {
+            'lq_levels': torch.stack(lq_levels, dim=0),
+            'gt': img_gt,
+            'qps': torch.tensor(self.qps, dtype=torch.float32),
+            'name_vid': info['video_id'],
+            'index_vid': info['index_vid'],
+            'frame_idx': frame_idx,
+        }
+
+    def __len__(self):
+        return len(self.samples)
+
+    def get_vid_num(self):
+        return len(self.video_entries)
