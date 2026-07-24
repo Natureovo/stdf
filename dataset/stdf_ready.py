@@ -1,4 +1,5 @@
 import csv
+import random
 import os.path as op
 from pathlib import Path
 
@@ -45,6 +46,95 @@ def _infer_yuv_frame_num(path, h, w, yuv_type='420p'):
             f'YUV file size is not aligned with frame size: {path}'
         )
     return file_bytes // frame_bytes
+
+
+def _upsample_chroma(chroma, height, width):
+    return cv2.resize(
+        chroma,
+        (int(width), int(height)),
+        interpolation=cv2.INTER_LINEAR,
+    )
+
+
+def _ycbcr_to_rgb(y, cb, cr, matrix='auto', value_range='limited'):
+    """Convert one planar YCbCr frame to RGB float data in [0, 1]."""
+    height, width = y.shape
+    cb = _upsample_chroma(cb, height, width).astype(np.float32)
+    cr = _upsample_chroma(cr, height, width).astype(np.float32)
+    y = y.astype(np.float32)
+
+    matrix = str(matrix).lower()
+    if matrix == 'auto':
+        matrix = 'bt709' if height >= 720 else 'bt601'
+    if matrix not in ('bt601', 'bt709'):
+        raise ValueError(f'Unsupported YCbCr matrix: {matrix}')
+
+    value_range = str(value_range).lower()
+    if value_range == 'limited':
+        y = (y - 16.0) / 219.0
+        cb = (cb - 128.0) / 224.0
+        cr = (cr - 128.0) / 224.0
+    elif value_range == 'full':
+        y = y / 255.0
+        cb = (cb - 128.0) / 255.0
+        cr = (cr - 128.0) / 255.0
+    else:
+        raise ValueError(f'Unsupported YCbCr value range: {value_range}')
+
+    if matrix == 'bt709':
+        red = y + 1.5748 * cr
+        green = y - 0.187324 * cb - 0.468124 * cr
+        blue = y + 1.8556 * cb
+    else:
+        red = y + 1.4020 * cr
+        green = y - 0.344136 * cb - 0.714136 * cr
+        blue = y + 1.7720 * cb
+    return np.stack((red, green, blue), axis=2).clip(0.0, 1.0)
+
+
+def _read_yuv_frame(
+        path,
+        height,
+        width,
+        frame_idx,
+        yuv_type='420p',
+        color_mode='y',
+        color_matrix='auto',
+        color_range='limited'):
+    color_mode = str(color_mode).lower()
+    if color_mode == 'y':
+        image = import_yuv(
+            seq_path=str(path),
+            h=height,
+            w=width,
+            tot_frm=1,
+            yuv_type=yuv_type,
+            start_frm=int(frame_idx),
+            only_y=True,
+        )
+        return np.expand_dims(
+            np.squeeze(image),
+            2,
+        ).astype(np.float32) / 255.0
+    if color_mode != 'rgb':
+        raise ValueError(f'Unsupported color_mode: {color_mode}')
+
+    y, cb, cr = import_yuv(
+        seq_path=str(path),
+        h=height,
+        w=width,
+        tot_frm=1,
+        yuv_type=yuv_type,
+        start_frm=int(frame_idx),
+        only_y=False,
+    )
+    return _ycbcr_to_rgb(
+        y[0],
+        cb[0],
+        cr[0],
+        matrix=color_matrix,
+        value_range=color_range,
+    ).astype(np.float32)
 
 
 class STDFReadyFrameDataset(data.Dataset):
@@ -119,6 +209,10 @@ class STDFReadyVideoDataset(data.Dataset):
         self.root = Path(opts_dict['root'])
         self.manifest_path = _resolve_path(self.root, opts_dict['manifest_path'])
         self.yuv_type = opts_dict.get('yuv_type', '420p')
+        self.color_mode = str(opts_dict.get('color_mode', 'y')).lower()
+        self.color_matrix = opts_dict.get('color_matrix', 'auto')
+        self.color_range = opts_dict.get('color_range', 'limited')
+        self.return_gt_clip = bool(opts_dict.get('return_gt_clip', False))
         self.gt_size = opts_dict.get('gt_size', None)
         self.use_flip = opts_dict.get('use_flip', False)
         self.use_rot = opts_dict.get('use_rot', False)
@@ -172,55 +266,90 @@ class STDFReadyVideoDataset(data.Dataset):
         info = self.video_entries[index_vid]
         h, w = info['h'], info['w']
 
-        img = import_yuv(
-            seq_path=str(info['gt_yuv']),
-            h=h,
-            w=w,
-            tot_frm=1,
-            yuv_type=self.yuv_type,
-            start_frm=frame_idx,
-            only_y=True,
-        )
-        img_gt = np.expand_dims(np.squeeze(img), 2).astype(np.float32) / 255.
-
         lq_indexes = list(range(frame_idx - self.radius, frame_idx + self.radius + 1))
         lq_indexes = list(np.clip(lq_indexes, 0, info['nfs'] - 1))
-        img_lqs = []
-        for lq_index in lq_indexes:
-            img = import_yuv(
-                seq_path=str(info['lq_yuv']),
-                h=h,
-                w=w,
-                tot_frm=1,
+        img_gt_clip = []
+        if self.return_gt_clip:
+            img_gt_clip = [
+                _read_yuv_frame(
+                    info['gt_yuv'],
+                    h,
+                    w,
+                    gt_index,
+                    yuv_type=self.yuv_type,
+                    color_mode=self.color_mode,
+                    color_matrix=self.color_matrix,
+                    color_range=self.color_range,
+                )
+                for gt_index in lq_indexes
+            ]
+            img_gt = img_gt_clip[self.radius].copy()
+        else:
+            img_gt = _read_yuv_frame(
+                info['gt_yuv'],
+                h,
+                w,
+                frame_idx,
                 yuv_type=self.yuv_type,
-                start_frm=lq_index,
-                only_y=True,
-            )
-            img_lqs.append(
-                np.expand_dims(np.squeeze(img), 2).astype(np.float32) / 255.
+                color_mode=self.color_mode,
+                color_matrix=self.color_matrix,
+                color_range=self.color_range,
             )
 
+        img_lqs = []
+        for lq_index in lq_indexes:
+            img_lqs.append(
+                _read_yuv_frame(
+                    info['lq_yuv'],
+                    h,
+                    w,
+                    lq_index,
+                    yuv_type=self.yuv_type,
+                    color_mode=self.color_mode,
+                    color_matrix=self.color_matrix,
+                    color_range=self.color_range,
+                )
+            )
+
+        paired = img_lqs + img_gt_clip
         if self.gt_size is not None:
-            img_gt, img_lqs = paired_random_crop(
+            img_gt, paired = paired_random_crop(
                 img_gt,
-                img_lqs,
+                paired,
                 self.gt_size,
                 str(info['gt_yuv']),
             )
+            img_lqs = paired[:len(lq_indexes)]
+            img_gt_clip = paired[len(lq_indexes):]
 
         if self.use_flip or self.use_rot:
-            img_lqs.append(img_gt)
-            img_results = augment(img_lqs, self.use_flip, self.use_rot)
-            img_lqs = img_results[:-1]
+            paired = augment(
+                img_lqs + img_gt_clip + [img_gt],
+                self.use_flip,
+                self.use_rot,
+            )
+            img_lqs = paired[:len(lq_indexes)]
+            img_gt_clip = paired[
+                len(lq_indexes):len(lq_indexes) + len(img_gt_clip)
+            ]
+            img_results = paired
             img_gt = img_results[-1]
 
-        img_lqs.append(img_gt)
-        img_results = totensor(img_lqs)
-        img_lqs = torch.stack(img_results[:-1], dim=0)
-        img_gt = img_results[-1]
+        tensors = totensor(
+            img_lqs + img_gt_clip + [img_gt],
+            opt_bgr2rgb=False,
+        )
+        img_lqs = torch.stack(tensors[:len(lq_indexes)], dim=0)
+        clip_begin = len(lq_indexes)
+        clip_end = clip_begin + len(img_gt_clip)
+        gt_clip = (
+            torch.stack(tensors[clip_begin:clip_end], dim=0)
+            if self.return_gt_clip else None
+        )
+        img_gt = tensors[-1]
 
         row = info['row']
-        return {
+        result = {
             'lq': img_lqs,
             'gt': img_gt,
             'qp': torch.tensor(float(row['qp']), dtype=torch.float32),
@@ -230,6 +359,9 @@ class STDFReadyVideoDataset(data.Dataset):
             'bitstream_path': row.get('bitstream_path', ''),
             'log_path': row.get('log_path', ''),
         }
+        if gt_clip is not None:
+            result['gt_clip'] = gt_clip
+        return result
 
     def __len__(self):
         return len(self.samples)
@@ -260,10 +392,22 @@ class STDFReadyMultiQPDataset(data.Dataset):
             opts_dict['manifest_path'],
         )
         self.yuv_type = opts_dict.get('yuv_type', '420p')
+        self.color_mode = str(opts_dict.get('color_mode', 'y')).lower()
+        self.color_matrix = opts_dict.get('color_matrix', 'auto')
+        self.color_range = opts_dict.get('color_range', 'limited')
+        self.return_gt_clip = bool(opts_dict.get('return_gt_clip', False))
         self.gt_size = opts_dict.get('gt_size', None)
         self.use_flip = opts_dict.get('use_flip', False)
         self.use_rot = opts_dict.get('use_rot', False)
         self.qps = tuple(float(value) for value in opts_dict.get('qps', QPS))
+        self.output_mode = str(
+            opts_dict.get('output_mode', 'stacked')
+        ).lower()
+        if self.output_mode not in ('stacked', 'random', 'indexed'):
+            raise ValueError(
+                'output_mode should be stacked, random, or indexed, got '
+                f'{self.output_mode}.'
+            )
         self.strict_qps = bool(opts_dict.get('strict_qps', True))
         if not self.qps:
             raise ValueError('At least one QP is required.')
@@ -350,81 +494,157 @@ class STDFReadyMultiQPDataset(data.Dataset):
             raise ValueError(
                 f'No complete multi-QP videos found in {self.manifest_path}.'
             )
-        self.data_info = {
-            'name_vid': [
-                self.video_entries[index_vid]['video_id']
-                for index_vid, _ in self.samples
-            ],
-            'frame_idx': [frame_idx for _, frame_idx in self.samples],
-        }
+        if self.output_mode == 'indexed':
+            self.data_info = {
+                'name_vid': [
+                    '{}_QP{:g}'.format(
+                        self.video_entries[index_vid]['video_id'],
+                        qp,
+                    )
+                    for index_vid, _ in self.samples
+                    for qp in self.qps
+                ],
+                'frame_idx': [
+                    frame_idx
+                    for _, frame_idx in self.samples
+                    for _ in self.qps
+                ],
+            }
+        else:
+            self.data_info = {
+                'name_vid': [
+                    self.video_entries[index_vid]['video_id']
+                    for index_vid, _ in self.samples
+                ],
+                'frame_idx': [frame_idx for _, frame_idx in self.samples],
+            }
 
-    def _read_y(self, path, h, w, frame_idx):
-        image = import_yuv(
-            seq_path=str(path),
-            h=h,
-            w=w,
-            tot_frm=1,
+    def _read_frame(self, path, h, w, frame_idx):
+        return _read_yuv_frame(
+            path,
+            h,
+            w,
+            frame_idx,
             yuv_type=self.yuv_type,
-            start_frm=int(frame_idx),
-            only_y=True,
+            color_mode=self.color_mode,
+            color_matrix=self.color_matrix,
+            color_range=self.color_range,
         )
-        return np.expand_dims(np.squeeze(image), 2).astype(np.float32) / 255.
 
     def __getitem__(self, index):
-        index_vid, frame_idx = self.samples[index]
+        if self.output_mode == 'indexed':
+            sample_index = index // len(self.qps)
+            selected_levels = [index % len(self.qps)]
+        elif self.output_mode == 'random':
+            sample_index = index
+            selected_levels = [random.randrange(len(self.qps))]
+        else:
+            sample_index = index
+            selected_levels = list(range(len(self.qps)))
+
+        index_vid, frame_idx = self.samples[sample_index]
         info = self.video_entries[index_vid]
         h, w, nfs = info['h'], info['w'], info['nfs']
-        img_gt = self._read_y(info['gt_yuv'], h, w, frame_idx)
         neighbor_indexes = np.clip(
             np.arange(frame_idx - self.radius, frame_idx + self.radius + 1),
             0,
             nfs - 1,
         ).tolist()
+        img_gt_clip = []
+        if self.return_gt_clip:
+            img_gt_clip = [
+                self._read_frame(info['gt_yuv'], h, w, neighbor_index)
+                for neighbor_index in neighbor_indexes
+            ]
+            img_gt = img_gt_clip[self.radius].copy()
+        else:
+            img_gt = self._read_frame(info['gt_yuv'], h, w, frame_idx)
 
         flat_lqs = []
-        for lq_yuv in info['lq_yuvs']:
+        for level_index in selected_levels:
+            lq_yuv = info['lq_yuvs'][level_index]
             images = [
-                self._read_y(lq_yuv, h, w, neighbor_index)
+                self._read_frame(lq_yuv, h, w, neighbor_index)
                 for neighbor_index in neighbor_indexes
             ]
             flat_lqs.extend(images)
 
+        paired = flat_lqs + img_gt_clip
         if self.gt_size is not None:
-            img_gt, flat_lqs = paired_random_crop(
+            lq_count = len(flat_lqs)
+            img_gt, paired = paired_random_crop(
                 img_gt,
-                flat_lqs,
+                paired,
                 self.gt_size,
                 str(info['gt_yuv']),
             )
+            flat_lqs = paired[:lq_count]
+            img_gt_clip = paired[lq_count:]
 
         if self.use_flip or self.use_rot:
             augmented = augment(
-                flat_lqs + [img_gt],
+                flat_lqs + img_gt_clip + [img_gt],
                 self.use_flip,
                 self.use_rot,
             )
-            flat_lqs, img_gt = augmented[:-1], augmented[-1]
+            lq_count = len(flat_lqs)
+            flat_lqs = augmented[:lq_count]
+            img_gt_clip = augmented[
+                lq_count:lq_count + len(img_gt_clip)
+            ]
+            img_gt = augmented[-1]
 
-        tensors = totensor(flat_lqs + [img_gt])
-        lq_tensors, img_gt = tensors[:-1], tensors[-1]
+        tensors = totensor(
+            flat_lqs + img_gt_clip + [img_gt],
+            opt_bgr2rgb=False,
+        )
+        lq_tensors = tensors[:len(flat_lqs)]
+        clip_begin = len(flat_lqs)
+        clip_end = clip_begin + len(img_gt_clip)
+        gt_clip = (
+            torch.stack(tensors[clip_begin:clip_end], dim=0)
+            if self.return_gt_clip else None
+        )
+        img_gt = tensors[-1]
         frames_per_level = 2 * self.radius + 1
         lq_levels = []
-        for level_index in range(len(self.qps)):
-            begin = level_index * frames_per_level
+        for relative_index in range(len(selected_levels)):
+            begin = relative_index * frames_per_level
             end = begin + frames_per_level
             lq_levels.append(torch.stack(lq_tensors[begin:end], dim=0))
 
-        return {
-            'lq_levels': torch.stack(lq_levels, dim=0),
+        result = {
             'gt': img_gt,
-            'qps': torch.tensor(self.qps, dtype=torch.float32),
-            'name_vid': info['video_id'],
-            'index_vid': info['index_vid'],
             'frame_idx': frame_idx,
         }
+        if self.output_mode == 'stacked':
+            result.update({
+                'lq_levels': torch.stack(lq_levels, dim=0),
+                'qps': torch.tensor(self.qps, dtype=torch.float32),
+                'name_vid': info['video_id'],
+                'index_vid': info['index_vid'],
+            })
+        else:
+            level_index = selected_levels[0]
+            qp = self.qps[level_index]
+            result.update({
+                'lq': lq_levels[0],
+                'qp': torch.tensor(qp, dtype=torch.float32),
+                'name_vid': f"{info['video_id']}_QP{qp:g}",
+                'index_vid': (
+                    info['index_vid'] * len(self.qps) + level_index
+                    if self.output_mode == 'indexed'
+                    else info['index_vid']
+                ),
+            })
+        if gt_clip is not None:
+            result['gt_clip'] = gt_clip
+        return result
 
     def __len__(self):
-        return len(self.samples)
+        multiplier = len(self.qps) if self.output_mode == 'indexed' else 1
+        return len(self.samples) * multiplier
 
     def get_vid_num(self):
-        return len(self.video_entries)
+        multiplier = len(self.qps) if self.output_mode == 'indexed' else 1
+        return len(self.video_entries) * multiplier

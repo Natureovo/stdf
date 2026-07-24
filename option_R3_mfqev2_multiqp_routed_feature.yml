@@ -1,0 +1,97 @@
+dataset:
+  train:
+    type: STDFReadyMultiQPDataset
+    root: /media/cp/SWH-4T机械红/MFQEv2_dataset
+    manifest_path: routed_feature_manifests/video_train.csv
+    yuv_type: 420p
+    color_mode: rgb
+    color_matrix: auto
+    color_range: limited
+    qps: [37, 42, 47, 51]
+    strict_qps: true
+    output_mode: random
+    return_gt_clip: false
+    gt_size: 128
+    use_flip: true
+    use_rot: true
+    enlarge_ratio: 20
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 4
+
+  val:
+    type: STDFReadyMultiQPDataset
+    root: /media/cp/SWH-4T机械红/MFQEv2_dataset
+    manifest_path: routed_feature_manifests/video_val.csv
+    yuv_type: 420p
+    color_mode: rgb
+    color_matrix: auto
+    color_range: limited
+    qps: [37, 42, 47, 51]
+    strict_qps: true
+    output_mode: indexed
+    return_gt_clip: true
+
+  test:
+    type: STDFReadyMultiQPDataset
+    root: /media/cp/SWH-4T机械红/MFQEv2_dataset
+    manifest_path: routed_feature_manifests/video_test.csv
+    yuv_type: 420p
+    color_mode: rgb
+    color_matrix: auto
+    color_range: limited
+    qps: [37, 42, 47, 51]
+    strict_qps: true
+    output_mode: indexed
+    return_gt_clip: true
+
+network:
+  radius: 3
+
+  rgb_fidelity:
+    channels: 48
+    blocks: [2, 3, 4]
+    heads: [2, 4, 8]
+    expansion: 2.0
+
+  routed_feature:
+    detail_levels: 3
+    detach_need_inputs: true
+    detail_decoder:
+      hidden: 48
+    need:
+      evidence_channels: 32
+      hidden: 48
+    score_variance:
+      perturbations: 3
+      perturb_scale: 0.01
+      confidence_temperature: 1.0
+    router:
+      need_low: 0.35
+      need_high: 0.55
+      confidence_min: 0.55
+      confidence_smooth_kernel: 5
+      growth_steps: 8
+      boundary_kernel: 5
+
+train:
+  exp_name: rgb_fidelity_need_multiqp
+  random_seed: 7
+  num_iter: 20000
+  interval_print: 100
+  interval_val: 2500
+  grad_clip: 5.0
+
+  optim:
+    type: Adam
+    lr: 0.0001
+    betas: [0.9, 0.999]
+    eps: 0.00000001
+
+  fidelity_loss:
+    reconstruction_weight: 1.0
+    highfreq_weight: 0.15
+    gradient_weight: 0.05
+    need_bce_weight: 0.20
+    need_l1_weight: 0.10
+    need_tv_weight: 0.002
+    charbonnier_eps: 0.001
