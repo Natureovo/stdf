@@ -175,11 +175,13 @@ class RGBFidelityBackbone(nn.Module):
             channels=48,
             blocks=(2, 3, 4),
             heads=(2, 4, 8),
-            expansion=2.0):
+            expansion=2.0,
+            chroma_correction_scale=1.0):
         super().__init__()
         if len(blocks) != 3 or len(heads) != 3:
             raise ValueError('blocks and heads must each contain 3 values.')
         channels = int(channels)
+        self.chroma_correction_scale = float(chroma_correction_scale)
         dimensions = (channels, channels * 2, channels * 4)
         self.temporal_fusion = TemporalRGBFusion(channels=dimensions[0])
         self.qp_conditions = nn.ModuleList([
@@ -239,6 +241,23 @@ class RGBFidelityBackbone(nn.Module):
             width + pad_w,
         ), (height, width)
 
+    @staticmethod
+    def compose_correction(center, correction, chroma_scale=1.0):
+        """Apply full luma correction while controlling color changes."""
+        weights = correction.new_tensor(
+            [0.2126, 0.7152, 0.0722]
+        ).view(1, 3, 1, 1)
+        luma_correction = (correction * weights).sum(
+            dim=1,
+            keepdim=True,
+        )
+        color_correction = correction - luma_correction
+        correction = (
+            luma_correction +
+            float(chroma_scale) * color_correction
+        )
+        return (center + correction).clamp(0.0, 1.0)
+
     def forward(self, clip, qp, return_features=False):
         clip, original_size = self._pad(clip)
         center = clip[:, clip.shape[1] // 2]
@@ -257,7 +276,12 @@ class RGBFidelityBackbone(nn.Module):
         decoded_full = self.decoder1(
             self.merge1(torch.cat((decoded_full, full), dim=1))
         )
-        restored = (center + self.output(decoded_full)).clamp(0.0, 1.0)
+        raw_correction = self.output(decoded_full)
+        restored = self.compose_correction(
+            center,
+            raw_correction,
+            self.chroma_correction_scale,
+        )
         height, width = original_size
         restored = restored[..., :height, :width]
         if not return_features:
@@ -271,6 +295,8 @@ class RGBFidelityBackbone(nn.Module):
             'temporal_weights': temporal_weights[
                 ..., :height, :width
             ],
+            'center': center[..., :height, :width],
+            'raw_correction': raw_correction[..., :height, :width],
         }
         return restored, features
 
@@ -281,4 +307,8 @@ def build_rgb_fidelity_backbone(opts):
         blocks=tuple(opts.get('blocks', (2, 3, 4))),
         heads=tuple(opts.get('heads', (2, 4, 8))),
         expansion=opts.get('expansion', 2.0),
+        chroma_correction_scale=opts.get(
+            'chroma_correction_scale',
+            1.0,
+        ),
     )

@@ -11,6 +11,14 @@ def require(condition, message):
         raise AssertionError(message)
 
 
+def rgb_chroma_difference(image):
+    weights = image.new_tensor([0.2126, 0.7152, 0.0722]).view(
+        1, 3, 1, 1,
+    )
+    luma = (image * weights).sum(dim=1, keepdim=True)
+    return torch.cat((image[:, 2:3] - luma, image[:, 0:1] - luma), dim=1)
+
+
 def main():
     torch.manual_seed(7)
     fidelity = RGBFidelityBackbone(
@@ -47,6 +55,20 @@ def main():
     require(
         torch.equal(outputs['fidelity'], center),
         'Zero-initialized fidelity head is not an exact identity mapping.',
+    )
+    color_safe_center = center * 0.5 + 0.25
+    color_safe = fidelity.compose_correction(
+        color_safe_center,
+        torch.rand_like(center) * 0.01,
+        chroma_scale=0.0,
+    )
+    require(
+        torch.allclose(
+            rgb_chroma_difference(color_safe),
+            rgb_chroma_difference(color_safe_center),
+            atol=1e-6,
+        ),
+        'Zero chroma scale did not preserve input color differences.',
     )
 
     targets = model.training_targets(gt, outputs['fidelity'].detach())

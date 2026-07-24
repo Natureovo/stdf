@@ -30,6 +30,17 @@ def parse_args():
         choices=['sequential', 'video_balanced'],
         default='video_balanced',
     )
+    parser.add_argument(
+        '--chroma_correction_scales',
+        type=float,
+        nargs='+',
+        default=None,
+        help=(
+            'Evaluate several color-correction strengths from one network '
+            'forward pass. Scale 0 preserves input chroma; scale 1 is the '
+            'original RGB correction.'
+        ),
+    )
     parser.add_argument('--report_path', default=None)
     return parser.parse_args()
 
@@ -59,6 +70,13 @@ def select_indices(ds, maximum, mode):
 def rgb_to_y(image):
     weights = image.new_tensor([0.2126, 0.7152, 0.0722]).view(1, 3, 1, 1)
     return (image * weights).sum(dim=1, keepdim=True)
+
+
+def rgb_to_chroma(image):
+    y = rgb_to_y(image)
+    cb = (image[:, 2:3] - y) / 1.8556
+    cr = (image[:, 0:1] - y) / 1.5748
+    return torch.cat((cb, cr), dim=1)
 
 
 def psnr(image, target):
@@ -106,6 +124,11 @@ def frame_metrics(base, refined, gt, need, need_target):
         'refined_rgb_psnr': psnr(refined, gt),
         'base_y_psnr': psnr(rgb_to_y(base), rgb_to_y(gt)),
         'refined_y_psnr': psnr(rgb_to_y(refined), rgb_to_y(gt)),
+        'base_chroma_psnr': psnr(rgb_to_chroma(base), rgb_to_chroma(gt)),
+        'refined_chroma_psnr': psnr(
+            rgb_to_chroma(refined),
+            rgb_to_chroma(gt),
+        ),
         'base_ssim': channel_ssim(base, gt),
         'refined_ssim': channel_ssim(refined, gt),
         'base_hf_mae': float((base_hf - gt_hf).abs().mean()),
@@ -165,6 +188,8 @@ def main():
 
     records = []
     records_by_qp = defaultdict(list)
+    sweep_records = defaultdict(list)
+    sweep_records_by_qp = defaultdict(lambda: defaultdict(list))
     temporal_by_qp = defaultdict(lambda: {'base': [], 'refined': []})
     previous_by_video = {}
     with torch.no_grad():
@@ -185,6 +210,25 @@ def main():
             qp_value = int(round(float(qp.reshape(-1)[0])))
             records.append(record)
             records_by_qp[qp_value].append(record)
+            if args.chroma_correction_scales:
+                for chroma_scale in args.chroma_correction_scales:
+                    swept = model.fidelity_backbone.compose_correction(
+                        outputs['features']['center'],
+                        outputs['features']['raw_correction'],
+                        chroma_scale,
+                    )
+                    sweep_record = frame_metrics(
+                        base,
+                        swept,
+                        gt,
+                        outputs['need'],
+                        targets['need'],
+                    )
+                    scale_key = '{:g}'.format(chroma_scale)
+                    sweep_records[scale_key].append(sweep_record)
+                    sweep_records_by_qp[scale_key][qp_value].append(
+                        sweep_record
+                    )
 
             name = data_item['name_vid'][0]
             frame_index = int(data_item['frame_idx'].reshape(-1)[0])
@@ -233,6 +277,17 @@ def main():
         'overall': summary,
         'by_qp': by_qp,
     }
+    sweep_summary = {}
+    if sweep_records:
+        for scale_key, scale_records in sweep_records.items():
+            scale_summary = average_records(scale_records)
+            scale_summary['by_qp'] = {
+                str(qp_value): average_records(qp_records)
+                for qp_value, qp_records
+                in sorted(sweep_records_by_qp[scale_key].items())
+            }
+            sweep_summary[scale_key] = scale_summary
+        report['chroma_correction_sweep'] = sweep_summary
 
     print('\n========== RGB fidelity validation ==========')
     print('split/sampling, samples: {}/{}, {}/{}'.format(
@@ -250,6 +305,11 @@ def main():
         summary['base_y_psnr'],
         summary['refined_y_psnr'],
         summary['refined_y_psnr'] - summary['base_y_psnr'],
+    ))
+    print('chroma PSNR base/refined/delta: {:.6f}/{:.6f}/{:+.6f}'.format(
+        summary['base_chroma_psnr'],
+        summary['refined_chroma_psnr'],
+        summary['refined_chroma_psnr'] - summary['base_chroma_psnr'],
     ))
     print('SSIM base/refined/delta: {:.6f}/{:.6f}/{:+.6f}'.format(
         summary['base_ssim'],
@@ -279,6 +339,28 @@ def main():
             qp_summary['refined_temporal_error'] - qp_summary['base_temporal_error'],
             qp_summary['temporal_pairs'],
         ))
+    if sweep_summary:
+        print('\n-- Chroma correction scale sweep --')
+        for scale_key, scale_summary in sweep_summary.items():
+            print(
+                'scale {}: RGB/Y/chroma PSNR delta '
+                '{:+.6f}/{:+.6f}/{:+.6f}, SSIM {:+.6f}, '
+                'HF/gradient {:+.8f}/{:+.8f}'.format(
+                    scale_key,
+                    scale_summary['refined_rgb_psnr'] -
+                    scale_summary['base_rgb_psnr'],
+                    scale_summary['refined_y_psnr'] -
+                    scale_summary['base_y_psnr'],
+                    scale_summary['refined_chroma_psnr'] -
+                    scale_summary['base_chroma_psnr'],
+                    scale_summary['refined_ssim'] -
+                    scale_summary['base_ssim'],
+                    scale_summary['refined_hf_mae'] -
+                    scale_summary['base_hf_mae'],
+                    scale_summary['refined_gradient_mae'] -
+                    scale_summary['base_gradient_mae'],
+                )
+            )
     if args.report_path:
         report_dir = op.dirname(args.report_path)
         if report_dir:
