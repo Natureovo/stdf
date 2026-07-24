@@ -52,6 +52,9 @@ network:
     blocks: [2, 3, 4]
     heads: [2, 4, 8]
     expansion: 2.0
+    # Preserve the reliable compressed chroma while retaining learned luma
+    # restoration. Validation selected 0.25 as the balanced RGB/SSIM setting.
+    chroma_correction_scale: 0.25
 
   routed_feature:
     detail_levels: 3
