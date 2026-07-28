@@ -1,6 +1,8 @@
 import argparse
 import json
+import math
 import os
+import sys
 from collections import defaultdict
 
 import numpy as np
@@ -167,6 +169,41 @@ def method_metrics(image, gt):
     }
 
 
+def find_dists_weights(module):
+    package_directory = os.path.dirname(
+        os.path.abspath(module.__file__)
+    )
+    candidates = (
+        os.path.join(package_directory, 'weights.pt'),
+        os.path.join(os.path.dirname(package_directory), 'weights.pt'),
+    )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def load_dists_model(device):
+    import DISTS_pytorch
+    from DISTS_pytorch import DISTS
+
+    try:
+        return DISTS().to(device).eval(), None
+    except FileNotFoundError as error:
+        weights_path = find_dists_weights(DISTS_pytorch)
+        if weights_path is None:
+            raise error
+        original_prefix = sys.prefix
+        try:
+            # DISTS-pytorch 0.1 resolves weights.pt from sys.prefix. A
+            # --target installation keeps that file beside the package.
+            sys.prefix = os.path.dirname(weights_path)
+            model = DISTS().to(device).eval()
+        finally:
+            sys.prefix = original_prefix
+        return model, weights_path
+
+
 def load_optional_perceptual_models(device, enabled):
     models = {'lpips': None, 'dists': None}
     availability = {'lpips': False, 'dists': False}
@@ -179,9 +216,10 @@ def load_optional_perceptual_models(device, enabled):
     except Exception as error:
         availability['lpips_error'] = str(error)
     try:
-        from DISTS_pytorch import DISTS
-        models['dists'] = DISTS().to(device).eval()
+        models['dists'], weights_path = load_dists_model(device)
         availability['dists'] = True
+        if weights_path is not None:
+            availability['dists_weights'] = weights_path
     except Exception as error:
         availability['dists_error'] = str(error)
     return models, availability
@@ -217,6 +255,47 @@ def delta(first, second):
         key: float(first[key] - second[key])
         for key in first
     }
+
+
+def confidence_interval(values):
+    values = np.asarray(list(values), dtype=np.float64)
+    if values.size == 0:
+        return {'mean': 0.0, 'low': 0.0, 'high': 0.0, 'n': 0}
+    mean = float(values.mean())
+    if values.size == 1:
+        return {'mean': mean, 'low': mean, 'high': mean, 'n': 1}
+    half_width = (
+        1.96 * float(values.std(ddof=1)) / math.sqrt(values.size)
+    )
+    return {
+        'mean': mean,
+        'low': mean - half_width,
+        'high': mean + half_width,
+        'n': int(values.size),
+    }
+
+
+def paired_group_delta(group_records, left, right, metric_name):
+    deltas = []
+    for method_records in group_records.values():
+        left_values = [
+            record[metric_name] for record in method_records[left]
+        ]
+        right_values = [
+            record[metric_name] for record in method_records[right]
+        ]
+        if len(left_values) != len(right_values):
+            raise ValueError(
+                'Unpaired perceptual values for {} and {}.'.format(
+                    left,
+                    right,
+                )
+            )
+        if left_values:
+            deltas.append(
+                float(np.mean(left_values) - np.mean(right_values))
+            )
+    return confidence_interval(deltas)
 
 
 def temporal_error(previous, current, previous_gt, current_gt):
@@ -356,6 +435,12 @@ def main():
     records_by_qp = defaultdict(
         lambda: {name: [] for name in method_names}
     )
+    perceptual_records_by_qp = defaultdict(
+        lambda: {name: [] for name in method_names}
+    )
+    perceptual_records_by_group = defaultdict(
+        lambda: {name: [] for name in method_names}
+    )
     detail_records = []
     candidate_diagnostic_records = []
     route_records = []
@@ -475,18 +560,27 @@ def main():
                 'diffusion_confidence_routed': diffusion_confidence_image,
             }
             qp_value = int(round(float(qp.reshape(-1)[0])))
+            video_name = data_item['name_vid'][0]
+            perceptual_group = (video_name, qp_value)
             for method_name, image in outputs.items():
                 metric = method_metrics(image, gt)
                 records[method_name].append(metric)
                 records_by_qp[qp_value][method_name].append(metric)
                 if perceptual_names:
-                    perceptual_records[method_name].append(
-                        perceptual_metrics(
-                            perceptual_models,
-                            image,
-                            gt,
-                        )
+                    perceptual_metric = perceptual_metrics(
+                        perceptual_models,
+                        image,
+                        gt,
                     )
+                    perceptual_records[method_name].append(
+                        perceptual_metric
+                    )
+                    perceptual_records_by_qp[
+                        qp_value
+                    ][method_name].append(perceptual_metric)
+                    perceptual_records_by_group[
+                        perceptual_group
+                    ][method_name].append(perceptual_metric)
 
             _, gt_detail = haar_detail(gt)
             band_weight = F.interpolate(
@@ -584,7 +678,6 @@ def main():
                 ),
             })
 
-            video_name = data_item['name_vid'][0]
             frame_index = int(data_item['frame_idx'].reshape(-1)[0])
             temporal_key = (video_name, qp_value)
             previous = previous_by_video_qp.get(temporal_key)
@@ -616,6 +709,13 @@ def main():
         for method_name, method_records in perceptual_records.items()
         if method_records
     }
+    perceptual_by_qp = {}
+    for qp_value, qp_methods in sorted(
+            perceptual_records_by_qp.items()):
+        perceptual_by_qp[str(qp_value)] = {
+            method_name: average(method_records)
+            for method_name, method_records in qp_methods.items()
+        }
     by_qp = {}
     for qp_value, qp_methods in sorted(records_by_qp.items()):
         by_qp[str(qp_value)] = {
@@ -652,6 +752,8 @@ def main():
     )
     perceptual_same_delta = {}
     perceptual_confidence_delta = {}
+    perceptual_same_paired_ci = {}
+    perceptual_confidence_paired_ci = {}
     perceptual_gate = 'NOT_RUN'
     if perceptual_names:
         perceptual_same_delta = {
@@ -670,11 +772,31 @@ def main():
             )
             for name in perceptual_names
         }
+        perceptual_same_paired_ci = {
+            name: paired_group_delta(
+                perceptual_records_by_group,
+                'diffusion_same_region',
+                'deterministic',
+                name,
+            )
+            for name in perceptual_names
+        }
+        perceptual_confidence_paired_ci = {
+            name: paired_group_delta(
+                perceptual_records_by_group,
+                'diffusion_confidence_routed',
+                'deterministic',
+                name,
+            )
+            for name in perceptual_names
+        }
         perceptual_non_worse = all(
-            value <= 0.0 for value in perceptual_same_delta.values()
+            value['high'] <= 0.0
+            for value in perceptual_same_paired_ci.values()
         )
         perceptual_strictly_better = any(
-            value < 0.0 for value in perceptual_same_delta.values()
+            value['high'] < 0.0
+            for value in perceptual_same_paired_ci.values()
         )
         perceptual_gate = (
             'PASS'
@@ -715,9 +837,16 @@ def main():
         'perceptual': {
             'availability': perceptual_availability,
             'metrics': perceptual_summaries,
+            'by_qp': perceptual_by_qp,
             'diffusion_same_minus_deterministic': perceptual_same_delta,
             'diffusion_confidence_minus_deterministic': (
                 perceptual_confidence_delta
+            ),
+            'diffusion_same_minus_deterministic_paired_95ci': (
+                perceptual_same_paired_ci
+            ),
+            'diffusion_confidence_minus_deterministic_paired_95ci': (
+                perceptual_confidence_paired_ci
             ),
             'gate': perceptual_gate,
         },
@@ -856,6 +985,34 @@ def main():
                 )
             )
         )
+        print(
+            'diffusion-deterministic perceptual paired 95% CI: {}'.format(
+                ', '.join(
+                    '{} {:+.8f} [{:+.8f}, {:+.8f}] (n={})'.format(
+                        name,
+                        perceptual_same_paired_ci[name]['mean'],
+                        perceptual_same_paired_ci[name]['low'],
+                        perceptual_same_paired_ci[name]['high'],
+                        perceptual_same_paired_ci[name]['n'],
+                    )
+                    for name in perceptual_names
+                )
+            )
+        )
+        print(
+            'confidence-deterministic perceptual paired 95% CI: {}'.format(
+                ', '.join(
+                    '{} {:+.8f} [{:+.8f}, {:+.8f}] (n={})'.format(
+                        name,
+                        perceptual_confidence_paired_ci[name]['mean'],
+                        perceptual_confidence_paired_ci[name]['low'],
+                        perceptual_confidence_paired_ci[name]['high'],
+                        perceptual_confidence_paired_ci[name]['n'],
+                    )
+                    for name in perceptual_names
+                )
+            )
+        )
     print('perceptual continuation gate: {}'.format(perceptual_gate))
     for qp_value, qp_methods in by_qp.items():
         qp_delta = delta(
@@ -872,6 +1029,25 @@ def main():
                 qp_delta['gradient_mae'],
             )
         )
+        if qp_value in perceptual_by_qp:
+            qp_perceptual = perceptual_by_qp[qp_value]
+            print(
+                'QP{} diffusion-deterministic perceptual: {}'.format(
+                    qp_value,
+                    ', '.join(
+                        '{} {:+.8f}'.format(
+                            name,
+                            (
+                                qp_perceptual[
+                                    'diffusion_same_region'
+                                ][name] -
+                                qp_perceptual['deterministic'][name]
+                            ),
+                        )
+                        for name in perceptual_names
+                    ),
+                )
+            )
     print('continuation gate: {}'.format(continuation_gate))
     if args.report_path:
         report_directory = os.path.dirname(args.report_path)
