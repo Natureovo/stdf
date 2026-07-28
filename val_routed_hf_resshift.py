@@ -78,9 +78,42 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        '--model_tile_size',
+        type=int,
+        default=128,
+        help=(
+            'Overlapping score-model tile size for full-frame inference. '
+            'Use 0 to run the official U-Net on the whole frame at once.'
+        ),
+    )
+    parser.add_argument(
+        '--model_tile_overlap',
+        type=int,
+        default=32,
+        help='Overlap between score-model inference tiles.',
+    )
+    parser.add_argument(
         '--enable_perceptual',
         action='store_true',
         help='Evaluate optional LPIPS and DISTS metrics when installed.',
+    )
+    parser.add_argument(
+        '--psnr_noninferiority_margin',
+        type=float,
+        default=0.02,
+        help='Allowed RGB PSNR loss for the final routed output in dB.',
+    )
+    parser.add_argument(
+        '--ssim_noninferiority_margin',
+        type=float,
+        default=0.002,
+        help='Allowed SSIM loss for the final routed output.',
+    )
+    parser.add_argument(
+        '--temporal_noninferiority_margin',
+        type=float,
+        default=0.0001,
+        help='Allowed increase in temporal difference error.',
     )
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--report_path', default=None)
@@ -284,9 +317,16 @@ def confidence_interval(values):
     }
 
 
-def paired_group_delta(group_records, left, right, metric_name):
+def paired_group_delta(
+        group_records,
+        left,
+        right,
+        metric_name,
+        group_filter=None):
     deltas = []
-    for method_records in group_records.values():
+    for group_key, method_records in group_records.items():
+        if group_filter is not None and not group_filter(group_key):
+            continue
         left_values = [
             record[metric_name] for record in method_records[left]
         ]
@@ -295,7 +335,7 @@ def paired_group_delta(group_records, left, right, metric_name):
         ]
         if len(left_values) != len(right_values):
             raise ValueError(
-                'Unpaired perceptual values for {} and {}.'.format(
+                'Unpaired metric values for {} and {}.'.format(
                     left,
                     right,
                 )
@@ -307,27 +347,109 @@ def paired_group_delta(group_records, left, right, metric_name):
     return confidence_interval(deltas)
 
 
-def perceptual_gate_status(pixel_delta, paired_intervals):
-    if (
-            pixel_delta['rgb_psnr'] < -0.02 or
-            pixel_delta['ssim'] < -0.002):
-        return 'STOP'
-    if any(
+def paired_metric_intervals(
+        group_records,
+        left,
+        right,
+        metric_names,
+        group_filter=None):
+    return {
+        metric_name: paired_group_delta(
+            group_records,
+            left,
+            right,
+            metric_name,
+            group_filter=group_filter,
+        )
+        for metric_name in metric_names
+    }
+
+
+def perceptual_gate_status(
+        pixel_delta,
+        pixel_intervals,
+        paired_intervals,
+        psnr_margin,
+        ssim_margin):
+    pixel_statuses = []
+    for metric_name, margin in (
+            ('rgb_psnr', psnr_margin),
+            ('ssim', ssim_margin)):
+        interval = pixel_intervals.get(metric_name)
+        if interval and interval['n']:
+            if interval['low'] >= -float(margin):
+                pixel_statuses.append('PASS')
+            elif interval['high'] < -float(margin):
+                pixel_statuses.append('STOP')
+            else:
+                pixel_statuses.append('INCONCLUSIVE')
+        elif pixel_delta[metric_name] < -float(margin):
+            pixel_statuses.append('STOP')
+        else:
+            pixel_statuses.append('INCONCLUSIVE')
+
+    if not paired_intervals:
+        perceptual_status = 'NOT_RUN'
+    elif any(
             interval['low'] > 0.0
             for interval in paired_intervals.values()):
+        perceptual_status = 'STOP'
+    elif all(
+            interval['high'] <= 0.0
+            for interval in paired_intervals.values()):
+        perceptual_status = 'PASS'
+    else:
+        perceptual_status = 'INCONCLUSIVE'
+    return combine_gate_status(
+        *pixel_statuses,
+        perceptual_status,
+    )
+
+
+def noninferiority_status(interval, margin):
+    if interval['n'] == 0:
+        return 'NOT_RUN'
+    if interval['high'] <= float(margin):
+        return 'PASS'
+    if interval['low'] > float(margin):
         return 'STOP'
-    if (
-            paired_intervals and
-            all(
-                interval['high'] <= 0.0
-                for interval in paired_intervals.values()
-            ) and
-            any(
-                interval['high'] < 0.0
-                for interval in paired_intervals.values()
-            )):
+    return 'INCONCLUSIVE'
+
+
+def combine_gate_status(*statuses):
+    active = [status for status in statuses if status != 'NOT_RUN']
+    if not active:
+        return 'NOT_RUN'
+    if 'STOP' in active:
+        return 'STOP'
+    if all(status == 'PASS' for status in active):
         return 'PASS'
     return 'INCONCLUSIVE'
+
+
+def route_protection_status(intervals):
+    checks = (
+        ('rgb_psnr', 'higher'),
+        ('ssim', 'higher'),
+        ('highfreq_mae', 'lower'),
+        ('gradient_mae', 'lower'),
+    )
+    statuses = []
+    for metric_name, direction in checks:
+        interval = intervals[metric_name]
+        if interval['n'] == 0:
+            statuses.append('NOT_RUN')
+        elif direction == 'higher' and interval['low'] >= 0.0:
+            statuses.append('PASS')
+        elif direction == 'lower' and interval['high'] <= 0.0:
+            statuses.append('PASS')
+        elif direction == 'higher' and interval['high'] < 0.0:
+            statuses.append('STOP')
+        elif direction == 'lower' and interval['low'] > 0.0:
+            statuses.append('STOP')
+        else:
+            statuses.append('INCONCLUSIVE')
+    return combine_gate_status(*statuses)
 
 
 def temporal_error(previous, current, previous_gt, current_gt):
@@ -399,10 +521,32 @@ def center_crop_pair(clip, gt, crop_size):
     )
 
 
+def group_summaries(group_records):
+    summaries = []
+    for (video_name, qp_value), method_records in sorted(
+            group_records.items()):
+        summaries.append({
+            'video': video_name,
+            'qp': int(qp_value),
+            'methods': {
+                method_name: average(records)
+                for method_name, records in method_records.items()
+                if records
+            },
+        })
+    return summaries
+
+
 def main():
     args = parse_args()
     if args.diffusion_candidates < 2:
         raise ValueError('--diffusion_candidates must be at least 2.')
+    for name in (
+            'psnr_noninferiority_margin',
+            'ssim_noninferiority_margin',
+            'temporal_noninferiority_margin'):
+        if getattr(args, name) < 0:
+            raise ValueError('--{} must be non-negative.'.format(name))
     with open(args.opt_path, 'r', encoding='utf-8') as fp:
         opts = yaml.load(fp, Loader=yaml.FullLoader)
     split_opts = opts['dataset'][args.split]
@@ -451,6 +595,14 @@ def main():
         args.target_mode,
         device,
     )
+    deterministic.configure_inference_tiling(
+        args.model_tile_size,
+        args.model_tile_overlap,
+    )
+    diffusion.configure_inference_tiling(
+        args.model_tile_size,
+        args.model_tile_overlap,
+    )
     perceptual_models, perceptual_availability = (
         load_optional_perceptual_models(
             device,
@@ -479,11 +631,28 @@ def main():
         'diffusion_t0',
         'diffusion_mean_same_region',
         'diffusion_same_region',
+        'diffusion_confidence_only',
         'diffusion_confidence_routed',
+    )
+    route_methods = {
+        'need_only': 'diffusion_same_region',
+        'confidence_only': 'diffusion_confidence_only',
+        'need_and_confidence': 'diffusion_confidence_routed',
+    }
+    pixel_metric_names = (
+        'rgb_psnr',
+        'y_psnr',
+        'chroma_psnr',
+        'ssim',
+        'highfreq_mae',
+        'gradient_mae',
     )
     records = {name: [] for name in method_names}
     perceptual_records = {name: [] for name in method_names}
     records_by_qp = defaultdict(
+        lambda: {name: [] for name in method_names}
+    )
+    records_by_group = defaultdict(
         lambda: {name: [] for name in method_names}
     )
     perceptual_records_by_qp = defaultdict(
@@ -495,7 +664,11 @@ def main():
     detail_records = []
     candidate_diagnostic_records = []
     route_records = []
+    route_records_by_group = defaultdict(list)
     temporal_records = defaultdict(
+        lambda: {name: [] for name in method_names}
+    )
+    temporal_records_by_group = defaultdict(
         lambda: {name: [] for name in method_names}
     )
     previous_by_video_qp = {}
@@ -602,6 +775,18 @@ def main():
                 mode='bilinear',
                 align_corners=False,
             )
+            confidence_only_routing = foundation.router(
+                torch.ones_like(need),
+                pixel_confidence,
+            )
+            diffusion_confidence_only_image, _ = (
+                reconstruct_routed_detail(
+                    fidelity,
+                    diffusion_detail,
+                    confidence_only_routing['diffusion_weight'],
+                    chroma_scale=diffusion.chroma_scale,
+                )
+            )
             confidence_routing = foundation.router(
                 need,
                 pixel_confidence,
@@ -619,6 +804,9 @@ def main():
                 'diffusion_t0': diffusion_t0_image,
                 'diffusion_mean_same_region': diffusion_mean_image,
                 'diffusion_same_region': diffusion_same_image,
+                'diffusion_confidence_only': (
+                    diffusion_confidence_only_image
+                ),
                 'diffusion_confidence_routed': diffusion_confidence_image,
             }
             perceptual_group = (video_name, qp_value)
@@ -626,6 +814,9 @@ def main():
                 metric = method_metrics(image, gt)
                 records[method_name].append(metric)
                 records_by_qp[qp_value][method_name].append(metric)
+                records_by_group[
+                    perceptual_group
+                ][method_name].append(metric)
                 if perceptual_names:
                     perceptual_metric = perceptual_metrics(
                         perceptual_models,
@@ -710,7 +901,7 @@ def main():
                     metric['gradient_mae'] for metric in candidate_metrics
                 ),
             })
-            route_records.append({
+            route_record = {
                 'need_mean': float(need.mean()),
                 'need_region_area': float(
                     same_routing['need_region'].mean()
@@ -719,7 +910,13 @@ def main():
                     same_routing['diffusion_weight'].mean()
                 ),
                 'confidence_mean': float(pixel_confidence.mean()),
+                'confidence_only_write_area': float(
+                    confidence_only_routing['diffusion_weight'].mean()
+                ),
                 'confidence_write_area': float(
+                    confidence_routing['diffusion_weight'].mean()
+                ),
+                'need_confidence_write_area': float(
                     confidence_routing['diffusion_weight'].mean()
                 ),
                 'consensus_candidate_index': float(
@@ -736,21 +933,37 @@ def main():
                     diffusion_same_image,
                     same_routing['diffusion_weight'],
                 ),
-            })
+                'outside_identity_confidence_only': outside_identity_error(
+                    fidelity,
+                    diffusion_confidence_only_image,
+                    confidence_only_routing['diffusion_weight'],
+                ),
+                'outside_identity_need_confidence': outside_identity_error(
+                    fidelity,
+                    diffusion_confidence_image,
+                    confidence_routing['diffusion_weight'],
+                ),
+            }
+            route_records.append(route_record)
+            route_records_by_group[perceptual_group].append(route_record)
 
             frame_index = int(data_item['frame_idx'].reshape(-1)[0])
             temporal_key = (video_name, qp_value)
             previous = previous_by_video_qp.get(temporal_key)
             if previous is not None and previous['frame'] + 1 == frame_index:
                 for method_name, image in outputs.items():
-                    temporal_records[qp_value][method_name].append(
-                        temporal_error(
-                            previous[method_name],
-                            image,
-                            previous['gt'],
-                            gt,
-                        )
+                    value = temporal_error(
+                        previous[method_name],
+                        image,
+                        previous['gt'],
+                        gt,
                     )
+                    temporal_records[qp_value][method_name].append(value)
+                    temporal_records_by_group[
+                        temporal_key
+                    ][method_name].append({
+                        'temporal_error': value,
+                    })
             previous_by_video_qp[temporal_key] = {
                 'frame': frame_index,
                 'gt': gt.detach().clone(),
@@ -802,67 +1015,194 @@ def main():
         summaries['diffusion_confidence_routed'],
         summaries['deterministic'],
     )
-    comparable_psnr = (
-        diffusion_vs_deterministic['rgb_psnr'] >= -0.02
-    )
-    comparable_ssim = diffusion_vs_deterministic['ssim'] >= -0.001
-    better_hf = (
-        diffusion_vs_deterministic['highfreq_mae'] < 0.0 and
-        diffusion_vs_deterministic['gradient_mae'] <= 0.0
-    )
-    continuation_gate = (
-        'PASS' if comparable_psnr and comparable_ssim and better_hf
-        else 'STOP'
-    )
-    perceptual_same_delta = {}
-    perceptual_confidence_delta = {}
-    perceptual_same_paired_ci = {}
-    perceptual_confidence_paired_ci = {}
-    perceptual_same_gate = 'NOT_RUN'
-    perceptual_confidence_gate = 'NOT_RUN'
+    route_deltas = {
+        label: delta(summaries[method_name], summaries['deterministic'])
+        for label, method_name in route_methods.items()
+    }
+    route_paired_intervals = {
+        label: paired_metric_intervals(
+            records_by_group,
+            method_name,
+            'deterministic',
+            pixel_metric_names,
+        )
+        for label, method_name in route_methods.items()
+    }
+    route_perceptual_deltas = {}
+    route_perceptual_intervals = {}
+    route_perceptual_gates = {
+        label: 'NOT_RUN' for label in route_methods
+    }
     if perceptual_names:
-        perceptual_same_delta = {
-            name: (
-                perceptual_summaries['diffusion_same_region'][name] -
-                perceptual_summaries['deterministic'][name]
+        for label, method_name in route_methods.items():
+            route_perceptual_deltas[label] = {
+                name: (
+                    perceptual_summaries[method_name][name] -
+                    perceptual_summaries['deterministic'][name]
+                )
+                for name in perceptual_names
+            }
+            route_perceptual_intervals[label] = (
+                paired_metric_intervals(
+                    perceptual_records_by_group,
+                    method_name,
+                    'deterministic',
+                    perceptual_names,
+                )
             )
-            for name in perceptual_names
-        }
-        perceptual_confidence_delta = {
-            name: (
-                perceptual_summaries[
-                    'diffusion_confidence_routed'
-                ][name] -
-                perceptual_summaries['deterministic'][name]
+            route_perceptual_gates[label] = perceptual_gate_status(
+                route_deltas[label],
+                route_paired_intervals[label],
+                route_perceptual_intervals[label],
+                args.psnr_noninferiority_margin,
+                args.ssim_noninferiority_margin,
             )
-            for name in perceptual_names
-        }
-        perceptual_same_paired_ci = {
-            name: paired_group_delta(
-                perceptual_records_by_group,
-                'diffusion_same_region',
-                'deterministic',
-                name,
-            )
-            for name in perceptual_names
-        }
-        perceptual_confidence_paired_ci = {
-            name: paired_group_delta(
-                perceptual_records_by_group,
-                'diffusion_confidence_routed',
-                'deterministic',
-                name,
-            )
-            for name in perceptual_names
-        }
-        perceptual_same_gate = perceptual_gate_status(
-            diffusion_vs_deterministic,
-            perceptual_same_paired_ci,
+
+    temporal_route_intervals = {
+        label: paired_group_delta(
+            temporal_records_by_group,
+            method_name,
+            'deterministic',
+            'temporal_error',
         )
-        perceptual_confidence_gate = perceptual_gate_status(
-            confidence_vs_deterministic,
-            perceptual_confidence_paired_ci,
+        for label, method_name in route_methods.items()
+    }
+    temporal_route_gates = {
+        label: noninferiority_status(
+            interval,
+            args.temporal_noninferiority_margin,
         )
+        for label, interval in temporal_route_intervals.items()
+    }
+    final_perceptual_gate = route_perceptual_gates[
+        'need_and_confidence'
+    ]
+    final_temporal_gate = temporal_route_gates[
+        'need_and_confidence'
+    ]
+    continuation_gate = combine_gate_status(
+        final_perceptual_gate,
+        final_temporal_gate,
+    )
+    if (
+            continuation_gate == 'PASS' and
+            (
+                final_perceptual_gate == 'NOT_RUN' or
+                final_temporal_gate == 'NOT_RUN'
+            )):
+        continuation_gate = 'INCONCLUSIVE'
+
+    need_confidence_minus_need_only = delta(
+        summaries['diffusion_confidence_routed'],
+        summaries['diffusion_same_region'],
+    )
+    need_confidence_minus_need_only_intervals = (
+        paired_metric_intervals(
+            records_by_group,
+            'diffusion_confidence_routed',
+            'diffusion_same_region',
+            pixel_metric_names,
+        )
+    )
+    route_protection_gate = route_protection_status(
+        need_confidence_minus_need_only_intervals
+    )
+    routing_gate = combine_gate_status(
+        route_protection_gate,
+        continuation_gate,
+    )
+
+    by_qp_route_ablation = {}
+    for qp_text, qp_methods in by_qp.items():
+        qp_value = int(qp_text)
+        group_filter = (
+            lambda group_key, target_qp=qp_value:
+            int(group_key[1]) == target_qp
+        )
+        by_qp_route_ablation[qp_text] = {}
+        for label, method_name in route_methods.items():
+            route_entry = {
+                'minus_deterministic': delta(
+                    qp_methods[method_name],
+                    qp_methods['deterministic'],
+                ),
+                'paired_95ci': paired_metric_intervals(
+                    records_by_group,
+                    method_name,
+                    'deterministic',
+                    pixel_metric_names,
+                    group_filter=group_filter,
+                ),
+            }
+            if perceptual_names:
+                route_entry['perceptual_minus_deterministic'] = {
+                    name: (
+                        perceptual_by_qp[qp_text][method_name][name] -
+                        perceptual_by_qp[
+                            qp_text
+                        ]['deterministic'][name]
+                    )
+                    for name in perceptual_names
+                }
+                route_entry['perceptual_paired_95ci'] = (
+                    paired_metric_intervals(
+                        perceptual_records_by_group,
+                        method_name,
+                        'deterministic',
+                        perceptual_names,
+                        group_filter=group_filter,
+                    )
+                )
+            by_qp_route_ablation[qp_text][label] = route_entry
+
+    by_video_qp = group_summaries(records_by_group)
+    for group_summary in by_video_qp:
+        group_key = (
+            group_summary['video'],
+            group_summary['qp'],
+        )
+        perceptual_group_records = perceptual_records_by_group.get(
+            group_key,
+        )
+        if perceptual_group_records:
+            group_summary['perceptual'] = {
+                method_name: average(method_records)
+                for method_name, method_records
+                in perceptual_group_records.items()
+                if method_records
+            }
+        temporal_group_records = temporal_records_by_group.get(group_key)
+        if temporal_group_records:
+            group_summary['temporal'] = {
+                method_name: average(method_records)
+                for method_name, method_records
+                in temporal_group_records.items()
+                if method_records
+            }
+        group_summary['routing'] = average(
+            route_records_by_group[group_key]
+        )
+
+    perceptual_same_delta = route_perceptual_deltas.get(
+        'need_only',
+        {},
+    )
+    perceptual_confidence_delta = route_perceptual_deltas.get(
+        'need_and_confidence',
+        {},
+    )
+    perceptual_same_paired_ci = route_perceptual_intervals.get(
+        'need_only',
+        {},
+    )
+    perceptual_confidence_paired_ci = route_perceptual_intervals.get(
+        'need_and_confidence',
+        {},
+    )
+    perceptual_same_gate = route_perceptual_gates['need_only']
+    perceptual_confidence_gate = route_perceptual_gates[
+        'need_and_confidence'
+    ]
     result = {
         'protocol': {
             'split': args.split,
@@ -872,11 +1212,29 @@ def main():
             'diffusion_candidates': args.diffusion_candidates,
             'diffusion_noise_mode': args.diffusion_noise_mode,
             'eval_crop_size': int(args.eval_crop_size),
+            'model_tile_size': int(args.model_tile_size),
+            'model_tile_overlap': int(args.model_tile_overlap),
             'target_mode': args.target_mode,
             'perceptual_enabled': bool(args.enable_perceptual),
-            'same_region_primary_comparison': True,
+            'primary_comparison': (
+                'need_and_confidence_vs_deterministic'
+            ),
+            'same_region_primary_comparison': False,
             'region_quota': None,
+            'full_frame_padding_multiple': int(
+                diffusion.spatial_multiple
+            ),
+            'route_ablation_uses_shared_candidates': True,
             'router': router_opts,
+            'noninferiority_margins': {
+                'rgb_psnr': float(
+                    args.psnr_noninferiority_margin
+                ),
+                'ssim': float(args.ssim_noninferiority_margin),
+                'temporal_error': float(
+                    args.temporal_noninferiority_margin
+                ),
+            },
         },
         'checkpoints': {
             'fidelity': args.fidelity_ckpt,
@@ -889,6 +1247,34 @@ def main():
             confidence_vs_deterministic
         ),
         'by_qp': by_qp,
+        'by_video_qp': by_video_qp,
+        'route_ablation': {
+            'method_keys': route_methods,
+            'minus_deterministic': route_deltas,
+            'minus_deterministic_paired_95ci': (
+                route_paired_intervals
+            ),
+            'perceptual_minus_deterministic': (
+                route_perceptual_deltas
+            ),
+            'perceptual_minus_deterministic_paired_95ci': (
+                route_perceptual_intervals
+            ),
+            'temporal_minus_deterministic_paired_95ci': (
+                temporal_route_intervals
+            ),
+            'need_and_confidence_minus_need_only': (
+                need_confidence_minus_need_only
+            ),
+            'need_and_confidence_minus_need_only_paired_95ci': (
+                need_confidence_minus_need_only_intervals
+            ),
+            'by_qp': by_qp_route_ablation,
+            'perceptual_gates': route_perceptual_gates,
+            'temporal_gates': temporal_route_gates,
+            'protection_gate': route_protection_gate,
+            'routing_gate': routing_gate,
+        },
         'detail': average(detail_records),
         'gt_only_candidate_diagnostic': average(
             candidate_diagnostic_records,
@@ -915,11 +1301,20 @@ def main():
         'temporal': temporal_summary,
         'continuation_gate': {
             'result': continuation_gate,
+            'perceptual_result': final_perceptual_gate,
+            'temporal_result': final_temporal_gate,
+            'routing_result': routing_gate,
             'criteria': {
-                'rgb_psnr_delta_min': -0.02,
-                'ssim_delta_min': -0.001,
-                'highfreq_mae_delta_max': 0.0,
-                'gradient_mae_delta_max': 0.0,
+                'rgb_psnr_delta_min': -float(
+                    args.psnr_noninferiority_margin
+                ),
+                'ssim_delta_min': -float(
+                    args.ssim_noninferiority_margin
+                ),
+                'temporal_error_delta_max': float(
+                    args.temporal_noninferiority_margin
+                ),
+                'perceptual_paired_ci_high_max': 0.0,
             },
         },
     }
@@ -934,12 +1329,14 @@ def main():
         )
     )
     print(
-        'target/regions/candidates/crop/noise: '
-        '{}/input-driven/{}/{}/{}'.format(
+        'target/regions/candidates/crop/noise/tile-overlap: '
+        '{}/input-driven/{}/{}/{}/{}-{}'.format(
             args.target_mode,
             args.diffusion_candidates,
             args.eval_crop_size or 'full',
             args.diffusion_noise_mode,
+            args.model_tile_size or 'disabled',
+            args.model_tile_overlap,
         )
     )
     for method_name in method_names:
@@ -964,6 +1361,63 @@ def main():
             diffusion_vs_deterministic['ssim'],
             diffusion_vs_deterministic['highfreq_mae'],
             diffusion_vs_deterministic['gradient_mae'],
+        )
+    )
+    print('\n-- Shared-candidate route ablation --')
+    for label in route_methods:
+        route_delta = route_deltas[label]
+        route_ci = route_paired_intervals[label]
+        print(
+            '{} minus deterministic RGB/Y/SSIM/HF/gradient: '
+            '{:+.6f}/{:+.6f}/{:+.6f}/{:+.8f}/{:+.8f}'.format(
+                label,
+                route_delta['rgb_psnr'],
+                route_delta['y_psnr'],
+                route_delta['ssim'],
+                route_delta['highfreq_mae'],
+                route_delta['gradient_mae'],
+            )
+        )
+        print(
+            '{} paired 95% CI RGB/SSIM/HF/gradient: '
+            '[{:+.6f},{:+.6f}] / [{:+.6f},{:+.6f}] / '
+            '[{:+.8f},{:+.8f}] / [{:+.8f},{:+.8f}] '
+            '(groups={})'.format(
+                label,
+                route_ci['rgb_psnr']['low'],
+                route_ci['rgb_psnr']['high'],
+                route_ci['ssim']['low'],
+                route_ci['ssim']['high'],
+                route_ci['highfreq_mae']['low'],
+                route_ci['highfreq_mae']['high'],
+                route_ci['gradient_mae']['low'],
+                route_ci['gradient_mae']['high'],
+                route_ci['rgb_psnr']['n'],
+            )
+        )
+    protection_ci = need_confidence_minus_need_only_intervals
+    print(
+        'need+confidence minus need-only RGB/SSIM/HF/gradient: '
+        '{:+.6f}/{:+.6f}/{:+.8f}/{:+.8f}, protection gate {}'.format(
+            need_confidence_minus_need_only['rgb_psnr'],
+            need_confidence_minus_need_only['ssim'],
+            need_confidence_minus_need_only['highfreq_mae'],
+            need_confidence_minus_need_only['gradient_mae'],
+            route_protection_gate,
+        )
+    )
+    print(
+        'need+confidence protection paired 95% CI RGB/SSIM/HF/gradient: '
+        '[{:+.6f},{:+.6f}] / [{:+.6f},{:+.6f}] / '
+        '[{:+.8f},{:+.8f}] / [{:+.8f},{:+.8f}]'.format(
+            protection_ci['rgb_psnr']['low'],
+            protection_ci['rgb_psnr']['high'],
+            protection_ci['ssim']['low'],
+            protection_ci['ssim']['high'],
+            protection_ci['highfreq_mae']['low'],
+            protection_ci['highfreq_mae']['high'],
+            protection_ci['gradient_mae']['low'],
+            protection_ci['gradient_mae']['high'],
         )
     )
     detail_summary = result['detail']
@@ -995,18 +1449,22 @@ def main():
         )
     )
     print(
-        'need/write/confidence-write area, confidence: '
-        '{:.4f}/{:.4f}/{:.4f}/{:.4f}'.format(
+        'need/need-only/confidence-only/joint write area, confidence: '
+        '{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}'.format(
             route_summary['need_region_area'],
             route_summary['same_write_area'],
-            route_summary['confidence_write_area'],
+            route_summary['confidence_only_write_area'],
+            route_summary['need_confidence_write_area'],
             route_summary['confidence_mean'],
         )
     )
     print(
-        'outside identity max deterministic/diffusion: {:.3e}/{:.3e}'.format(
+        'outside identity max deterministic/need/confidence/joint: '
+        '{:.3e}/{:.3e}/{:.3e}/{:.3e}'.format(
             route_summary['outside_identity_deterministic'],
             route_summary['outside_identity_diffusion'],
+            route_summary['outside_identity_confidence_only'],
+            route_summary['outside_identity_need_confidence'],
         )
     )
     print(
@@ -1076,85 +1534,84 @@ def main():
                 )
             )
         )
-    print(
-        'independent same-region perceptual gate: {}'.format(
-            perceptual_same_gate,
-        )
-    )
-    print(
-        'final confidence-routed perceptual gate: {}'.format(
-            perceptual_confidence_gate,
-        )
-    )
-    for qp_value, qp_methods in by_qp.items():
-        qp_delta = delta(
-            qp_methods['diffusion_same_region'],
-            qp_methods['deterministic'],
-        )
-        print(
-            'QP{} diffusion-deterministic RGB/SSIM/HF/gradient: '
-            '{:+.6f}/{:+.6f}/{:+.8f}/{:+.8f}'.format(
-                qp_value,
-                qp_delta['rgb_psnr'],
-                qp_delta['ssim'],
-                qp_delta['highfreq_mae'],
-                qp_delta['gradient_mae'],
-            )
-        )
-        if qp_value in perceptual_by_qp:
-            qp_perceptual = perceptual_by_qp[qp_value]
+        for label in route_methods:
+            intervals = route_perceptual_intervals[label]
             print(
-                'QP{} diffusion/confidence-deterministic perceptual: '
-                '{} / {}'.format(
-                    qp_value,
+                '{} perceptual gate/paired 95% CI: {} | {}'.format(
+                    label,
+                    route_perceptual_gates[label],
                     ', '.join(
-                        '{} {:+.8f}'.format(
+                        '{} {:+.8f} [{:+.8f}, {:+.8f}]'.format(
                             name,
-                            (
-                                qp_perceptual[
-                                    'diffusion_same_region'
-                                ][name] -
-                                qp_perceptual['deterministic'][name]
-                            ),
-                        )
-                        for name in perceptual_names
-                    ),
-                    ', '.join(
-                        '{} {:+.8f}'.format(
-                            name,
-                            (
-                                qp_perceptual[
-                                    'diffusion_confidence_routed'
-                                ][name] -
-                                qp_perceptual['deterministic'][name]
-                            ),
+                            intervals[name]['mean'],
+                            intervals[name]['low'],
+                            intervals[name]['high'],
                         )
                         for name in perceptual_names
                     ),
                 )
             )
+    else:
+        print('perceptual route gates: NOT_RUN')
+    for qp_value, qp_methods in by_qp.items():
+        for label in route_methods:
+            qp_route = by_qp_route_ablation[qp_value][label]
+            qp_delta = qp_route['minus_deterministic']
+            print(
+                'QP{} {} minus deterministic RGB/SSIM/HF/gradient: '
+                '{:+.6f}/{:+.6f}/{:+.8f}/{:+.8f}'.format(
+                    qp_value,
+                    label,
+                    qp_delta['rgb_psnr'],
+                    qp_delta['ssim'],
+                    qp_delta['highfreq_mae'],
+                    qp_delta['gradient_mae'],
+                )
+            )
+            if perceptual_names:
+                qp_perceptual_delta = qp_route[
+                    'perceptual_minus_deterministic'
+                ]
+                print(
+                    'QP{} {} perceptual minus deterministic: {}'.format(
+                        qp_value,
+                        label,
+                        ', '.join(
+                            '{} {:+.8f}'.format(
+                                name,
+                                qp_perceptual_delta[name],
+                            )
+                            for name in perceptual_names
+                        ),
+                    )
+                )
     for qp_value, qp_temporal in temporal_summary.items():
         pairs = qp_temporal['pairs']
         deterministic_temporal = qp_temporal['deterministic']
-        diffusion_temporal = qp_temporal['diffusion_same_region']
-        confidence_temporal = qp_temporal[
-            'diffusion_confidence_routed'
-        ]
-        if (
-                pairs and
-                deterministic_temporal is not None and
-                diffusion_temporal is not None and
-                confidence_temporal is not None):
-            print(
-                'QP{} temporal diffusion/confidence-deterministic: '
-                '{:+.8f}/{:+.8f} ({} pairs)'.format(
-                    qp_value,
-                    diffusion_temporal - deterministic_temporal,
-                    confidence_temporal - deterministic_temporal,
-                    pairs,
+        if pairs and deterministic_temporal is not None:
+            for label, method_name in route_methods.items():
+                route_temporal = qp_temporal[method_name]
+                if route_temporal is None:
+                    continue
+                print(
+                    'QP{} {} temporal minus deterministic: '
+                    '{:+.8f} ({} pairs)'.format(
+                        qp_value,
+                        label,
+                        route_temporal - deterministic_temporal,
+                        pairs,
+                    )
                 )
-            )
-    print('continuation gate: {}'.format(continuation_gate))
+    print(
+        'route protection/final perceptual/final temporal/'
+        'continuation/routing gate: {}/{}/{}/{}/{}'.format(
+            route_protection_gate,
+            final_perceptual_gate,
+            final_temporal_gate,
+            continuation_gate,
+            routing_gate,
+        )
+    )
     if args.report_path:
         report_directory = os.path.dirname(args.report_path)
         if report_directory:

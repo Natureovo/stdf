@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 
-from net_routed_feature_diffusion import haar_detail
+from net_routed_feature_diffusion import (
+    ThreeStateRegionRouter,
+    haar_detail,
+)
 from net_routed_hf_resshift import (
     OfficialRoutedHaarResShift,
     consensus_medoid,
@@ -166,6 +169,16 @@ def main():
     )
     if not rgb_candidate_gap > 0:
         raise AssertionError('RGB proposal candidates should differ.')
+    model.configure_inference_tiling(tile_size=64, overlap=16)
+    tiled_rgb_detail = model.generate_rgb_detail_candidates(
+        fidelity[:1],
+        mode='deterministic',
+    )[0]
+    if tuple(tiled_rgb_detail.shape) != expected_shape:
+        raise AssertionError('Tiled full-frame detail shape mismatch.')
+    if not torch.isfinite(tiled_rgb_detail).all():
+        raise AssertionError('Tiled full-frame prediction is not finite.')
+    model.configure_inference_tiling(tile_size=0)
 
     zero = torch.zeros(1, 9, 8, 8)
     consensus, consensus_index, _ = consensus_medoid(
@@ -174,6 +187,52 @@ def main():
     )
     if int(consensus_index[0]) != 2 or consensus.shape != zero.shape:
         raise AssertionError('GT-free consensus medoid selection failed.')
+
+    router = ThreeStateRegionRouter(
+        need_low=0.35,
+        need_high=0.55,
+        confidence_min=0.55,
+        confidence_smooth_kernel=1,
+        growth_steps=0,
+        boundary_kernel=1,
+    )
+    route_need = torch.zeros(1, 1, 16, 16)
+    route_need[..., :, :8] = 1.0
+    route_confidence = torch.zeros_like(route_need)
+    route_confidence[..., :8, :] = 1.0
+    need_only = router(route_need, torch.ones_like(route_need))
+    confidence_only = router(
+        torch.ones_like(route_need),
+        route_confidence,
+    )
+    need_and_confidence = router(route_need, route_confidence)
+    expected_areas = (0.5, 0.5, 0.25)
+    actual_areas = tuple(
+        float(routing['diffusion_weight'].mean())
+        for routing in (
+            need_only,
+            confidence_only,
+            need_and_confidence,
+        )
+    )
+    if any(
+            abs(actual - expected) > 1e-6
+            for actual, expected in zip(actual_areas, expected_areas)):
+        raise AssertionError(
+            'Route ablation masks are incorrect: {}'.format(
+                actual_areas,
+            )
+        )
+    if torch.any(
+            need_and_confidence['diffusion_weight'] >
+            need_only['diffusion_weight']):
+        raise AssertionError('Joint route escaped the need-only support.')
+    if torch.any(
+            need_and_confidence['diffusion_weight'] >
+            confidence_only['diffusion_weight']):
+        raise AssertionError(
+            'Joint route escaped the confidence-only support.'
+        )
 
     print('Haar roundtrip max error: {:.3e}'.format(roundtrip_error))
     print('zero-route identity max error: {:.3e}'.format(identity_error))
@@ -186,7 +245,12 @@ def main():
     print('deterministic detail shape: {}'.format(expected_shape))
     print('two-candidate mean gap: {:.8f}'.format(candidate_gap))
     print('RGB proposal candidate gap: {:.8f}'.format(rgb_candidate_gap))
+    print('overlap-tiled full-frame inference: OK')
     print('consensus medoid check: OK')
+    print(
+        'need/confidence/joint route areas: '
+        '{:.2f}/{:.2f}/{:.2f}'.format(*actual_areas)
+    )
     print('routed detail ResShift checks: OK')
 
 

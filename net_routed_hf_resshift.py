@@ -371,10 +371,38 @@ class OfficialRoutedHaarResShift(nn.Module):
         self.band_clip = float(band_clip)
         self.chroma_scale = float(chroma_scale)
         self.spatial_multiple = int(spatial_multiple)
+        self.inference_tile_size = 0
+        self.inference_tile_overlap = 0
         if self.band_scale <= 0 or self.band_clip <= 0:
             raise ValueError('band_scale and band_clip must be positive.')
         if self.spatial_multiple < 1:
             raise ValueError('spatial_multiple must be positive.')
+
+    def configure_inference_tiling(self, tile_size=0, overlap=0):
+        tile_size = int(tile_size)
+        overlap = int(overlap)
+        if tile_size < 0:
+            raise ValueError('tile_size must be non-negative.')
+        if tile_size == 0:
+            self.inference_tile_size = 0
+            self.inference_tile_overlap = 0
+            return
+        if tile_size < self.spatial_multiple:
+            raise ValueError(
+                'tile_size must be at least spatial_multiple ({}).'.format(
+                    self.spatial_multiple,
+                )
+            )
+        if tile_size % self.spatial_multiple:
+            raise ValueError(
+                'tile_size must be divisible by spatial_multiple ({}).'.format(
+                    self.spatial_multiple,
+                )
+            )
+        if overlap < 0 or overlap >= tile_size:
+            raise ValueError('overlap must satisfy 0 <= overlap < tile_size.')
+        self.inference_tile_size = tile_size
+        self.inference_tile_overlap = overlap
 
     def normalize_band(self, band):
         return (band * self.band_scale).clamp(
@@ -399,8 +427,7 @@ class OfficialRoutedHaarResShift(nn.Module):
             1.0,
         )
 
-    def predict_target(self, state, condition, timesteps):
-        model_input = self.schedule.scale_model_input(state, timesteps)
+    def _predict_padded(self, model_input, condition, timesteps):
         height, width = model_input.shape[-2:]
         pad_bottom = (-height) % self.spatial_multiple
         pad_right = (-width) % self.spatial_multiple
@@ -426,6 +453,118 @@ class OfficialRoutedHaarResShift(nn.Module):
         )
         if pad_bottom or pad_right:
             prediction = prediction[..., :height, :width]
+        return prediction
+
+    @staticmethod
+    def _tile_starts(length, tile_size, overlap):
+        if length <= tile_size:
+            return [0]
+        step = tile_size - overlap
+        starts = list(range(0, length - tile_size + 1, step))
+        final_start = length - tile_size
+        if starts[-1] != final_start:
+            starts.append(final_start)
+        return starts
+
+    @staticmethod
+    def _tile_weight(
+            tile,
+            top,
+            left,
+            full_height,
+            full_width,
+            overlap):
+        tile_height, tile_width = tile.shape[-2:]
+        weight = tile.new_ones((1, 1, tile_height, tile_width))
+        vertical_blend = min(int(overlap), tile_height // 2)
+        horizontal_blend = min(int(overlap), tile_width // 2)
+        if vertical_blend:
+            ramp = torch.linspace(
+                0.0,
+                1.0,
+                vertical_blend + 2,
+                dtype=tile.dtype,
+                device=tile.device,
+            )[1:-1].view(1, 1, -1, 1)
+            if top > 0:
+                weight[..., :vertical_blend, :] *= ramp
+            if top + tile_height < full_height:
+                weight[..., -vertical_blend:, :] *= torch.flip(
+                    ramp,
+                    dims=(2,),
+                )
+        if horizontal_blend:
+            ramp = torch.linspace(
+                0.0,
+                1.0,
+                horizontal_blend + 2,
+                dtype=tile.dtype,
+                device=tile.device,
+            )[1:-1].view(1, 1, 1, -1)
+            if left > 0:
+                weight[..., :, :horizontal_blend] *= ramp
+            if left + tile_width < full_width:
+                weight[..., :, -horizontal_blend:] *= torch.flip(
+                    ramp,
+                    dims=(3,),
+                )
+        return weight
+
+    def _predict_tiled(self, model_input, condition, timesteps):
+        height, width = model_input.shape[-2:]
+        tile_size = self.inference_tile_size
+        overlap = self.inference_tile_overlap
+        top_starts = self._tile_starts(height, tile_size, overlap)
+        left_starts = self._tile_starts(width, tile_size, overlap)
+        prediction_sum = torch.zeros_like(model_input)
+        weight_sum = model_input.new_zeros(
+            (1, 1, height, width)
+        )
+        for top in top_starts:
+            bottom = min(top + tile_size, height)
+            for left in left_starts:
+                right = min(left + tile_size, width)
+                input_tile = model_input[..., top:bottom, left:right]
+                condition_tile = condition[..., top:bottom, left:right]
+                prediction_tile = self._predict_padded(
+                    input_tile,
+                    condition_tile,
+                    timesteps,
+                )
+                weight = self._tile_weight(
+                    prediction_tile,
+                    top,
+                    left,
+                    height,
+                    width,
+                    overlap,
+                )
+                prediction_sum[
+                    ..., top:bottom, left:right
+                ] += prediction_tile * weight
+                weight_sum[..., top:bottom, left:right] += weight
+        return prediction_sum / weight_sum.clamp_min(1e-8)
+
+    def predict_target(self, state, condition, timesteps):
+        model_input = self.schedule.scale_model_input(state, timesteps)
+        height, width = model_input.shape[-2:]
+        if (
+                self.inference_tile_size and
+                (
+                    height > self.inference_tile_size or
+                    width > self.inference_tile_size
+                )):
+            prediction = self._predict_tiled(
+                model_input,
+                condition,
+                timesteps,
+            )
+        else:
+            prediction = self._predict_padded(
+                model_input,
+                condition,
+                timesteps,
+            )
         return prediction.clamp(-self.band_clip, self.band_clip)
 
     def training_prediction(self, mode, target, condition):
