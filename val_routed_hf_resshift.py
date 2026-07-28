@@ -307,6 +307,29 @@ def paired_group_delta(group_records, left, right, metric_name):
     return confidence_interval(deltas)
 
 
+def perceptual_gate_status(pixel_delta, paired_intervals):
+    if (
+            pixel_delta['rgb_psnr'] < -0.02 or
+            pixel_delta['ssim'] < -0.002):
+        return 'STOP'
+    if any(
+            interval['low'] > 0.0
+            for interval in paired_intervals.values()):
+        return 'STOP'
+    if (
+            paired_intervals and
+            all(
+                interval['high'] <= 0.0
+                for interval in paired_intervals.values()
+            ) and
+            any(
+                interval['high'] < 0.0
+                for interval in paired_intervals.values()
+            )):
+        return 'PASS'
+    return 'INCONCLUSIVE'
+
+
 def temporal_error(previous, current, previous_gt, current_gt):
     return float(
         (
@@ -832,41 +855,13 @@ def main():
             )
             for name in perceptual_names
         }
-        perceptual_same_non_worse = all(
-            value['high'] <= 0.0
-            for value in perceptual_same_paired_ci.values()
+        perceptual_same_gate = perceptual_gate_status(
+            diffusion_vs_deterministic,
+            perceptual_same_paired_ci,
         )
-        perceptual_same_strictly_better = any(
-            value['high'] < 0.0
-            for value in perceptual_same_paired_ci.values()
-        )
-        perceptual_same_gate = (
-            'PASS'
-            if (
-                diffusion_vs_deterministic['rgb_psnr'] >= -0.02 and
-                diffusion_vs_deterministic['ssim'] >= -0.002 and
-                perceptual_same_non_worse and
-                perceptual_same_strictly_better
-            )
-            else 'STOP'
-        )
-        perceptual_confidence_non_worse = all(
-            value['high'] <= 0.0
-            for value in perceptual_confidence_paired_ci.values()
-        )
-        perceptual_confidence_strictly_better = any(
-            value['high'] < 0.0
-            for value in perceptual_confidence_paired_ci.values()
-        )
-        perceptual_confidence_gate = (
-            'PASS'
-            if (
-                confidence_vs_deterministic['rgb_psnr'] >= -0.02 and
-                confidence_vs_deterministic['ssim'] >= -0.002 and
-                perceptual_confidence_non_worse and
-                perceptual_confidence_strictly_better
-            )
-            else 'STOP'
+        perceptual_confidence_gate = perceptual_gate_status(
+            confidence_vs_deterministic,
+            perceptual_confidence_paired_ci,
         )
     result = {
         'protocol': {
