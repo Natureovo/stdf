@@ -114,6 +114,33 @@ def reconstruct_routed_detail(
     }
 
 
+def consensus_medoid(candidates, spatial_weight=None, eps=1e-8):
+    """Select one coherent, GT-free candidate nearest to all other samples."""
+    stacked = torch.stack(candidates, dim=0)
+    pairwise = (
+        stacked[:, None] - stacked[None, :]
+    ).abs().mean(dim=3)
+    if spatial_weight is not None:
+        weight = F.interpolate(
+            spatial_weight,
+            size=stacked.shape[-2:],
+            mode='area',
+        ).clamp(0.0, 1.0)
+        normalization = weight.sum(dim=(-2, -1)).clamp_min(float(eps))
+        pairwise = (
+            pairwise * weight[None, None, :, 0]
+        ).sum(dim=(-2, -1)) / normalization[None, None, :, 0]
+    else:
+        pairwise = pairwise.mean(dim=(-2, -1))
+    scores = pairwise.mean(dim=1)
+    indices = scores.argmin(dim=0)
+    selected = torch.stack([
+        stacked[int(indices[batch_index]), batch_index]
+        for batch_index in range(stacked.size(1))
+    ], dim=0)
+    return selected, indices, scores
+
+
 def _normalized_state_dict(state):
     prefixes = (
         'module.',

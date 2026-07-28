@@ -13,6 +13,7 @@ import dataset
 from net_routed_hf_resshift import (
     OfficialRoutedHaarResShift,
     build_official_score_model,
+    consensus_medoid,
     reconstruct_routed_detail,
 )
 from net_routed_feature_diffusion import haar_detail
@@ -156,8 +157,8 @@ def confidence_from_candidates(candidates, temperature=1.0, eps=1e-8):
     return confidence.clamp(0.0, 1.0), variance
 
 
-def outside_identity_error(fidelity, refined, need_region):
-    outside = 1.0 - need_region
+def outside_identity_error(fidelity, refined, write_weight):
+    outside = (write_weight <= 0).to(fidelity)
     difference = (refined - fidelity).abs() * outside
     return float(difference.max())
 
@@ -237,6 +238,8 @@ def main():
     method_names = (
         'fidelity',
         'deterministic',
+        'diffusion_t0',
+        'diffusion_mean_same_region',
         'diffusion_same_region',
         'diffusion_confidence_routed',
     )
@@ -245,6 +248,7 @@ def main():
         lambda: {name: [] for name in method_names}
     )
     detail_records = []
+    candidate_diagnostic_records = []
     route_records = []
     temporal_records = defaultdict(
         lambda: {name: [] for name in method_names}
@@ -276,16 +280,28 @@ def main():
                     mode='deterministic',
                 )[0]
             )
+            diffusion_t0_detail = (
+                diffusion.generate_all_orientations(
+                    fidelity,
+                    mode='deterministic',
+                )[0]
+            )
             diffusion_candidates = diffusion.generate_all_orientations(
                 fidelity,
                 mode='resshift',
                 candidates=args.diffusion_candidates,
                 seed=args.seed + sample_index * args.diffusion_candidates,
             )
-            diffusion_detail = torch.stack(
+            diffusion_mean_detail = torch.stack(
                 diffusion_candidates,
                 dim=0,
             ).mean(dim=0)
+            diffusion_detail, consensus_indices, consensus_scores = (
+                consensus_medoid(
+                    diffusion_candidates,
+                    spatial_weight=need,
+                )
+            )
 
             full_confidence = torch.ones_like(need)
             same_routing = foundation.router(need, full_confidence)
@@ -294,6 +310,18 @@ def main():
                 deterministic_detail,
                 same_routing['diffusion_weight'],
                 chroma_scale=deterministic.chroma_scale,
+            )
+            diffusion_t0_image, _ = reconstruct_routed_detail(
+                fidelity,
+                diffusion_t0_detail,
+                same_routing['diffusion_weight'],
+                chroma_scale=diffusion.chroma_scale,
+            )
+            diffusion_mean_image, _ = reconstruct_routed_detail(
+                fidelity,
+                diffusion_mean_detail,
+                same_routing['diffusion_weight'],
+                chroma_scale=diffusion.chroma_scale,
             )
             diffusion_same_image, _ = reconstruct_routed_detail(
                 fidelity,
@@ -326,6 +354,8 @@ def main():
             outputs = {
                 'fidelity': fidelity,
                 'deterministic': deterministic_image,
+                'diffusion_t0': diffusion_t0_image,
+                'diffusion_mean_same_region': diffusion_mean_image,
                 'diffusion_same_region': diffusion_same_image,
                 'diffusion_confidence_routed': diffusion_confidence_image,
             }
@@ -344,10 +374,30 @@ def main():
             normalization = (
                 band_weight.sum() * gt_detail.size(1)
             ).clamp_min(1.0)
+            candidate_detail_maes = [
+                float(
+                    (
+                        (candidate - gt_detail).abs() * band_weight
+                    ).sum() / normalization
+                )
+                for candidate in diffusion_candidates
+            ]
             detail_records.append({
                 'deterministic_mae': float(
                     (
                         (deterministic_detail - gt_detail).abs() *
+                        band_weight
+                    ).sum() / normalization
+                ),
+                'diffusion_t0_mae': float(
+                    (
+                        (diffusion_t0_detail - gt_detail).abs() *
+                        band_weight
+                    ).sum() / normalization
+                ),
+                'diffusion_mean_mae': float(
+                    (
+                        (diffusion_mean_detail - gt_detail).abs() *
                         band_weight
                     ).sum() / normalization
                 ),
@@ -357,7 +407,31 @@ def main():
                         band_weight
                     ).sum() / normalization
                 ),
+                'oracle_best_candidate_mae': min(candidate_detail_maes),
                 'candidate_variance': float(band_variance.mean()),
+            })
+            candidate_metrics = []
+            for candidate in diffusion_candidates:
+                candidate_image, _ = reconstruct_routed_detail(
+                    fidelity,
+                    candidate,
+                    same_routing['diffusion_weight'],
+                    chroma_scale=diffusion.chroma_scale,
+                )
+                candidate_metrics.append(method_metrics(candidate_image, gt))
+            candidate_diagnostic_records.append({
+                'oracle_best_rgb_psnr': max(
+                    metric['rgb_psnr'] for metric in candidate_metrics
+                ),
+                'oracle_best_ssim': max(
+                    metric['ssim'] for metric in candidate_metrics
+                ),
+                'oracle_best_highfreq_mae': min(
+                    metric['highfreq_mae'] for metric in candidate_metrics
+                ),
+                'oracle_best_gradient_mae': min(
+                    metric['gradient_mae'] for metric in candidate_metrics
+                ),
             })
             route_records.append({
                 'need_mean': float(need.mean()),
@@ -371,15 +445,19 @@ def main():
                 'confidence_write_area': float(
                     confidence_routing['diffusion_weight'].mean()
                 ),
+                'consensus_candidate_index': float(
+                    consensus_indices.float().mean()
+                ),
+                'consensus_score': float(consensus_scores.min(dim=0)[0].mean()),
                 'outside_identity_deterministic': outside_identity_error(
                     fidelity,
                     deterministic_image,
-                    same_routing['need_region'],
+                    same_routing['diffusion_weight'],
                 ),
                 'outside_identity_diffusion': outside_identity_error(
                     fidelity,
                     diffusion_same_image,
-                    same_routing['need_region'],
+                    same_routing['diffusion_weight'],
                 ),
             })
 
@@ -465,6 +543,9 @@ def main():
         'diffusion_minus_deterministic': diffusion_vs_deterministic,
         'by_qp': by_qp,
         'detail': average(detail_records),
+        'gt_only_candidate_diagnostic': average(
+            candidate_diagnostic_records,
+        ),
         'routing': average(route_records),
         'temporal': temporal_summary,
         'continuation_gate': {
@@ -518,13 +599,31 @@ def main():
         )
     )
     detail_summary = result['detail']
+    candidate_diagnostic = result['gt_only_candidate_diagnostic']
     route_summary = result['routing']
     print(
-        'routed detail MAE deterministic/diffusion, candidate variance: '
-        '{:.8f}/{:.8f}/{:.10f}'.format(
+        'routed detail MAE deterministic/t0/mean/consensus/oracle-best: '
+        '{:.8f}/{:.8f}/{:.8f}/{:.8f}/{:.8f}'.format(
             detail_summary['deterministic_mae'],
+            detail_summary['diffusion_t0_mae'],
+            detail_summary['diffusion_mean_mae'],
             detail_summary['diffusion_mae'],
+            detail_summary['oracle_best_candidate_mae'],
+        )
+    )
+    print(
+        'candidate variance/consensus score: {:.10f}/{:.8f}'.format(
             detail_summary['candidate_variance'],
+            route_summary['consensus_score'],
+        )
+    )
+    print(
+        'GT-only best candidate RGB PSNR/SSIM/HF/gradient: '
+        '{:.6f}/{:.6f}/{:.8f}/{:.8f}'.format(
+            candidate_diagnostic['oracle_best_rgb_psnr'],
+            candidate_diagnostic['oracle_best_ssim'],
+            candidate_diagnostic['oracle_best_highfreq_mae'],
+            candidate_diagnostic['oracle_best_gradient_mae'],
         )
     )
     print(
@@ -542,6 +641,21 @@ def main():
             route_summary['outside_identity_diffusion'],
         )
     )
+    for qp_value, qp_methods in by_qp.items():
+        qp_delta = delta(
+            qp_methods['diffusion_same_region'],
+            qp_methods['deterministic'],
+        )
+        print(
+            'QP{} diffusion-deterministic RGB/SSIM/HF/gradient: '
+            '{:+.6f}/{:+.6f}/{:+.8f}/{:+.8f}'.format(
+                qp_value,
+                qp_delta['rgb_psnr'],
+                qp_delta['ssim'],
+                qp_delta['highfreq_mae'],
+                qp_delta['gradient_mae'],
+            )
+        )
     print('continuation gate: {}'.format(continuation_gate))
     if args.report_path:
         report_directory = os.path.dirname(args.report_path)

@@ -4,6 +4,7 @@ import torch.nn as nn
 from net_routed_feature_diffusion import haar_detail
 from net_routed_hf_resshift import (
     OfficialRoutedHaarResShift,
+    consensus_medoid,
     inverse_haar,
     reconstruct_routed_detail,
 )
@@ -113,11 +114,20 @@ def main():
     if not candidate_gap > 0:
         raise AssertionError('Diffusion candidates should not be identical.')
 
+    zero = torch.zeros(1, 9, 8, 8)
+    consensus, consensus_index, _ = consensus_medoid(
+        [zero, zero + 1.0, zero + 0.1],
+        spatial_weight=torch.ones(1, 1, 16, 16),
+    )
+    if int(consensus_index[0]) != 2 or consensus.shape != zero.shape:
+        raise AssertionError('GT-free consensus medoid selection failed.')
+
     print('Haar roundtrip max error: {:.3e}'.format(roundtrip_error))
     print('zero-route identity max error: {:.3e}'.format(identity_error))
     print('score-model gradient sum: {:.6f}'.format(gradient_sum))
     print('deterministic detail shape: {}'.format(expected_shape))
     print('two-candidate mean gap: {:.8f}'.format(candidate_gap))
+    print('consensus medoid check: OK')
     print('routed finest-Haar ResShift checks: OK')
 
 
