@@ -738,6 +738,10 @@ def main():
         summaries['diffusion_same_region'],
         summaries['deterministic'],
     )
+    confidence_vs_deterministic = delta(
+        summaries['diffusion_confidence_routed'],
+        summaries['deterministic'],
+    )
     comparable_psnr = (
         diffusion_vs_deterministic['rgb_psnr'] >= -0.02
     )
@@ -754,7 +758,8 @@ def main():
     perceptual_confidence_delta = {}
     perceptual_same_paired_ci = {}
     perceptual_confidence_paired_ci = {}
-    perceptual_gate = 'NOT_RUN'
+    perceptual_same_gate = 'NOT_RUN'
+    perceptual_confidence_gate = 'NOT_RUN'
     if perceptual_names:
         perceptual_same_delta = {
             name: (
@@ -790,21 +795,39 @@ def main():
             )
             for name in perceptual_names
         }
-        perceptual_non_worse = all(
+        perceptual_same_non_worse = all(
             value['high'] <= 0.0
             for value in perceptual_same_paired_ci.values()
         )
-        perceptual_strictly_better = any(
+        perceptual_same_strictly_better = any(
             value['high'] < 0.0
             for value in perceptual_same_paired_ci.values()
         )
-        perceptual_gate = (
+        perceptual_same_gate = (
             'PASS'
             if (
                 diffusion_vs_deterministic['rgb_psnr'] >= -0.02 and
                 diffusion_vs_deterministic['ssim'] >= -0.002 and
-                perceptual_non_worse and
-                perceptual_strictly_better
+                perceptual_same_non_worse and
+                perceptual_same_strictly_better
+            )
+            else 'STOP'
+        )
+        perceptual_confidence_non_worse = all(
+            value['high'] <= 0.0
+            for value in perceptual_confidence_paired_ci.values()
+        )
+        perceptual_confidence_strictly_better = any(
+            value['high'] < 0.0
+            for value in perceptual_confidence_paired_ci.values()
+        )
+        perceptual_confidence_gate = (
+            'PASS'
+            if (
+                confidence_vs_deterministic['rgb_psnr'] >= -0.02 and
+                confidence_vs_deterministic['ssim'] >= -0.002 and
+                perceptual_confidence_non_worse and
+                perceptual_confidence_strictly_better
             )
             else 'STOP'
         )
@@ -829,6 +852,9 @@ def main():
         },
         'metrics': summaries,
         'diffusion_minus_deterministic': diffusion_vs_deterministic,
+        'confidence_routed_minus_deterministic': (
+            confidence_vs_deterministic
+        ),
         'by_qp': by_qp,
         'detail': average(detail_records),
         'gt_only_candidate_diagnostic': average(
@@ -848,7 +874,9 @@ def main():
             'diffusion_confidence_minus_deterministic_paired_95ci': (
                 perceptual_confidence_paired_ci
             ),
-            'gate': perceptual_gate,
+            'same_region_gate': perceptual_same_gate,
+            'confidence_routed_gate': perceptual_confidence_gate,
+            'gate': perceptual_confidence_gate,
         },
         'routing': average(route_records),
         'temporal': temporal_summary,
@@ -1013,7 +1041,16 @@ def main():
                 )
             )
         )
-    print('perceptual continuation gate: {}'.format(perceptual_gate))
+    print(
+        'independent same-region perceptual gate: {}'.format(
+            perceptual_same_gate,
+        )
+    )
+    print(
+        'final confidence-routed perceptual gate: {}'.format(
+            perceptual_confidence_gate,
+        )
+    )
     for qp_value, qp_methods in by_qp.items():
         qp_delta = delta(
             qp_methods['diffusion_same_region'],
@@ -1032,7 +1069,8 @@ def main():
         if qp_value in perceptual_by_qp:
             qp_perceptual = perceptual_by_qp[qp_value]
             print(
-                'QP{} diffusion-deterministic perceptual: {}'.format(
+                'QP{} diffusion/confidence-deterministic perceptual: '
+                '{} / {}'.format(
                     qp_value,
                     ', '.join(
                         '{} {:+.8f}'.format(
@@ -1046,6 +1084,39 @@ def main():
                         )
                         for name in perceptual_names
                     ),
+                    ', '.join(
+                        '{} {:+.8f}'.format(
+                            name,
+                            (
+                                qp_perceptual[
+                                    'diffusion_confidence_routed'
+                                ][name] -
+                                qp_perceptual['deterministic'][name]
+                            ),
+                        )
+                        for name in perceptual_names
+                    ),
+                )
+            )
+    for qp_value, qp_temporal in temporal_summary.items():
+        pairs = qp_temporal['pairs']
+        deterministic_temporal = qp_temporal['deterministic']
+        diffusion_temporal = qp_temporal['diffusion_same_region']
+        confidence_temporal = qp_temporal[
+            'diffusion_confidence_routed'
+        ]
+        if (
+                pairs and
+                deterministic_temporal is not None and
+                diffusion_temporal is not None and
+                confidence_temporal is not None):
+            print(
+                'QP{} temporal diffusion/confidence-deterministic: '
+                '{:+.8f}/{:+.8f} ({} pairs)'.format(
+                    qp_value,
+                    diffusion_temporal - deterministic_temporal,
+                    confidence_temporal - deterministic_temporal,
+                    pairs,
                 )
             )
     print('continuation gate: {}'.format(continuation_gate))
