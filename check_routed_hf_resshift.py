@@ -22,6 +22,12 @@ class TinyOfficialInterface(nn.Module):
     def forward(self, state, timesteps, lq=None):
         if lq is None:
             raise ValueError('The official interface requires lq.')
+        if state.size(-2) % 64 or state.size(-1) % 64:
+            raise ValueError(
+                'Official Swin input must be divisible by 64, got {}.'.format(
+                    tuple(state.shape[-2:]),
+                )
+            )
         timestep = timesteps.to(state).view(-1, 1, 1, 1)
         return self.body(torch.cat((state, lq), dim=1)) + timestep * 0.0
 
@@ -70,6 +76,7 @@ def main():
         band_scale=4.0,
         band_clip=1.0,
         chroma_scale=0.25,
+        spatial_multiple=64,
     )
     losses = model.training_losses(
         'resshift',

@@ -84,6 +84,7 @@ def build_generator(opts, resshift_root, official_checkpoint, strict=True):
         band_scale=model_opts.get('band_scale', 4.0),
         band_clip=model_opts.get('band_clip', 1.0),
         chroma_scale=model_opts.get('chroma_scale', 0.25),
+        spatial_multiple=model_opts.get('spatial_multiple', 64),
     )
     return generator, load_info
 

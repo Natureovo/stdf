@@ -319,15 +319,19 @@ class OfficialRoutedHaarResShift(nn.Module):
             schedule_opts=None,
             band_scale=4.0,
             band_clip=1.0,
-            chroma_scale=0.25):
+            chroma_scale=0.25,
+            spatial_multiple=64):
         super().__init__()
         self.score_model = score_model
         self.schedule = ResShiftBandSchedule(**(schedule_opts or {}))
         self.band_scale = float(band_scale)
         self.band_clip = float(band_clip)
         self.chroma_scale = float(chroma_scale)
+        self.spatial_multiple = int(spatial_multiple)
         if self.band_scale <= 0 or self.band_clip <= 0:
             raise ValueError('band_scale and band_clip must be positive.')
+        if self.spatial_multiple < 1:
+            raise ValueError('spatial_multiple must be positive.')
 
     def normalize_band(self, band):
         return (band * self.band_scale).clamp(
@@ -343,11 +347,31 @@ class OfficialRoutedHaarResShift(nn.Module):
 
     def predict_target(self, state, condition, timesteps):
         model_input = self.schedule.scale_model_input(state, timesteps)
+        height, width = model_input.shape[-2:]
+        pad_bottom = (-height) % self.spatial_multiple
+        pad_right = (-width) % self.spatial_multiple
+        if pad_bottom or pad_right:
+            pad_mode = 'reflect'
+            if height <= pad_bottom or width <= pad_right:
+                pad_mode = 'replicate'
+            padding = (0, pad_right, 0, pad_bottom)
+            model_input = F.pad(
+                model_input,
+                padding,
+                mode=pad_mode,
+            )
+            condition = F.pad(
+                condition,
+                padding,
+                mode=pad_mode,
+            )
         prediction = self.score_model(
             model_input,
             timesteps,
             lq=condition,
         )
+        if pad_bottom or pad_right:
+            prediction = prediction[..., :height, :width]
         return prediction.clamp(-self.band_clip, self.band_clip)
 
     def training_prediction(self, mode, target, condition):

@@ -113,6 +113,9 @@ network:
     band_scale: 4.0
     band_clip: 1.0
     chroma_scale: 0.25
+    # Three U-Net downsampling stages and 8x8 Swin windows require 64.
+    # Validation reflect-pads full-frame Haar bands and crops predictions back.
+    spatial_multiple: 64
 
 train:
   exp_name: rgb_fidelity_need_multiqp

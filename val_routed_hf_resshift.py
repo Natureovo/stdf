@@ -51,6 +51,15 @@ def parse_args():
         default='video_balanced',
     )
     parser.add_argument('--diffusion_candidates', type=int, default=3)
+    parser.add_argument(
+        '--eval_crop_size',
+        type=int,
+        default=0,
+        help=(
+            'Optional centered RGB crop for the short paired screen. '
+            'Use 0 for full-frame validation.'
+        ),
+    )
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--report_path', default=None)
     return parser.parse_args()
@@ -68,6 +77,7 @@ def build_trained_generator(opts, resshift_root, checkpoint_path, mode, device):
         band_scale=model_opts.get('band_scale', 4.0),
         band_clip=model_opts.get('band_clip', 1.0),
         chroma_scale=model_opts.get('chroma_scale', 0.25),
+        spatial_multiple=model_opts.get('spatial_multiple', 64),
     )
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     checkpoint_mode = checkpoint.get('model_mode')
@@ -152,6 +162,27 @@ def outside_identity_error(fidelity, refined, need_region):
     return float(difference.max())
 
 
+def center_crop_pair(clip, gt, crop_size):
+    crop_size = int(crop_size)
+    if crop_size <= 0:
+        return clip, gt
+    height, width = gt.shape[-2:]
+    if crop_size > height or crop_size > width:
+        raise ValueError(
+            'eval crop {} exceeds frame size {}x{}.'.format(
+                crop_size,
+                height,
+                width,
+            )
+        )
+    top = (height - crop_size) // 2
+    left = (width - crop_size) // 2
+    return (
+        clip[..., top:top + crop_size, left:left + crop_size],
+        gt[..., top:top + crop_size, left:left + crop_size],
+    )
+
+
 def main():
     args = parse_args()
     if args.diffusion_candidates < 2:
@@ -230,6 +261,11 @@ def main():
             clip = data_item['lq'].to(device)
             gt = data_item['gt'].to(device)
             qp = data_item['qp'].to(device)
+            clip, gt = center_crop_pair(
+                clip,
+                gt,
+                args.eval_crop_size,
+            )
             fidelity_outputs = foundation.forward_fidelity(clip, qp)
             fidelity = fidelity_outputs['fidelity']
             need = fidelity_outputs['need']
@@ -415,6 +451,7 @@ def main():
             'samples': len(indices),
             'dataset_samples': len(validation_dataset),
             'diffusion_candidates': args.diffusion_candidates,
+            'eval_crop_size': int(args.eval_crop_size),
             'same_region_primary_comparison': True,
             'region_quota': None,
             'router': router_opts,
@@ -451,8 +488,9 @@ def main():
         )
     )
     print(
-        'same input-driven regions, no area quota; candidates: {}'.format(
+        'same input-driven regions, no area quota; candidates/crop: {}/{}'.format(
             args.diffusion_candidates,
+            args.eval_crop_size or 'full',
         )
     )
     for method_name in method_names:
