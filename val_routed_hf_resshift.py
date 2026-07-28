@@ -60,6 +60,15 @@ def parse_args():
     )
     parser.add_argument('--diffusion_candidates', type=int, default=3)
     parser.add_argument(
+        '--diffusion_noise_mode',
+        choices=['independent', 'video_shared'],
+        default='independent',
+        help=(
+            'Use independent noise per frame or reuse candidate noise '
+            'within each video/QP stream for temporal screening.'
+        ),
+    )
+    parser.add_argument(
         '--eval_crop_size',
         type=int,
         default=0,
@@ -327,6 +336,25 @@ def outside_identity_error(fidelity, refined, write_weight):
     return float(difference.max())
 
 
+def diffusion_seed(
+        base_seed,
+        sample_index,
+        candidate_count,
+        noise_mode,
+        video_name,
+        qp_value,
+        stream_seeds):
+    independent_seed = (
+        int(base_seed) + int(sample_index) * int(candidate_count)
+    )
+    if noise_mode == 'independent':
+        return independent_seed
+    stream_key = (video_name, int(qp_value))
+    if stream_key not in stream_seeds:
+        stream_seeds[stream_key] = independent_seed
+    return stream_seeds[stream_key]
+
+
 def center_crop_pair(clip, gt, crop_size):
     crop_size = int(crop_size)
     if crop_size <= 0:
@@ -448,6 +476,7 @@ def main():
         lambda: {name: [] for name in method_names}
     )
     previous_by_video_qp = {}
+    diffusion_stream_seeds = {}
     router_opts = opts['network']['routed_feature'].get('router', {})
     confidence_temperature = opts['network']['routed_feature'].get(
         'score_variance',
@@ -459,6 +488,8 @@ def main():
             clip = data_item['lq'].to(device)
             gt = data_item['gt'].to(device)
             qp = data_item['qp'].to(device)
+            qp_value = int(round(float(qp.reshape(-1)[0])))
+            video_name = data_item['name_vid'][0]
             clip, gt = center_crop_pair(
                 clip,
                 gt,
@@ -490,7 +521,15 @@ def main():
                 args.target_mode,
                 mode='resshift',
                 candidates=args.diffusion_candidates,
-                seed=args.seed + sample_index * args.diffusion_candidates,
+                seed=diffusion_seed(
+                    args.seed,
+                    sample_index,
+                    args.diffusion_candidates,
+                    args.diffusion_noise_mode,
+                    video_name,
+                    qp_value,
+                    diffusion_stream_seeds,
+                ),
             )
             diffusion_mean_detail = torch.stack(
                 diffusion_candidates,
@@ -559,8 +598,6 @@ def main():
                 'diffusion_same_region': diffusion_same_image,
                 'diffusion_confidence_routed': diffusion_confidence_image,
             }
-            qp_value = int(round(float(qp.reshape(-1)[0])))
-            video_name = data_item['name_vid'][0]
             perceptual_group = (video_name, qp_value)
             for method_name, image in outputs.items():
                 metric = method_metrics(image, gt)
@@ -838,6 +875,7 @@ def main():
             'samples': len(indices),
             'dataset_samples': len(validation_dataset),
             'diffusion_candidates': args.diffusion_candidates,
+            'diffusion_noise_mode': args.diffusion_noise_mode,
             'eval_crop_size': int(args.eval_crop_size),
             'target_mode': args.target_mode,
             'perceptual_enabled': bool(args.enable_perceptual),
@@ -901,10 +939,12 @@ def main():
         )
     )
     print(
-        'target/regions/candidates/crop: {}/input-driven/{}/{}'.format(
+        'target/regions/candidates/crop/noise: '
+        '{}/input-driven/{}/{}/{}'.format(
             args.target_mode,
             args.diffusion_candidates,
             args.eval_crop_size or 'full',
+            args.diffusion_noise_mode,
         )
     )
     for method_name in method_names:
