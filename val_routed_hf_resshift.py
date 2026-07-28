@@ -33,7 +33,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             'Paired validation of deterministic and official ResShift '
-            'finest-Haar generation under exactly the same need regions.'
+            'detail generation under exactly the same need regions.'
         )
     )
     parser.add_argument(
@@ -44,6 +44,11 @@ def parse_args():
     parser.add_argument('--resshift_root', required=True)
     parser.add_argument('--deterministic_ckpt', required=True)
     parser.add_argument('--diffusion_ckpt', required=True)
+    parser.add_argument(
+        '--target_mode',
+        choices=['haar_band', 'rgb_detail_proposal'],
+        default='haar_band',
+    )
     parser.add_argument('--split', choices=['val', 'test'], default='val')
     parser.add_argument('--max_samples', type=int, default=50)
     parser.add_argument(
@@ -66,7 +71,13 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_trained_generator(opts, resshift_root, checkpoint_path, mode, device):
+def build_trained_generator(
+        opts,
+        resshift_root,
+        checkpoint_path,
+        mode,
+        target_mode,
+        device):
     model_opts = opts['network']['routed_hf_diffusion']
     score_model = build_official_score_model(
         model_opts['official_model'],
@@ -90,11 +101,44 @@ def build_trained_generator(opts, resshift_root, checkpoint_path, mode, device):
                 mode,
             )
         )
+    checkpoint_target_mode = checkpoint.get('target_mode', 'haar_band')
+    if checkpoint_target_mode != target_mode:
+        raise ValueError(
+            '{} contains target mode {}, expected {}.'.format(
+                checkpoint_path,
+                checkpoint_target_mode,
+                target_mode,
+            )
+        )
     model.load_state_dict(
         checkpoint.get('state_dict', checkpoint),
         strict=True,
     )
     return model.to(device).eval()
+
+
+def generate_details(
+        model,
+        fidelity,
+        target_mode,
+        mode,
+        candidates=1,
+        seed=7):
+    if target_mode == 'haar_band':
+        return model.generate_all_orientations(
+            fidelity,
+            mode=mode,
+            candidates=candidates,
+            seed=seed,
+        )
+    if target_mode == 'rgb_detail_proposal':
+        return model.generate_rgb_detail_candidates(
+            fidelity,
+            mode=mode,
+            candidates=candidates,
+            seed=seed,
+        )
+    raise ValueError('Unsupported target mode: {}'.format(target_mode))
 
 
 def method_metrics(image, gt):
@@ -225,6 +269,7 @@ def main():
         args.resshift_root,
         args.deterministic_ckpt,
         'deterministic',
+        args.target_mode,
         device,
     )
     diffusion = build_trained_generator(
@@ -232,6 +277,7 @@ def main():
         args.resshift_root,
         args.diffusion_ckpt,
         'resshift',
+        args.target_mode,
         device,
     )
 
@@ -275,19 +321,25 @@ def main():
             need = fidelity_outputs['need']
 
             deterministic_detail = (
-                deterministic.generate_all_orientations(
+                generate_details(
+                    deterministic,
                     fidelity,
+                    args.target_mode,
                     mode='deterministic',
                 )[0]
             )
             diffusion_t0_detail = (
-                diffusion.generate_all_orientations(
+                generate_details(
+                    diffusion,
                     fidelity,
+                    args.target_mode,
                     mode='deterministic',
                 )[0]
             )
-            diffusion_candidates = diffusion.generate_all_orientations(
+            diffusion_candidates = generate_details(
+                diffusion,
                 fidelity,
+                args.target_mode,
                 mode='resshift',
                 candidates=args.diffusion_candidates,
                 seed=args.seed + sample_index * args.diffusion_candidates,
@@ -530,6 +582,7 @@ def main():
             'dataset_samples': len(validation_dataset),
             'diffusion_candidates': args.diffusion_candidates,
             'eval_crop_size': int(args.eval_crop_size),
+            'target_mode': args.target_mode,
             'same_region_primary_comparison': True,
             'region_quota': None,
             'router': router_opts,
@@ -559,7 +612,7 @@ def main():
         },
     }
 
-    print('\n========== Routed finest-Haar ResShift validation ==========')
+    print('\n========== Routed detail ResShift validation ==========')
     print(
         'split/sampling, samples: {}/{}, {}/{}'.format(
             args.split,
@@ -569,7 +622,8 @@ def main():
         )
     )
     print(
-        'same input-driven regions, no area quota; candidates/crop: {}/{}'.format(
+        'target/regions/candidates/crop: {}/input-driven/{}/{}'.format(
+            args.target_mode,
             args.diffusion_candidates,
             args.eval_crop_size or 'full',
         )

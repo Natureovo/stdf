@@ -20,7 +20,7 @@ from train_rgb_fidelity import build_model as build_fidelity_foundation
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            'Train paired deterministic/ResShift finest-Haar generators '
+            'Train paired deterministic/ResShift detail generators '
             'behind a frozen RGB fidelity and detail-need stage.'
         )
     )
@@ -35,6 +35,11 @@ def parse_args():
         '--model_mode',
         choices=['deterministic', 'resshift'],
         required=True,
+    )
+    parser.add_argument(
+        '--target_mode',
+        choices=['haar_band', 'rgb_detail_proposal'],
+        default='haar_band',
     )
     parser.add_argument('--resume_ckpt', default=None)
     parser.add_argument('--num_iter', type=int, default=None)
@@ -112,7 +117,7 @@ def main():
     torch.backends.cudnn.benchmark = args.overfit_batches == 0
 
     timestamped_name = '{}_{}_{}'.format(
-        args.exp_name,
+        '{}_{}'.format(args.exp_name, args.target_mode),
         args.model_mode,
         utils.get_timestr(),
     )
@@ -189,6 +194,14 @@ def main():
                     args.model_mode,
                 )
             )
+        resume_target_mode = resume.get('target_mode', 'haar_band')
+        if resume_target_mode != args.target_mode:
+            raise ValueError(
+                'Resume target mode {} does not match requested mode {}.'.format(
+                    resume_target_mode,
+                    args.target_mode,
+                )
+            )
         model.load_state_dict(resume['state_dict'], strict=True)
         if 'optimizer' in resume:
             optimizer.load_state_dict(resume['optimizer'])
@@ -206,7 +219,7 @@ def main():
         if parameter.requires_grad
     )
     header = (
-        '========== Routed HF {} training ==========\n'
+        '========== Routed HF {}/{} training ==========\n'
         'iterations/start/iter-per-epoch: {}/{}/{}\n'
         'fidelity checkpoint: {}\n'
         'official checkpoint: {}\n'
@@ -215,6 +228,7 @@ def main():
         'AMP/batch: {}/{}\n'
         'output: {}\n'.format(
             args.model_mode,
+            args.target_mode,
             num_iter,
             start_iteration,
             iterations_per_epoch,
@@ -269,17 +283,29 @@ def main():
                 fidelity,
             )['need']
 
-        orientation = (iteration - 1) % 3
+        orientation = (
+            (iteration - 1) % 3
+            if args.target_mode == 'haar_band' else -1
+        )
         optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=use_amp):
-            losses = model.training_losses(
-                args.model_mode,
-                fidelity,
-                gt,
-                need_target,
-                orientation,
-                **loss_opts
-            )
+            if args.target_mode == 'haar_band':
+                losses = model.training_losses(
+                    args.model_mode,
+                    fidelity,
+                    gt,
+                    need_target,
+                    orientation,
+                    **loss_opts
+                )
+            else:
+                losses = model.training_rgb_detail_losses(
+                    args.model_mode,
+                    fidelity,
+                    gt,
+                    need_target,
+                    **loss_opts
+                )
         scaler.scale(losses['loss']).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(
@@ -292,8 +318,8 @@ def main():
         if iteration == 1 or iteration % interval_print == 0:
             message = (
                 'iter [{}/{}], epoch [{}], orientation {}, '
-                'loss {:.6f}, detail/image/hf/bg '
-                '{:.6f}/{:.6f}/{:.6f}/{:.6f}, '
+                'loss {:.6f}, detail/proposal/image/hf/bg '
+                '{:.6f}/{:.6f}/{:.6f}/{:.6f}/{:.6f}, '
                 'PSNR {:.4f}, need {:.4f}, timestep {:.2f}'.format(
                     iteration,
                     num_iter,
@@ -301,6 +327,7 @@ def main():
                     orientation,
                     scalar(losses['loss']),
                     scalar(losses['detail_loss']),
+                    scalar(losses['proposal_loss']),
                     scalar(losses['image_loss']),
                     scalar(losses['highfreq_loss']),
                     scalar(losses['background_identity']),
@@ -318,13 +345,14 @@ def main():
             torch.save({
                 'num_iter_accum': iteration,
                 'model_mode': args.model_mode,
+                'target_mode': args.target_mode,
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'opt_path': args.opt_path,
                 'fidelity_ckpt': args.fidelity_ckpt,
                 'official_ckpt': args.official_ckpt,
                 'official_load_info': official_load_info,
-                'phase': 'paired_routed_finest_haar_screen',
+                'phase': 'paired_routed_detail_screen',
             }, save_path)
             print('saved: {}'.format(save_path))
     log_fp.close()

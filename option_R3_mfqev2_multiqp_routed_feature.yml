@@ -79,7 +79,9 @@ network:
   # Phase two keeps the fidelity/need checkpoint frozen. The same official
   # ResShift Swin-UNet initialization is trained once as a deterministic
   # control and once with the four-step residual-shifting process. Both
-  # predict only the finest RGB Haar bands and use identical routed regions.
+  # The retained ablation predicts signed Haar bands directly. The main mode
+  # predicts a natural RGB proposal with fidelity lowpass and supervised GT
+  # detail, then writes only its finest Haar details into identical regions.
   routed_hf_diffusion:
     official_model:
       target: models.unet.UNetModelSwin
@@ -153,6 +155,9 @@ train:
       weight_decay: 0
     loss:
       detail_weight: 1.0
+      # RGB-detail mode learns a natural-image proposal whose lowpass comes
+      # from fidelity and whose supervised detail comes from GT.
+      proposal_weight: 0.5
       image_weight: 0.2
       highfreq_weight: 0.1
       background_identity_weight: 0.05

@@ -106,12 +106,28 @@ def reconstruct_routed_detail(
         mixed_detail,
         output_size=fidelity.shape[-2:],
     )
+    pixel_support = (pixel_weight > 0).to(reconstructed)
+    reconstructed = (
+        fidelity + pixel_support * (reconstructed - fidelity)
+    )
     return reconstructed.clamp(0.0, 1.0), {
         'base_detail': base_detail,
         'mixed_detail': mixed_detail,
         'band_weight': band_weight,
+        'pixel_support': pixel_support,
         'detail_delta': detail_delta,
     }
+
+
+def rgb_detail_proposal_target(fidelity, gt):
+    """Keep fidelity low frequencies and insert supervised GT Haar details."""
+    fidelity_lowpass, _ = haar_detail(fidelity)
+    _, gt_detail = haar_detail(gt)
+    return inverse_haar(
+        fidelity_lowpass,
+        gt_detail,
+        output_size=fidelity.shape[-2:],
+    ).clamp(0.0, 1.0)
 
 
 def consensus_medoid(candidates, spatial_weight=None, eps=1e-8):
@@ -338,7 +354,7 @@ class ResShiftBandSchedule(nn.Module):
 
 
 class OfficialRoutedHaarResShift(nn.Module):
-    """Generate only finest-scale RGB Haar details with an official U-Net."""
+    """Generate routed RGB detail proposals with an official ResShift U-Net."""
 
     def __init__(
             self,
@@ -371,6 +387,17 @@ class OfficialRoutedHaarResShift(nn.Module):
             -self.band_clip,
             self.band_clip,
         ) / self.band_scale
+
+    @staticmethod
+    def normalize_rgb(image):
+        return (image * 2.0 - 1.0).clamp(-1.0, 1.0)
+
+    @staticmethod
+    def denormalize_rgb(image):
+        return ((image.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(
+            0.0,
+            1.0,
+        )
 
     def predict_target(self, state, condition, timesteps):
         model_input = self.schedule.scale_model_input(state, timesteps)
@@ -437,6 +464,7 @@ class OfficialRoutedHaarResShift(nn.Module):
             need_target,
             orientation,
             detail_weight=1.0,
+            proposal_weight=0.5,
             image_weight=0.2,
             highfreq_weight=0.1,
             background_identity_weight=0.05,
@@ -508,12 +536,102 @@ class OfficialRoutedHaarResShift(nn.Module):
         return {
             'loss': total,
             'detail_loss': detail_loss,
+            'proposal_loss': total.new_zeros(()),
             'image_loss': image_loss,
             'highfreq_loss': highfreq_loss,
             'background_identity': background_identity,
             'prediction': prediction,
             'target': target_band,
             'condition': base_band,
+            'reconstructed': reconstructed,
+            'need_band': need_band,
+            'write_info': write_info,
+            'timesteps': process['timesteps'],
+        }
+
+    def training_rgb_detail_losses(
+            self,
+            mode,
+            fidelity,
+            gt,
+            need_target,
+            detail_weight=1.0,
+            proposal_weight=0.5,
+            image_weight=0.2,
+            highfreq_weight=0.1,
+            background_identity_weight=0.05,
+            need_boost=2.0,
+            eps=1e-3):
+        proposal_target = rgb_detail_proposal_target(fidelity, gt)
+        condition = self.normalize_rgb(fidelity)
+        target = self.normalize_rgb(proposal_target)
+        prediction, process = self.training_prediction(
+            mode,
+            target,
+            condition,
+        )
+        proposal = self.denormalize_rgb(prediction)
+        _, predicted_detail = haar_detail(proposal)
+        _, gt_detail = haar_detail(gt)
+        need_band = F.interpolate(
+            need_target,
+            size=predicted_detail.shape[-2:],
+            mode='area',
+        ).clamp(0.0, 1.0)
+        detail_weights = 1.0 + float(need_boost) * need_band
+        detail_error = torch.sqrt(
+            (predicted_detail - gt_detail).square() + float(eps) ** 2
+        )
+        detail_loss = (
+            detail_error * detail_weights
+        ).sum() / (
+            detail_weights.sum() * predicted_detail.size(1)
+        ).clamp_min(1.0)
+
+        pixel_weights = 1.0 + float(need_boost) * need_target
+        proposal_error = torch.sqrt(
+            (proposal - proposal_target).square() + float(eps) ** 2
+        )
+        proposal_loss = (
+            proposal_error * pixel_weights
+        ).sum() / (
+            pixel_weights.sum() * proposal.size(1)
+        ).clamp_min(1.0)
+        background_identity = (
+            (proposal - fidelity).abs() * (1.0 - need_target)
+        ).mean()
+
+        reconstructed, write_info = reconstruct_routed_detail(
+            fidelity,
+            predicted_detail,
+            need_target,
+            chroma_scale=self.chroma_scale,
+        )
+        image_loss = torch.sqrt(
+            (reconstructed - gt).square() + float(eps) ** 2
+        ).mean()
+        reconstructed_detail = haar_detail(reconstructed)[1]
+        highfreq_loss = torch.sqrt(
+            (reconstructed_detail - gt_detail).square() +
+            float(eps) ** 2
+        ).mean()
+        total = (
+            float(detail_weight) * detail_loss +
+            float(proposal_weight) * proposal_loss +
+            float(image_weight) * image_loss +
+            float(highfreq_weight) * highfreq_loss +
+            float(background_identity_weight) * background_identity
+        )
+        return {
+            'loss': total,
+            'detail_loss': detail_loss,
+            'proposal_loss': proposal_loss,
+            'image_loss': image_loss,
+            'highfreq_loss': highfreq_loss,
+            'background_identity': background_identity,
+            'prediction': proposal,
+            'target': proposal_target,
+            'condition': fidelity,
             'reconstructed': reconstructed,
             'need_band': need_band,
             'write_info': write_info,
@@ -537,6 +655,11 @@ class OfficialRoutedHaarResShift(nn.Module):
     @torch.no_grad()
     def sample_band(self, base_band, generator=None):
         condition = self.normalize_band(base_band)
+        state = self._sample_normalized(condition, generator=generator)
+        return self.denormalize_band(state)
+
+    @torch.no_grad()
+    def _sample_normalized(self, condition, generator=None):
         terminal_eta = float(self.schedule.etas[-1])
         noise = torch.randn(
             condition.shape,
@@ -578,7 +701,27 @@ class OfficialRoutedHaarResShift(nn.Module):
                 ) * noise
             else:
                 state = mean
-        return self.denormalize_band(state)
+        return state
+
+    def deterministic_rgb(self, fidelity):
+        condition = self.normalize_rgb(fidelity)
+        timesteps = torch.zeros(
+            condition.size(0),
+            dtype=torch.long,
+            device=condition.device,
+        )
+        prediction = self.predict_target(
+            condition,
+            condition,
+            timesteps,
+        )
+        return self.denormalize_rgb(prediction)
+
+    @torch.no_grad()
+    def sample_rgb(self, fidelity, generator=None):
+        condition = self.normalize_rgb(fidelity)
+        state = self._sample_normalized(condition, generator=generator)
+        return self.denormalize_rgb(state)
 
     def generate_all_orientations(
             self,
@@ -611,4 +754,28 @@ class OfficialRoutedHaarResShift(nn.Module):
             generated_candidates.append(
                 merge_haar_orientations(torch.stack(bands, dim=1))
             )
+        return generated_candidates
+
+    def generate_rgb_detail_candidates(
+            self,
+            fidelity,
+            mode,
+            candidates=1,
+            seed=7):
+        generated_candidates = []
+        candidate_count = 1 if mode == 'deterministic' else int(candidates)
+        for candidate_index in range(candidate_count):
+            generator = None
+            if mode == 'deterministic':
+                proposal = self.deterministic_rgb(fidelity)
+            elif mode == 'resshift':
+                generator = torch.Generator(device=fidelity.device)
+                generator.manual_seed(int(seed) + candidate_index)
+                proposal = self.sample_rgb(
+                    fidelity,
+                    generator=generator,
+                )
+            else:
+                raise ValueError('Unsupported mode: {}'.format(mode))
+            generated_candidates.append(haar_detail(proposal)[1])
         return generated_candidates

@@ -7,6 +7,7 @@ from net_routed_hf_resshift import (
     consensus_medoid,
     inverse_haar,
     reconstruct_routed_detail,
+    rgb_detail_proposal_target,
 )
 
 
@@ -65,6 +66,30 @@ def main():
             )
         )
 
+    partial_weight = torch.zeros_like(need)
+    partial_weight[..., :32] = 1.0
+    partial_output, _ = reconstruct_routed_detail(
+        fidelity,
+        generated,
+        partial_weight,
+    )
+    partial_outside_error = float(
+        (
+            (partial_output - fidelity).abs() *
+            (partial_weight == 0).to(fidelity)
+        ).max()
+    )
+    if partial_outside_error > 1e-6:
+        raise AssertionError(
+            'Routed output changed a zero-write pixel: {:.3e}'.format(
+                partial_outside_error,
+            )
+        )
+
+    proposal_target = rgb_detail_proposal_target(fidelity, gt)
+    if proposal_target.shape != fidelity.shape:
+        raise AssertionError('RGB detail proposal target shape mismatch.')
+
     model = OfficialRoutedHaarResShift(
         score_model=TinyOfficialInterface(),
         schedule_opts={
@@ -95,6 +120,16 @@ def main():
     if not gradient_sum > 0:
         raise AssertionError('No gradient reached the score model.')
 
+    rgb_losses = model.training_rgb_detail_losses(
+        'resshift',
+        fidelity,
+        gt,
+        need,
+    )
+    rgb_losses['loss'].backward()
+    if not torch.isfinite(rgb_losses['loss']):
+        raise AssertionError('RGB detail proposal loss is not finite.')
+
     deterministic = model.generate_all_orientations(
         fidelity[:1],
         mode='deterministic',
@@ -114,6 +149,24 @@ def main():
     if not candidate_gap > 0:
         raise AssertionError('Diffusion candidates should not be identical.')
 
+    rgb_deterministic = model.generate_rgb_detail_candidates(
+        fidelity[:1],
+        mode='deterministic',
+    )
+    rgb_candidates = model.generate_rgb_detail_candidates(
+        fidelity[:1],
+        mode='resshift',
+        candidates=2,
+        seed=17,
+    )
+    if tuple(rgb_deterministic[0].shape) != expected_shape:
+        raise AssertionError('RGB proposal detail shape mismatch.')
+    rgb_candidate_gap = float(
+        (rgb_candidates[0] - rgb_candidates[1]).abs().mean()
+    )
+    if not rgb_candidate_gap > 0:
+        raise AssertionError('RGB proposal candidates should differ.')
+
     zero = torch.zeros(1, 9, 8, 8)
     consensus, consensus_index, _ = consensus_medoid(
         [zero, zero + 1.0, zero + 0.1],
@@ -124,11 +177,17 @@ def main():
 
     print('Haar roundtrip max error: {:.3e}'.format(roundtrip_error))
     print('zero-route identity max error: {:.3e}'.format(identity_error))
+    print(
+        'partial-route outside identity max error: {:.3e}'.format(
+            partial_outside_error,
+        )
+    )
     print('score-model gradient sum: {:.6f}'.format(gradient_sum))
     print('deterministic detail shape: {}'.format(expected_shape))
     print('two-candidate mean gap: {:.8f}'.format(candidate_gap))
+    print('RGB proposal candidate gap: {:.8f}'.format(rgb_candidate_gap))
     print('consensus medoid check: OK')
-    print('routed finest-Haar ResShift checks: OK')
+    print('routed detail ResShift checks: OK')
 
 
 if __name__ == '__main__':

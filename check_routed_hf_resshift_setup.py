@@ -55,8 +55,16 @@ def main():
     with torch.no_grad():
         band = torch.zeros(1, 3, 64, 64, device=device)
         output = generator.deterministic_band(band)
+        rgb = torch.full(
+            (1, 3, 64, 64),
+            0.5,
+            device=device,
+        )
+        rgb_output = generator.deterministic_rgb(rgb)
     if output.shape != band.shape or not torch.isfinite(output).all():
         raise AssertionError('Official score-model smoke test failed.')
+    if rgb_output.shape != rgb.shape or not torch.isfinite(rgb_output).all():
+        raise AssertionError('Official RGB proposal smoke test failed.')
 
     parameters = sum(
         parameter.numel()
@@ -74,6 +82,11 @@ def main():
     )
     print('official score parameters: {}'.format(parameters))
     print('band smoke output abs: {:.8f}'.format(float(output.abs().mean())))
+    print(
+        'RGB proposal smoke output abs: {:.8f}'.format(
+            float(rgb_output.abs().mean()),
+        )
+    )
     print('status: OK')
 
 
