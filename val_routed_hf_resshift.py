@@ -66,6 +66,11 @@ def parse_args():
             'Use 0 for full-frame validation.'
         ),
     )
+    parser.add_argument(
+        '--enable_perceptual',
+        action='store_true',
+        help='Evaluate optional LPIPS and DISTS metrics when installed.',
+    )
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--report_path', default=None)
     return parser.parse_args()
@@ -160,6 +165,42 @@ def method_metrics(image, gt):
             (image_gradient[1] - gt_gradient[1]).abs().mean()
         )),
     }
+
+
+def load_optional_perceptual_models(device, enabled):
+    models = {'lpips': None, 'dists': None}
+    availability = {'lpips': False, 'dists': False}
+    if not enabled:
+        return models, availability
+    try:
+        import lpips
+        models['lpips'] = lpips.LPIPS(net='alex').to(device).eval()
+        availability['lpips'] = True
+    except Exception as error:
+        availability['lpips_error'] = str(error)
+    try:
+        from DISTS_pytorch import DISTS
+        models['dists'] = DISTS().to(device).eval()
+        availability['dists'] = True
+    except Exception as error:
+        availability['dists_error'] = str(error)
+    return models, availability
+
+
+def perceptual_metrics(models, image, gt):
+    result = {}
+    if models.get('lpips') is not None:
+        result['lpips'] = float(
+            models['lpips'](
+                gt * 2.0 - 1.0,
+                image * 2.0 - 1.0,
+            ).mean()
+        )
+    if models.get('dists') is not None:
+        result['dists'] = float(
+            models['dists'](gt, image).mean()
+        )
+    return result
 
 
 def average(records):
@@ -280,6 +321,27 @@ def main():
         args.target_mode,
         device,
     )
+    perceptual_models, perceptual_availability = (
+        load_optional_perceptual_models(
+            device,
+            args.enable_perceptual,
+        )
+    )
+    perceptual_names = tuple(
+        name for name in ('lpips', 'dists')
+        if perceptual_availability.get(name, False)
+    )
+    if args.enable_perceptual:
+        print(
+            'perceptual setup: {}'.format(
+                perceptual_availability,
+            )
+        )
+        if not perceptual_names:
+            raise RuntimeError(
+                'Perceptual evaluation was requested, but neither LPIPS '
+                'nor DISTS could be loaded.'
+            )
 
     method_names = (
         'fidelity',
@@ -290,6 +352,7 @@ def main():
         'diffusion_confidence_routed',
     )
     records = {name: [] for name in method_names}
+    perceptual_records = {name: [] for name in method_names}
     records_by_qp = defaultdict(
         lambda: {name: [] for name in method_names}
     )
@@ -416,6 +479,14 @@ def main():
                 metric = method_metrics(image, gt)
                 records[method_name].append(metric)
                 records_by_qp[qp_value][method_name].append(metric)
+                if perceptual_names:
+                    perceptual_records[method_name].append(
+                        perceptual_metrics(
+                            perceptual_models,
+                            image,
+                            gt,
+                        )
+                    )
 
             _, gt_detail = haar_detail(gt)
             band_weight = F.interpolate(
@@ -540,6 +611,11 @@ def main():
         method_name: average(method_records)
         for method_name, method_records in records.items()
     }
+    perceptual_summaries = {
+        method_name: average(method_records)
+        for method_name, method_records in perceptual_records.items()
+        if method_records
+    }
     by_qp = {}
     for qp_value, qp_methods in sorted(records_by_qp.items()):
         by_qp[str(qp_value)] = {
@@ -574,6 +650,42 @@ def main():
         'PASS' if comparable_psnr and comparable_ssim and better_hf
         else 'STOP'
     )
+    perceptual_same_delta = {}
+    perceptual_confidence_delta = {}
+    perceptual_gate = 'NOT_RUN'
+    if perceptual_names:
+        perceptual_same_delta = {
+            name: (
+                perceptual_summaries['diffusion_same_region'][name] -
+                perceptual_summaries['deterministic'][name]
+            )
+            for name in perceptual_names
+        }
+        perceptual_confidence_delta = {
+            name: (
+                perceptual_summaries[
+                    'diffusion_confidence_routed'
+                ][name] -
+                perceptual_summaries['deterministic'][name]
+            )
+            for name in perceptual_names
+        }
+        perceptual_non_worse = all(
+            value <= 0.0 for value in perceptual_same_delta.values()
+        )
+        perceptual_strictly_better = any(
+            value < 0.0 for value in perceptual_same_delta.values()
+        )
+        perceptual_gate = (
+            'PASS'
+            if (
+                diffusion_vs_deterministic['rgb_psnr'] >= -0.02 and
+                diffusion_vs_deterministic['ssim'] >= -0.002 and
+                perceptual_non_worse and
+                perceptual_strictly_better
+            )
+            else 'STOP'
+        )
     result = {
         'protocol': {
             'split': args.split,
@@ -583,6 +695,7 @@ def main():
             'diffusion_candidates': args.diffusion_candidates,
             'eval_crop_size': int(args.eval_crop_size),
             'target_mode': args.target_mode,
+            'perceptual_enabled': bool(args.enable_perceptual),
             'same_region_primary_comparison': True,
             'region_quota': None,
             'router': router_opts,
@@ -599,6 +712,15 @@ def main():
         'gt_only_candidate_diagnostic': average(
             candidate_diagnostic_records,
         ),
+        'perceptual': {
+            'availability': perceptual_availability,
+            'metrics': perceptual_summaries,
+            'diffusion_same_minus_deterministic': perceptual_same_delta,
+            'diffusion_confidence_minus_deterministic': (
+                perceptual_confidence_delta
+            ),
+            'gate': perceptual_gate,
+        },
         'routing': average(route_records),
         'temporal': temporal_summary,
         'continuation_gate': {
@@ -695,6 +817,46 @@ def main():
             route_summary['outside_identity_diffusion'],
         )
     )
+    print(
+        'perceptual availability: {}'.format(
+            perceptual_availability,
+        )
+    )
+    if perceptual_names:
+        for method_name in method_names:
+            values = perceptual_summaries[method_name]
+            print(
+                '{} perceptual: {}'.format(
+                    method_name,
+                    ', '.join(
+                        '{} {:.8f}'.format(name, values[name])
+                        for name in perceptual_names
+                    ),
+                )
+            )
+        print(
+            'diffusion-deterministic perceptual: {}'.format(
+                ', '.join(
+                    '{} {:+.8f}'.format(
+                        name,
+                        perceptual_same_delta[name],
+                    )
+                    for name in perceptual_names
+                )
+            )
+        )
+        print(
+            'confidence-deterministic perceptual: {}'.format(
+                ', '.join(
+                    '{} {:+.8f}'.format(
+                        name,
+                        perceptual_confidence_delta[name],
+                    )
+                    for name in perceptual_names
+                )
+            )
+        )
+    print('perceptual continuation gate: {}'.format(perceptual_gate))
     for qp_value, qp_methods in by_qp.items():
         qp_delta = delta(
             qp_methods['diffusion_same_region'],
