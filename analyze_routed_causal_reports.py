@@ -366,8 +366,6 @@ def format_interval(interval, digits=6):
 
 def main():
     args = parse_args()
-    if len(args.reports) < 2:
-        raise ValueError('At least two reports are required.')
     for name in ('psnr_margin', 'ssim_margin', 'temporal_margin'):
         if getattr(args, name) < 0:
             raise ValueError('--{} must be non-negative.'.format(name))
@@ -481,7 +479,12 @@ def main():
         'gates': gates,
     }
 
-    print('========== Combined routed causal analysis ==========')
+    title = (
+        'Combined routed causal analysis'
+        if len(loaded) > 1
+        else 'Routed causal analysis'
+    )
+    print('========== {} =========='.format(title))
     print(
         'reports/videos/video-QP groups: {}/{}/{}'.format(
             len(loaded),

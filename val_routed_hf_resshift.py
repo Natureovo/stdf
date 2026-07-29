@@ -52,6 +52,16 @@ def parse_args():
         default='haar_band',
     )
     parser.add_argument('--split', choices=['val', 'test'], default='val')
+    parser.add_argument(
+        '--dataset_root',
+        default=None,
+        help='Optional dataset root override for an external manifest.',
+    )
+    parser.add_argument(
+        '--manifest_path',
+        default=None,
+        help='Optional manifest override for frozen external validation.',
+    )
     parser.add_argument('--max_samples', type=int, default=50)
     parser.add_argument(
         '--sample_mode',
@@ -633,7 +643,11 @@ def main():
             raise ValueError('--{} must be non-negative.'.format(name))
     with open(args.opt_path, 'r', encoding='utf-8') as fp:
         opts = yaml.load(fp, Loader=yaml.FullLoader)
-    split_opts = opts['dataset'][args.split]
+    split_opts = dict(opts['dataset'][args.split])
+    if args.dataset_root is not None:
+        split_opts['root'] = args.dataset_root
+    if args.manifest_path is not None:
+        split_opts['manifest_path'] = args.manifest_path
     dataset_class = getattr(dataset, split_opts['type'])
     validation_dataset = dataset_class(
         split_opts,
@@ -1536,6 +1550,8 @@ def main():
     result = {
         'protocol': {
             'split': args.split,
+            'dataset_root': str(split_opts['root']),
+            'manifest_path': str(split_opts['manifest_path']),
             'sample_mode': args.sample_mode,
             'samples': len(indices),
             'dataset_samples': len(validation_dataset),
@@ -1694,6 +1710,10 @@ def main():
             len(validation_dataset),
         )
     )
+    print('dataset root/manifest: {}/{}'.format(
+        split_opts['root'],
+        split_opts['manifest_path'],
+    ))
     print(
         'sampled video-QP groups/count min-max: {}/{}-{}'.format(
             len(sampled_group_counts),

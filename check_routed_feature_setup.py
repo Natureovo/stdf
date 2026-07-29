@@ -15,6 +15,16 @@ def parse_args():
         default='option_R3_mfqev2_multiqp_routed_feature.yml',
     )
     parser.add_argument('--split', choices=['train', 'val', 'test'], default='train')
+    parser.add_argument(
+        '--dataset_root',
+        default=None,
+        help='Optional dataset root override for an external manifest.',
+    )
+    parser.add_argument(
+        '--manifest_path',
+        default=None,
+        help='Optional manifest override for frozen external validation.',
+    )
     return parser.parse_args()
 
 
@@ -22,7 +32,11 @@ def main():
     args = parse_args()
     with open(args.opt_path, 'r', encoding='utf-8') as fp:
         opts = yaml.load(fp, Loader=yaml.FullLoader)
-    split_opts = opts['dataset'][args.split]
+    split_opts = dict(opts['dataset'][args.split])
+    if args.dataset_root is not None:
+        split_opts['root'] = args.dataset_root
+    if args.manifest_path is not None:
+        split_opts['manifest_path'] = args.manifest_path
     dataset_cls = getattr(dataset, split_opts['type'])
     ds = dataset_cls(split_opts, radius=opts['network']['radius'])
     sample = ds[0]
@@ -47,6 +61,10 @@ def main():
     print('split/output mode: {}/{}'.format(
         args.split,
         split_opts.get('output_mode', 'stacked'),
+    ))
+    print('root/manifest: {}/{}'.format(
+        split_opts['root'],
+        split_opts['manifest_path'],
     ))
     print('videos/samples: {}/{}'.format(ds.get_vid_num(), len(ds)))
     print('QPs: {}'.format([int(qp) for qp in ds.qps]))
