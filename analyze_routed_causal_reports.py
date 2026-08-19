@@ -40,14 +40,26 @@ COMPARISONS = {
         'diffusion_confidence_routed',
         'diffusion_shifted_joint',
     ),
+    'location_vs_multi_shift': (
+        'diffusion_confidence_routed',
+        'diffusion_multi_shift_control',
+    ),
+    'location_vs_block_permutation': (
+        'diffusion_confidence_routed',
+        'diffusion_block_permutation_control',
+    ),
 }
 PROTOCOL_KEYS = (
     'target_mode',
     'diffusion_candidates',
     'diffusion_noise_mode',
+    'seed',
     'eval_crop_size',
     'model_tile_size',
     'model_tile_overlap',
+    'location_shift_controls',
+    'location_permutation_controls',
+    'location_block_size',
 )
 
 
@@ -177,9 +189,13 @@ def load_reports(paths):
 def collect_deltas(loaded_reports):
     collected = {
         comparison: {
-            'pixel': defaultdict(list),
-            'perceptual': defaultdict(list),
-            'temporal': defaultdict(list),
+            'pixel': {
+                metric: [] for metric in PIXEL_METRICS
+            },
+            'perceptual': {
+                metric: [] for metric in PERCEPTUAL_METRICS
+            },
+            'temporal': {'temporal_error': []},
         }
         for comparison in COMPARISONS
     }
@@ -442,11 +458,34 @@ def main():
             primary['location_vs_shifted'],
             args,
         ),
+        'location_vs_multi_shift': perceptual_noninferiority_gate(
+            primary['location_vs_multi_shift'],
+            args,
+        ),
+        'location_vs_block_permutation': (
+            perceptual_noninferiority_gate(
+                primary['location_vs_block_permutation'],
+                args,
+            )
+        ),
     }
-    gates['location'] = combine_statuses(
-        gates['location_vs_matched_need'],
-        gates['location_vs_shifted'],
+    new_location_statuses = (
+        gates['location_vs_multi_shift'],
+        gates['location_vs_block_permutation'],
     )
+    if all(status == 'NOT_RUN' for status in new_location_statuses):
+        location_protocol = 'legacy_single_shift'
+        gates['location'] = combine_statuses(
+            gates['location_vs_matched_need'],
+            gates['location_vs_shifted'],
+        )
+    else:
+        location_protocol = 'multi_placebo_primary'
+        gates['location'] = combine_statuses(
+            gates['location_vs_matched_need'],
+            gates['location_vs_multi_shift'],
+            gates['location_vs_block_permutation'],
+        )
     gates['causal'] = combine_statuses(
         gates['full_frame_perceptual'],
         gates['final_route'],
@@ -468,6 +507,7 @@ def main():
                 for source, groups in report_groups.items()
             },
             'model_protocol': protocol,
+            'location_gate_protocol': location_protocol,
             'noninferiority_margins': {
                 'rgb_psnr': args.psnr_margin,
                 'ssim': args.ssim_margin,

@@ -140,6 +140,30 @@ def parse_args():
         default=0.0001,
         help='Allowed increase in temporal difference error.',
     )
+    parser.add_argument(
+        '--location_shift_controls',
+        type=int,
+        default=4,
+        help=(
+            'Number of fixed non-zero translations used to test whether '
+            'the learned route location matters at unchanged write mass.'
+        ),
+    )
+    parser.add_argument(
+        '--location_permutation_controls',
+        type=int,
+        default=4,
+        help=(
+            'Number of deterministic block permutations used as '
+            'same-budget spatial placebos.'
+        ),
+    )
+    parser.add_argument(
+        '--location_block_size',
+        type=int,
+        default=16,
+        help='Block size for same-budget route permutation controls.',
+    )
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--report_path', default=None)
     return parser.parse_args()
@@ -521,16 +545,149 @@ def match_write_mass(source_weight, target_weight, eps=1e-8):
     return matched, scale
 
 
-def spatially_shift_weight(weight):
-    """Move an unchanged route to a deliberately wrong spatial location."""
+def spatially_shift_weight(weight, shift_y=None, shift_x=None):
+    """Move an unchanged route without changing its values or write mass."""
     height, width = weight.shape[-2:]
-    shift_y = max(1, height // 2) if height > 1 else 0
-    shift_x = max(1, width // 2) if width > 1 else 0
+    if shift_y is None:
+        shift_y = max(1, height // 2) if height > 1 else 0
+    if shift_x is None:
+        shift_x = max(1, width // 2) if width > 1 else 0
     return torch.roll(
         weight,
-        shifts=(shift_y, shift_x),
+        shifts=(int(shift_y), int(shift_x)),
         dims=(-2, -1),
     )
+
+
+def multi_shift_weights(weight, count):
+    """Return fixed translations that preserve route shape and exact mass."""
+    count = int(count)
+    if count <= 0:
+        return []
+    height, width = weight.shape[-2:]
+    fractions = (
+        (0.0, 0.25),
+        (0.0, 0.5),
+        (0.25, 0.0),
+        (0.5, 0.0),
+        (0.25, 0.25),
+        (0.25, 0.5),
+        (0.5, 0.25),
+        (0.5, 0.5),
+        (0.0, 0.75),
+        (0.75, 0.0),
+        (0.25, 0.75),
+        (0.75, 0.25),
+        (0.5, 0.75),
+        (0.75, 0.5),
+        (0.75, 0.75),
+    )
+    shifts = []
+    seen = set()
+    for fraction_y, fraction_x in fractions:
+        shift_y = int(round(height * fraction_y)) % max(height, 1)
+        shift_x = int(round(width * fraction_x)) % max(width, 1)
+        key = (shift_y, shift_x)
+        if key == (0, 0) or key in seen:
+            continue
+        seen.add(key)
+        shifts.append(key)
+        if len(shifts) == count:
+            break
+    if len(shifts) < count:
+        raise ValueError(
+            'Requested {} unique shifts, but only {} are available for '
+            'a {}x{} route.'.format(count, len(shifts), height, width)
+        )
+    return [
+        spatially_shift_weight(weight, shift_y, shift_x)
+        for shift_y, shift_x in shifts
+    ]
+
+
+def block_permute_weight(weight, block_size, seed):
+    """Permute equal-sized route blocks while preserving exact write mass."""
+    block_size = int(block_size)
+    if block_size <= 0:
+        raise ValueError('location block size must be positive.')
+    height, width = weight.shape[-2:]
+    block_rows = height // block_size
+    block_columns = width // block_size
+    block_count = block_rows * block_columns
+    if block_count < 2:
+        raise ValueError(
+            'Route {}x{} needs at least two {}x{} blocks.'.format(
+                height,
+                width,
+                block_size,
+                block_size,
+            )
+        )
+    core_height = block_rows * block_size
+    core_width = block_columns * block_size
+    core = weight[..., :core_height, :core_width]
+    batch, channels = core.shape[:2]
+    blocks = core.reshape(
+        batch,
+        channels,
+        block_rows,
+        block_size,
+        block_columns,
+        block_size,
+    ).permute(0, 1, 2, 4, 3, 5).reshape(
+        batch,
+        channels,
+        block_count,
+        block_size,
+        block_size,
+    )
+    permutation = np.random.RandomState(int(seed)).permutation(block_count)
+    permutation = torch.as_tensor(
+        permutation,
+        device=weight.device,
+        dtype=torch.long,
+    )
+    blocks = blocks.index_select(2, permutation)
+    permuted_core = blocks.reshape(
+        batch,
+        channels,
+        block_rows,
+        block_columns,
+        block_size,
+        block_size,
+    ).permute(0, 1, 2, 4, 3, 5).reshape(
+        batch,
+        channels,
+        core_height,
+        core_width,
+    )
+    result = weight.clone()
+    result[..., :core_height, :core_width] = permuted_core
+    return result
+
+
+def block_permutation_weights(weight, count, block_size, seed):
+    return [
+        block_permute_weight(
+            weight,
+            block_size,
+            int(seed) + control_index,
+        )
+        for control_index in range(int(count))
+    ]
+
+
+def location_control_seed(base_seed, video_name, qp_value):
+    """Build a reproducible per-stream seed without Python hash salt."""
+    name_value = sum(
+        (index + 1) * ord(character)
+        for index, character in enumerate(str(video_name))
+    )
+    return (
+        int(base_seed) * 1000003 +
+        int(qp_value) * 1009 +
+        name_value
+    ) % (2 ** 31 - 1)
 
 
 def diffusion_seed(
@@ -642,6 +799,16 @@ def main():
     args = parse_args()
     if args.diffusion_candidates < 2:
         raise ValueError('--diffusion_candidates must be at least 2.')
+    if not 1 <= args.location_shift_controls <= 15:
+        raise ValueError(
+            '--location_shift_controls must be between 1 and 15.'
+        )
+    if args.location_permutation_controls < 1:
+        raise ValueError(
+            '--location_permutation_controls must be at least 1.'
+        )
+    if args.location_block_size < 1:
+        raise ValueError('--location_block_size must be positive.')
     for name in (
             'psnr_noninferiority_margin',
             'ssim_noninferiority_margin',
@@ -749,6 +916,8 @@ def main():
         'diffusion_confidence_only',
         'diffusion_matched_mass_need',
         'diffusion_shifted_joint',
+        'diffusion_multi_shift_control',
+        'diffusion_block_permutation_control',
         'diffusion_confidence_routed',
     )
     route_methods = {
@@ -761,7 +930,14 @@ def main():
     location_controls = {
         'matched_mass_need': 'diffusion_matched_mass_need',
         'shifted_joint': 'diffusion_shifted_joint',
+        'multi_shift': 'diffusion_multi_shift_control',
+        'block_permutation': 'diffusion_block_permutation_control',
     }
+    primary_location_controls = (
+        'matched_mass_need',
+        'multi_shift',
+        'block_permutation',
+    )
     pixel_metric_names = (
         'rgb_psnr',
         'y_psnr',
@@ -936,6 +1112,23 @@ def main():
             shifted_joint_weight = spatially_shift_weight(
                 confidence_routing['diffusion_weight'],
             )
+            multi_shift_control_weights = multi_shift_weights(
+                confidence_routing['diffusion_weight'],
+                args.location_shift_controls,
+            )
+            permutation_seed = location_control_seed(
+                args.seed,
+                video_name,
+                qp_value,
+            )
+            block_permutation_control_weights = (
+                block_permutation_weights(
+                    confidence_routing['diffusion_weight'],
+                    args.location_permutation_controls,
+                    args.location_block_size,
+                    permutation_seed,
+                )
+            )
             diffusion_matched_mass_need_image, _ = (
                 reconstruct_routed_detail(
                     fidelity,
@@ -952,6 +1145,24 @@ def main():
                     chroma_scale=diffusion.chroma_scale,
                 )
             )
+            multi_shift_control_images = [
+                reconstruct_routed_detail(
+                    fidelity,
+                    diffusion_detail,
+                    control_weight,
+                    chroma_scale=diffusion.chroma_scale,
+                )[0]
+                for control_weight in multi_shift_control_weights
+            ]
+            block_permutation_control_images = [
+                reconstruct_routed_detail(
+                    fidelity,
+                    diffusion_detail,
+                    control_weight,
+                    chroma_scale=diffusion.chroma_scale,
+                )[0]
+                for control_weight in block_permutation_control_weights
+            ]
             diffusion_confidence_image, _ = reconstruct_routed_detail(
                 fidelity,
                 diffusion_detail,
@@ -980,6 +1191,14 @@ def main():
                 ),
                 'diffusion_confidence_routed': diffusion_confidence_image,
             }
+            location_control_images = {
+                'diffusion_multi_shift_control': (
+                    multi_shift_control_images
+                ),
+                'diffusion_block_permutation_control': (
+                    block_permutation_control_images
+                ),
+            }
             perceptual_group = (video_name, qp_value)
             for method_name, image in outputs.items():
                 metric = method_metrics(image, gt)
@@ -993,6 +1212,40 @@ def main():
                         perceptual_models,
                         image,
                         gt,
+                    )
+                    perceptual_records[method_name].append(
+                        perceptual_metric
+                    )
+                    perceptual_records_by_qp[
+                        qp_value
+                    ][method_name].append(perceptual_metric)
+                    perceptual_records_by_group[
+                        perceptual_group
+                    ][method_name].append(perceptual_metric)
+
+            for method_name, control_images in (
+                    location_control_images.items()):
+                metric = average([
+                    method_metrics(image, gt)
+                    for image in control_images
+                ])
+                records[method_name].append(metric)
+                records_by_qp[qp_value][method_name].append(metric)
+                records_by_group[
+                    perceptual_group
+                ][method_name].append(metric)
+                if perceptual_names:
+                    control_batch = torch.cat(control_images, dim=0)
+                    control_gt = gt.repeat(
+                        len(control_images),
+                        1,
+                        1,
+                        1,
+                    )
+                    perceptual_metric = perceptual_metrics(
+                        perceptual_models,
+                        control_batch,
+                        control_gt,
                     )
                     perceptual_records[method_name].append(
                         perceptual_metric
@@ -1115,6 +1368,42 @@ def main():
                         ].sum()
                     ).abs()
                 ),
+                'multi_shift_control_count': float(
+                    len(multi_shift_control_weights)
+                ),
+                'multi_shift_mass_max_absolute_error': float(max(
+                    (
+                        control_weight.sum() -
+                        confidence_routing['diffusion_weight'].sum()
+                    ).abs()
+                    for control_weight in multi_shift_control_weights
+                )),
+                'multi_shift_weight_l1_gap': float(np.mean([
+                    float((
+                        control_weight -
+                        confidence_routing['diffusion_weight']
+                    ).abs().mean())
+                    for control_weight in multi_shift_control_weights
+                ])),
+                'block_permutation_control_count': float(
+                    len(block_permutation_control_weights)
+                ),
+                'block_permutation_mass_max_absolute_error': float(max(
+                    (
+                        control_weight.sum() -
+                        confidence_routing['diffusion_weight'].sum()
+                    ).abs()
+                    for control_weight
+                    in block_permutation_control_weights
+                )),
+                'block_permutation_weight_l1_gap': float(np.mean([
+                    float((
+                        control_weight -
+                        confidence_routing['diffusion_weight']
+                    ).abs().mean())
+                    for control_weight
+                    in block_permutation_control_weights
+                ])),
                 'consensus_candidate_index': float(
                     consensus_indices.float().mean()
                 ),
@@ -1172,12 +1461,49 @@ def main():
                     ][method_name].append({
                         'temporal_error': value,
                     })
+                for method_name, control_images in (
+                        location_control_images.items()):
+                    previous_images = previous[
+                        'location_control_images'
+                    ][method_name]
+                    if len(previous_images) != len(control_images):
+                        raise ValueError(
+                            'Location control count changed within {}.'.format(
+                                temporal_key,
+                            )
+                        )
+                    value = float(np.mean([
+                        temporal_error(
+                            previous_image,
+                            image,
+                            previous['gt'],
+                            gt,
+                        )
+                        for previous_image, image in zip(
+                            previous_images,
+                            control_images,
+                        )
+                    ]))
+                    temporal_records[qp_value][method_name].append(value)
+                    temporal_records_by_group[
+                        temporal_key
+                    ][method_name].append({
+                        'temporal_error': value,
+                    })
             previous_by_video_qp[temporal_key] = {
                 'frame': frame_index,
                 'gt': gt.detach().clone(),
                 **{
                     method_name: image.detach().clone()
                     for method_name, image in outputs.items()
+                },
+                'location_control_images': {
+                    method_name: [
+                        image.detach().clone()
+                        for image in control_images
+                    ]
+                    for method_name, control_images
+                    in location_control_images.items()
                 },
             }
 
@@ -1382,9 +1708,10 @@ def main():
             'gate': control_gate,
         }
         location_control_gates[label] = control_gate
-    location_gate = combine_gate_status(
-        *location_control_gates.values()
-    )
+    location_gate = combine_gate_status(*(
+        location_control_gates[label]
+        for label in primary_location_controls
+    ))
     final_perceptual_gate = route_perceptual_gates[
         'need_and_confidence'
     ]
@@ -1573,6 +1900,7 @@ def main():
             ),
             'diffusion_candidates': args.diffusion_candidates,
             'diffusion_noise_mode': args.diffusion_noise_mode,
+            'seed': int(args.seed),
             'eval_crop_size': int(args.eval_crop_size),
             'model_tile_size': int(args.model_tile_size),
             'model_tile_overlap': int(args.model_tile_overlap),
@@ -1588,6 +1916,18 @@ def main():
             ),
             'route_ablation_uses_shared_candidates': True,
             'matched_budget_controls': True,
+            'location_shift_controls': int(
+                args.location_shift_controls
+            ),
+            'location_permutation_controls': int(
+                args.location_permutation_controls
+            ),
+            'location_block_size': int(args.location_block_size),
+            'primary_location_controls': list(
+                primary_location_controls
+            ),
+            'location_control_aggregation': 'per_sample_mean',
+            'location_permutation_stream': 'fixed_per_video_qp',
             'router': router_opts,
             'noninferiority_margins': {
                 'rgb_psnr': float(
@@ -1658,10 +1998,13 @@ def main():
         },
         'matched_budget_location_controls': {
             'controls': location_control_results,
+            'primary_controls': list(primary_location_controls),
+            'diagnostic_controls': ['shifted_joint'],
             'gate': location_gate,
             'criteria': (
                 'The learned joint route must retain perceptual and '
-                'temporal noninferiority against both equal-write-mass '
+                'temporal noninferiority against the need-ranked, '
+                'multi-shift, and block-permuted equal-write-mass '
                 'controls using the same diffusion candidates.'
             ),
         },
@@ -1913,6 +2256,23 @@ def main():
         )
     )
     print(
+        'location controls shift/permutation count, weight L1 gap, '
+        'max mass error, block: {}/{}, {:.6f}/{:.6f}, '
+        '{:.3e}/{:.3e}, {}'.format(
+            int(round(route_summary['multi_shift_control_count'])),
+            int(round(
+                route_summary['block_permutation_control_count']
+            )),
+            route_summary['multi_shift_weight_l1_gap'],
+            route_summary['block_permutation_weight_l1_gap'],
+            route_summary['multi_shift_mass_max_absolute_error'],
+            route_summary[
+                'block_permutation_mass_max_absolute_error'
+            ],
+            args.location_block_size,
+        )
+    )
+    print(
         'outside identity max deterministic/need/confidence/'
         'matched/shifted/joint: '
         '{:.3e}/{:.3e}/{:.3e}/{:.3e}/{:.3e}/{:.3e}'.format(
@@ -2008,7 +2368,12 @@ def main():
                     ),
                 )
             )
-        print('\n-- Matched-write-mass location controls --')
+        print('\n-- Same-write-mass location controls --')
+        print(
+            'primary controls: {}; legacy diagnostic: shifted_joint'.format(
+                '/'.join(primary_location_controls),
+            )
+        )
         for label, control in location_control_results.items():
             pixel_delta = control['joint_minus_control']
             pixel_ci = control['joint_minus_control_paired_95ci']
