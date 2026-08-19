@@ -62,6 +62,13 @@ def parse_args():
         default=None,
         help='Optional manifest override for frozen external validation.',
     )
+    parser.add_argument(
+        '--qps',
+        type=float,
+        nargs='+',
+        default=None,
+        help='Optional ordered QP override for the selected manifest.',
+    )
     parser.add_argument('--max_samples', type=int, default=50)
     parser.add_argument(
         '--sample_mode',
@@ -648,6 +655,8 @@ def main():
         split_opts['root'] = args.dataset_root
     if args.manifest_path is not None:
         split_opts['manifest_path'] = args.manifest_path
+    if args.qps is not None:
+        split_opts['qps'] = args.qps
     dataset_class = getattr(dataset, split_opts['type'])
     validation_dataset = dataset_class(
         split_opts,

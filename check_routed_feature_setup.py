@@ -25,6 +25,13 @@ def parse_args():
         default=None,
         help='Optional manifest override for frozen external validation.',
     )
+    parser.add_argument(
+        '--qps',
+        type=float,
+        nargs='+',
+        default=None,
+        help='Optional ordered QP override for the selected manifest.',
+    )
     return parser.parse_args()
 
 
@@ -37,6 +44,8 @@ def main():
         split_opts['root'] = args.dataset_root
     if args.manifest_path is not None:
         split_opts['manifest_path'] = args.manifest_path
+    if args.qps is not None:
+        split_opts['qps'] = args.qps
     dataset_cls = getattr(dataset, split_opts['type'])
     ds = dataset_cls(split_opts, radius=opts['network']['radius'])
     sample = ds[0]
