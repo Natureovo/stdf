@@ -28,6 +28,10 @@ COMPARISONS = {
         'diffusion_confidence_routed',
         'deterministic',
     ),
+    'confidence_only_route': (
+        'diffusion_confidence_only',
+        'deterministic',
+    ),
     'route_protection': (
         'diffusion_confidence_routed',
         'diffusion_same_region',
@@ -48,6 +52,14 @@ COMPARISONS = {
         'diffusion_confidence_routed',
         'diffusion_block_permutation_control',
     ),
+    'confidence_location_vs_multi_shift': (
+        'diffusion_confidence_only',
+        'diffusion_confidence_multi_shift_control',
+    ),
+    'confidence_location_vs_block_permutation': (
+        'diffusion_confidence_only',
+        'diffusion_confidence_block_permutation_control',
+    ),
 }
 PROTOCOL_KEYS = (
     'target_mode',
@@ -60,6 +72,7 @@ PROTOCOL_KEYS = (
     'location_shift_controls',
     'location_permutation_controls',
     'location_block_size',
+    'confidence_location_controls',
 )
 
 
@@ -447,6 +460,10 @@ def main():
             primary['final_route'],
             args,
         ),
+        'confidence_only_route': perceptual_noninferiority_gate(
+            primary['confidence_only_route'],
+            args,
+        ),
         'route_protection': route_protection_gate(
             primary['route_protection']
         ),
@@ -465,6 +482,18 @@ def main():
         'location_vs_block_permutation': (
             perceptual_noninferiority_gate(
                 primary['location_vs_block_permutation'],
+                args,
+            )
+        ),
+        'confidence_location_vs_multi_shift': (
+            perceptual_noninferiority_gate(
+                primary['confidence_location_vs_multi_shift'],
+                args,
+            )
+        ),
+        'confidence_location_vs_block_permutation': (
+            perceptual_noninferiority_gate(
+                primary['confidence_location_vs_block_permutation'],
                 args,
             )
         ),
@@ -492,6 +521,30 @@ def main():
         gates['route_protection'],
         gates['location'],
     )
+    confidence_location_statuses = (
+        gates['confidence_location_vs_multi_shift'],
+        gates['confidence_location_vs_block_permutation'],
+    )
+    if all(
+            status == 'NOT_RUN'
+            for status in confidence_location_statuses):
+        gates['confidence_location'] = 'NOT_RUN'
+    elif any(
+            status == 'NOT_RUN'
+            for status in confidence_location_statuses):
+        gates['confidence_location'] = 'INCONCLUSIVE'
+    else:
+        gates['confidence_location'] = combine_statuses(
+            *confidence_location_statuses
+        )
+    if gates['confidence_location'] == 'NOT_RUN':
+        gates['confidence_causal'] = 'INCONCLUSIVE'
+    else:
+        gates['confidence_causal'] = combine_statuses(
+            gates['full_frame_perceptual'],
+            gates['confidence_only_route'],
+            gates['confidence_location'],
+        )
 
     videos = sorted({item['video_key'] for item in metadata.values()})
     result = {

@@ -918,6 +918,8 @@ def main():
         'diffusion_shifted_joint',
         'diffusion_multi_shift_control',
         'diffusion_block_permutation_control',
+        'diffusion_confidence_multi_shift_control',
+        'diffusion_confidence_block_permutation_control',
         'diffusion_confidence_routed',
     )
     route_methods = {
@@ -932,6 +934,12 @@ def main():
         'shifted_joint': 'diffusion_shifted_joint',
         'multi_shift': 'diffusion_multi_shift_control',
         'block_permutation': 'diffusion_block_permutation_control',
+    }
+    confidence_location_controls = {
+        'multi_shift': 'diffusion_confidence_multi_shift_control',
+        'block_permutation': (
+            'diffusion_confidence_block_permutation_control'
+        ),
     }
     primary_location_controls = (
         'matched_mass_need',
@@ -1099,6 +1107,23 @@ def main():
                     chroma_scale=diffusion.chroma_scale,
                 )
             )
+            confidence_multi_shift_control_weights = multi_shift_weights(
+                confidence_only_routing['diffusion_weight'],
+                args.location_shift_controls,
+            )
+            confidence_permutation_seed = location_control_seed(
+                args.seed,
+                video_name,
+                qp_value,
+            )
+            confidence_block_permutation_control_weights = (
+                block_permutation_weights(
+                    confidence_only_routing['diffusion_weight'],
+                    args.location_permutation_controls,
+                    args.location_block_size,
+                    confidence_permutation_seed,
+                )
+            )
             confidence_routing = foundation.router(
                 need,
                 pixel_confidence,
@@ -1163,6 +1188,26 @@ def main():
                 )[0]
                 for control_weight in block_permutation_control_weights
             ]
+            confidence_multi_shift_control_images = [
+                reconstruct_routed_detail(
+                    fidelity,
+                    diffusion_detail,
+                    control_weight,
+                    chroma_scale=diffusion.chroma_scale,
+                )[0]
+                for control_weight
+                in confidence_multi_shift_control_weights
+            ]
+            confidence_block_permutation_control_images = [
+                reconstruct_routed_detail(
+                    fidelity,
+                    diffusion_detail,
+                    control_weight,
+                    chroma_scale=diffusion.chroma_scale,
+                )[0]
+                for control_weight
+                in confidence_block_permutation_control_weights
+            ]
             diffusion_confidence_image, _ = reconstruct_routed_detail(
                 fidelity,
                 diffusion_detail,
@@ -1197,6 +1242,12 @@ def main():
                 ),
                 'diffusion_block_permutation_control': (
                     block_permutation_control_images
+                ),
+                'diffusion_confidence_multi_shift_control': (
+                    confidence_multi_shift_control_images
+                ),
+                'diffusion_confidence_block_permutation_control': (
+                    confidence_block_permutation_control_images
                 ),
             }
             perceptual_group = (video_name, qp_value)
@@ -1403,6 +1454,42 @@ def main():
                     ).abs().mean())
                     for control_weight
                     in block_permutation_control_weights
+                ])),
+                'confidence_multi_shift_mass_max_absolute_error': float(max(
+                    (
+                        control_weight.sum() -
+                        confidence_only_routing['diffusion_weight'].sum()
+                    ).abs()
+                    for control_weight
+                    in confidence_multi_shift_control_weights
+                )),
+                'confidence_multi_shift_weight_l1_gap': float(np.mean([
+                    float((
+                        control_weight -
+                        confidence_only_routing['diffusion_weight']
+                    ).abs().mean())
+                    for control_weight
+                    in confidence_multi_shift_control_weights
+                ])),
+                'confidence_block_permutation_mass_max_absolute_error': (
+                    float(max(
+                        (
+                            control_weight.sum() -
+                            confidence_only_routing[
+                                'diffusion_weight'
+                            ].sum()
+                        ).abs()
+                        for control_weight
+                        in confidence_block_permutation_control_weights
+                    ))
+                ),
+                'confidence_block_permutation_weight_l1_gap': float(np.mean([
+                    float((
+                        control_weight -
+                        confidence_only_routing['diffusion_weight']
+                    ).abs().mean())
+                    for control_weight
+                    in confidence_block_permutation_control_weights
                 ])),
                 'consensus_candidate_index': float(
                     consensus_indices.float().mean()
@@ -1640,77 +1727,107 @@ def main():
         )
         for label, interval in temporal_route_intervals.items()
     }
-    location_control_results = {}
-    location_control_gates = {}
-    for label, method_name in location_controls.items():
-        pixel_delta = delta(
-            summaries['diffusion_confidence_routed'],
-            summaries[method_name],
-        )
-        pixel_intervals = paired_metric_intervals(
-            records_by_group,
-            'diffusion_confidence_routed',
-            method_name,
-            pixel_metric_names,
-        )
-        temporal_interval = paired_group_delta(
-            temporal_records_by_group,
-            'diffusion_confidence_routed',
-            method_name,
-            'temporal_error',
-        )
-        perceptual_delta = {}
-        perceptual_intervals = {}
-        perceptual_gate = 'NOT_RUN'
-        if perceptual_names:
-            perceptual_delta = {
-                name: (
-                    perceptual_summaries[
-                        'diffusion_confidence_routed'
-                    ][name] -
-                    perceptual_summaries[method_name][name]
-                )
-                for name in perceptual_names
-            }
-            perceptual_intervals = paired_metric_intervals(
-                perceptual_records_by_group,
-                'diffusion_confidence_routed',
+    def evaluate_location_controls(reference_method, controls):
+        control_results = {}
+        control_gates = {}
+        for label, method_name in controls.items():
+            pixel_delta = delta(
+                summaries[reference_method],
+                summaries[method_name],
+            )
+            pixel_intervals = paired_metric_intervals(
+                records_by_group,
+                reference_method,
                 method_name,
-                perceptual_names,
+                pixel_metric_names,
             )
-            perceptual_gate = perceptual_gate_status(
-                pixel_delta,
-                pixel_intervals,
-                perceptual_intervals,
-                args.psnr_noninferiority_margin,
-                args.ssim_noninferiority_margin,
+            temporal_interval = paired_group_delta(
+                temporal_records_by_group,
+                reference_method,
+                method_name,
+                'temporal_error',
             )
-        temporal_gate = noninferiority_status(
-            temporal_interval,
-            args.temporal_noninferiority_margin,
+            perceptual_delta = {}
+            perceptual_intervals = {}
+            perceptual_gate = 'NOT_RUN'
+            if perceptual_names:
+                perceptual_delta = {
+                    name: (
+                        perceptual_summaries[reference_method][name] -
+                        perceptual_summaries[method_name][name]
+                    )
+                    for name in perceptual_names
+                }
+                perceptual_intervals = paired_metric_intervals(
+                    perceptual_records_by_group,
+                    reference_method,
+                    method_name,
+                    perceptual_names,
+                )
+                perceptual_gate = perceptual_gate_status(
+                    pixel_delta,
+                    pixel_intervals,
+                    perceptual_intervals,
+                    args.psnr_noninferiority_margin,
+                    args.ssim_noninferiority_margin,
+                )
+            temporal_gate = noninferiority_status(
+                temporal_interval,
+                args.temporal_noninferiority_margin,
+            )
+            control_gate = combine_gate_status(
+                perceptual_gate,
+                temporal_gate,
+            )
+            control_results[label] = {
+                'reference_method': reference_method,
+                'reference_minus_control': pixel_delta,
+                'reference_minus_control_paired_95ci': pixel_intervals,
+                'perceptual_reference_minus_control': perceptual_delta,
+                'perceptual_reference_minus_control_paired_95ci': (
+                    perceptual_intervals
+                ),
+                'temporal_reference_minus_control_paired_95ci': (
+                    temporal_interval
+                ),
+                'perceptual_gate': perceptual_gate,
+                'temporal_gate': temporal_gate,
+                'gate': control_gate,
+            }
+            if reference_method == 'diffusion_confidence_routed':
+                control_results[label].update({
+                    'joint_minus_control': pixel_delta,
+                    'joint_minus_control_paired_95ci': pixel_intervals,
+                    'perceptual_joint_minus_control': perceptual_delta,
+                    'perceptual_joint_minus_control_paired_95ci': (
+                        perceptual_intervals
+                    ),
+                    'temporal_joint_minus_control_paired_95ci': (
+                        temporal_interval
+                    ),
+                })
+            control_gates[label] = control_gate
+        return control_results, control_gates
+
+    location_control_results, location_control_gates = (
+        evaluate_location_controls(
+            'diffusion_confidence_routed',
+            location_controls,
         )
-        control_gate = combine_gate_status(
-            perceptual_gate,
-            temporal_gate,
+    )
+    confidence_location_control_results, confidence_location_control_gates = (
+        evaluate_location_controls(
+            'diffusion_confidence_only',
+            confidence_location_controls,
         )
-        location_control_results[label] = {
-            'joint_minus_control': pixel_delta,
-            'joint_minus_control_paired_95ci': pixel_intervals,
-            'perceptual_joint_minus_control': perceptual_delta,
-            'perceptual_joint_minus_control_paired_95ci': (
-                perceptual_intervals
-            ),
-            'temporal_joint_minus_control_paired_95ci': (
-                temporal_interval
-            ),
-            'perceptual_gate': perceptual_gate,
-            'temporal_gate': temporal_gate,
-            'gate': control_gate,
-        }
-        location_control_gates[label] = control_gate
+    )
     location_gate = combine_gate_status(*(
         location_control_gates[label]
         for label in primary_location_controls
+    ))
+    confidence_location_gate = combine_gate_status(*(
+        confidence_location_control_gates[label]
+        for label in confidence_location_controls
     ))
     final_perceptual_gate = route_perceptual_gates[
         'need_and_confidence'
@@ -1916,6 +2033,7 @@ def main():
             ),
             'route_ablation_uses_shared_candidates': True,
             'matched_budget_controls': True,
+            'confidence_location_controls': True,
             'location_shift_controls': int(
                 args.location_shift_controls
             ),
@@ -2006,6 +2124,17 @@ def main():
                 'temporal noninferiority against the need-ranked, '
                 'multi-shift, and block-permuted equal-write-mass '
                 'controls using the same diffusion candidates.'
+            ),
+        },
+        'matched_budget_confidence_location_controls': {
+            'controls': confidence_location_control_results,
+            'primary_controls': list(confidence_location_controls),
+            'gate': confidence_location_gate,
+            'criteria': (
+                'The candidate-confidence route must retain perceptual '
+                'and temporal noninferiority against multi-shift and '
+                'block-permuted equal-write-mass controls using the same '
+                'diffusion candidates.'
             ),
         },
         'detail': average(detail_records),
@@ -2368,54 +2497,69 @@ def main():
                     ),
                 )
             )
-        print('\n-- Same-write-mass location controls --')
-        print(
-            'primary controls: {}; legacy diagnostic: shifted_joint'.format(
-                '/'.join(primary_location_controls),
-            )
+        def print_location_control_results(
+                title,
+                reference_label,
+                control_results):
+            print('\n-- {} --'.format(title))
+            for label, control in control_results.items():
+                pixel_delta = control['reference_minus_control']
+                pixel_ci = control[
+                    'reference_minus_control_paired_95ci'
+                ]
+                perceptual_ci = control[
+                    'perceptual_reference_minus_control_paired_95ci'
+                ]
+                print(
+                    '{} minus {} RGB/SSIM/HF/gradient: '
+                    '{:+.6f}/{:+.6f}/{:+.8f}/{:+.8f}'.format(
+                        reference_label,
+                        label,
+                        pixel_delta['rgb_psnr'],
+                        pixel_delta['ssim'],
+                        pixel_delta['highfreq_mae'],
+                        pixel_delta['gradient_mae'],
+                    )
+                )
+                print(
+                    '{} minus {} paired 95% CI RGB/SSIM: '
+                    '[{:+.6f},{:+.6f}] / [{:+.6f},{:+.6f}]'.format(
+                        reference_label,
+                        label,
+                        pixel_ci['rgb_psnr']['low'],
+                        pixel_ci['rgb_psnr']['high'],
+                        pixel_ci['ssim']['low'],
+                        pixel_ci['ssim']['high'],
+                    )
+                )
+                print(
+                    '{} minus {} perceptual paired 95% CI: {} | '
+                    'gate {}'.format(
+                        reference_label,
+                        label,
+                        ', '.join(
+                            '{} {:+.8f} [{:+.8f}, {:+.8f}]'.format(
+                                name,
+                                perceptual_ci[name]['mean'],
+                                perceptual_ci[name]['low'],
+                                perceptual_ci[name]['high'],
+                            )
+                            for name in perceptual_names
+                        ),
+                        control['gate'],
+                    )
+                )
+
+        print_location_control_results(
+            'Same-write-mass joint location controls',
+            'joint',
+            location_control_results,
         )
-        for label, control in location_control_results.items():
-            pixel_delta = control['joint_minus_control']
-            pixel_ci = control['joint_minus_control_paired_95ci']
-            perceptual_ci = control[
-                'perceptual_joint_minus_control_paired_95ci'
-            ]
-            print(
-                'joint minus {} RGB/SSIM/HF/gradient: '
-                '{:+.6f}/{:+.6f}/{:+.8f}/{:+.8f}'.format(
-                    label,
-                    pixel_delta['rgb_psnr'],
-                    pixel_delta['ssim'],
-                    pixel_delta['highfreq_mae'],
-                    pixel_delta['gradient_mae'],
-                )
-            )
-            print(
-                'joint minus {} paired 95% CI RGB/SSIM: '
-                '[{:+.6f},{:+.6f}] / [{:+.6f},{:+.6f}]'.format(
-                    label,
-                    pixel_ci['rgb_psnr']['low'],
-                    pixel_ci['rgb_psnr']['high'],
-                    pixel_ci['ssim']['low'],
-                    pixel_ci['ssim']['high'],
-                )
-            )
-            print(
-                'joint minus {} perceptual paired 95% CI: {} | '
-                'gate {}'.format(
-                    label,
-                    ', '.join(
-                        '{} {:+.8f} [{:+.8f}, {:+.8f}]'.format(
-                            name,
-                            perceptual_ci[name]['mean'],
-                            perceptual_ci[name]['low'],
-                            perceptual_ci[name]['high'],
-                        )
-                        for name in perceptual_names
-                    ),
-                    control['gate'],
-                )
-            )
+        print_location_control_results(
+            'Same-write-mass confidence-only location controls',
+            'confidence-only',
+            confidence_location_control_results,
+        )
     else:
         print('perceptual route gates: NOT_RUN')
     for qp_value, qp_methods in by_qp.items():
@@ -2501,14 +2645,15 @@ def main():
                 )
     print(
         'route protection/final perceptual/final temporal/'
-        'continuation/routing/location/causal gate: '
-        '{}/{}/{}/{}/{}/{}/{}'.format(
+        'continuation/routing/joint-location/confidence-location/'
+        'joint-causal gate: {}/{}/{}/{}/{}/{}/{}/{}'.format(
             route_protection_gate,
             final_perceptual_gate,
             final_temporal_gate,
             continuation_gate,
             routing_gate,
             location_gate,
+            confidence_location_gate,
             causal_routing_gate,
         )
     )
